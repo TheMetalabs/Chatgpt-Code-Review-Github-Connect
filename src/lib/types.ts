@@ -123,6 +123,14 @@ export interface Job {
   /** Where each salvaged leg's piece ends in rawReview, in block order (salvagedReview). A body that
    * has to cut the block further to fit GitHub's limit names exactly the replies its cut reaches. */
   rawLegs?: RawLeg[];
+  /** The reviewers whose reply was cut off after a complete verdict with a complete, closed, EMPTY
+   * findings list and no REQUEST_CHANGES (only its coverage list stopped): their verdict counts, the
+   * review reads "no major issues" (gate passes, design: Horim 2026-10-20), and coverage is marked
+   * incomplete. A reply cut before or inside its findings never is (aicc-center#1091). */
+  coverageCutProviders?: ReviewProvider[];
+  /** Those reviewers' replies, verbatim, posted under the clean line as evidence (redacted from the
+   * public snapshot like rawReview). */
+  coverageCutReview?: string;
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;

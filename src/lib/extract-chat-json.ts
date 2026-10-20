@@ -123,13 +123,19 @@ export function lastReviewStart(text: string): number {
   return last;
 }
 
-type ReviewScan = { complete: boolean; inString: boolean; findingsEnd: number; coverageObjectAt: number; rootEnd: number; cuts: { end: number; closers: string }[] };
+/** A clean cut: where the slice may end (`end`) and the closers that finish it there. `key` is the root
+ * key whose array the cut sits in (a cut inside a root-level array: `closers` is "]}"), "" at the root. */
+type ReviewCut = { end: number; closers: string; key: string };
+type ReviewScan = { complete: boolean; inString: boolean; findingsEnd: number; coverageObjectAt: number; rootEnd: number; cuts: ReviewCut[]; rootKeys: { key: string; at: number }[] };
 
 /** One forward pass over a review slice: whether its root closed, where the top-level `findings` array
  * ended (-1: it did not), and every place it could be cut cleanly with the closers that would finish it. */
 function scanReview(s: string): ReviewScan {
   const stack: string[] = [];
-  const cuts: { end: number; closers: string }[] = [];
+  const cuts: ReviewCut[] = [];
+  // Every key of the ROOT object, in order, with where its name starts: what a cut drops is read from it.
+  const rootKeys: { key: string; at: number }[] = [];
+  let rootKey = "";
   let inStr = false, esc = false, strStart = -1;
   let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false, coverageObjectAt = -1, rootEnd = -1;
   for (let i = 0; i < s.length; i += 1) {
@@ -146,6 +152,8 @@ function scanReview(s: string): ReviewScan {
             let key = "";
             try { key = JSON.parse(s.slice(strStart, i + 1)) as string; } catch { key = ""; }
             afterFindingsKey = key === "findings";
+            rootKey = key;
+            rootKeys.push({ key, at: strStart });
             // The ROOT object's `coverage` whose value is an object, not an array (a missing `[`).
             let k = j + 1;
             while (k < s.length && /\s/.test(s[k])) k += 1;
@@ -169,11 +177,11 @@ function scanReview(s: string): ReviewScan {
       // inside `[`). A delimiter deeper than that closes the INNER part of an element that is still open
       // (a nested object or array of a half-written coverage entry): cutting there would keep a partial entry.
       if (stack.length === 1 || (stack.length === 2 && stack[1] === "[")) {
-        cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join("") });
+        cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join(""), key: stack.length === 2 ? rootKey : "" });
       }
     }
   }
-  return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts };
+  return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts, rootKeys };
 }
 
 /** A review whose text stopped before it finished, recovered ONLY when everything the verdict rests on
@@ -183,6 +191,20 @@ function scanReview(s: string): ReviewScan {
  * `findings`, or one that never reached `merge_recommendation`, is not recovered (null): a dropped
  * finding is worse than a missing one. A missing `[` after `"coverage":` (Grok's page text) is supplied. */
 export function recoverTruncatedReviewJson(text: string): string | null {
+  return recoverTruncatedReview(text)?.json ?? null;
+}
+
+/** The ROOT field a cut-off reply stopped in, read structurally from the same cut recoverTruncatedReviewJson
+ * keeps (never from the recovered JSON, which no longer shows where it ended): "coverage" only when every
+ * field before `coverage` arrived whole and nothing but coverage entries was lost; another key when the
+ * lost text belongs to that field; "unknown" when the lost text is not a whole key (a half-written name) or
+ * spans more than one field. null when the text is not a recoverable cut-off review. The gate's clean
+ * verdict for a reply cut in coverage only (harbor gateLeg) rests on this, not on `truncated: true`. */
+export function truncatedReviewField(text: string): string | null {
+  return recoverTruncatedReview(text)?.field ?? null;
+}
+
+function recoverTruncatedReview(text: string): { json: string; field: string } | null {
   const s = String(text || "");
   const start = lastReviewStart(s);
   if (start < 0) return null;
@@ -194,6 +216,16 @@ export function recoverTruncatedReviewJson(text: string): string | null {
     slice = `${slice.slice(0, scan.coverageObjectAt)}[${slice.slice(scan.coverageObjectAt)}`;
     scan = scanReview(slice);
   }
+  const recovered = recoverFromCuts(slice, scan);
+  if (recovered || scan.complete) return recovered;
+  // Read once more with the reply's format normalized (normalizeReviewFormat: bare inner quotes escaped,
+  // a missing findings `[` supplied): the same rule applies, the verdict and every finding must be whole.
+  const normalized = normalizeReviewFormat(slice);
+  return normalized === slice ? null : recoverFromCuts(normalized, scanReview(normalized));
+}
+
+/** recoverTruncatedReviewJson's cut search over one reading of the slice. */
+function recoverFromCuts(slice: string, scan: ReviewScan): { json: string; field: string } | null {
   if (scan.complete || scan.findingsEnd < 0) return null;
   for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
     const cut = scan.cuts[n];
@@ -202,11 +234,132 @@ export function recoverTruncatedReviewJson(text: string): string | null {
     for (const body of [candidate, repairJsonEscapes(candidate)]) {
       try {
         const parsed = JSON.parse(body) as Record<string, unknown>;
-        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") return JSON.stringify({ ...parsed, truncated: true });
+        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") {
+          return { json: JSON.stringify({ ...parsed, truncated: true }), field: cutField(slice, scan, cut) };
+        }
       } catch { /* try the escape-repaired form, then an earlier cut */ }
     }
   }
   return null;
+}
+
+/** Which root field the text dropped at `cut` belongs to (truncatedReviewField). */
+function cutField(slice: string, scan: ReviewScan, cut: ReviewCut): string {
+  const lost = new Set(scan.rootKeys.filter((k) => k.at >= cut.end).map((k) => k.key));
+  if (cut.key) lost.add(cut.key);
+  if (lost.size > 1) return "unknown";
+  if (lost.size === 1) {
+    // A whole key after the cut: the dropped text must be that field alone (only `,` / space before its name).
+    const [key] = lost;
+    if (!cut.key) {
+      const first = scan.rootKeys.find((k) => k.at >= cut.end);
+      if (!first || !/^[\s,]*$/.test(slice.slice(cut.end, first.at))) return "unknown";
+    }
+    return key;
+  }
+  // Nothing but separators after a whole root value: the reply ended right after that field.
+  if (!/^[\s,]*$/.test(slice.slice(cut.end))) return "unknown";
+  return [...scan.rootKeys].reverse().find((k) => k.at < cut.end)?.key ?? "unknown";
+}
+
+/** Format-only normalization of a review object's text (`slice` starts at its opening brace), for a reply
+ * the strict parse and the escape repair could not read. It never changes what the reply says: every
+ * character the model wrote is kept, in order. Only the JSON syntax around it is supplied:
+ *  - a quote inside a string that cannot be the string's end (live 2026-10: Grok wrote shell and UI text
+ *    such as `"This AI's style..."` / `[ -f "$f" ]` with bare quotes) is escaped. A quote ends its string
+ *    only where JSON can continue: a key's quote before `:`, a value's before `}` or before `,` and the next
+ *    key's quote, an array item's before `]` or before `,` and the next item, or at the end of the text;
+ *  - an invalid escape keeps its backslash (doubled) and a raw control character is escaped (repairJsonEscapes);
+ *  - a missing `[` after the root's `"findings":` (the value opens with `{`) is supplied.
+ * The text after the root object closes is not part of it and is left out. The result may still be
+ * unclosed (a reply cut off mid-answer): recoverTruncatedReviewJson reads that. Mirrors extension/json.js. */
+export function normalizeReviewFormat(slice: string): string {
+  return normalizeReviewFormatSpan(slice).text;
+}
+
+/** normalizeReviewFormat, and where in `slice` the root object closed (its length when it did not). */
+function normalizeReviewFormatSpan(slice: string): { text: string; end: number } {
+  const s = String(slice || "");
+  const SHORT: Record<string, string> = { "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+  type Frame = { open: "{" | "["; expectKey: boolean; key: string };
+  const stack: Frame[] = [];
+  let out = "";
+  let role: "key" | "value" | "item" | "" = "";
+  let inStr = false, strOut = "";
+  const nextNonWs = (from: number) => { let j = from; while (j < s.length && /\s/.test(s[j])) j += 1; return j; };
+  const ends = (i: number): boolean => {
+    const j = nextNonWs(i + 1);
+    if (j >= s.length) return true;
+    const n = s[j];
+    if (role === "key") return n === ":";
+    const after = nextNonWs(j + 1);
+    if (role === "value") return n === "}" || (n === "," && (after >= s.length || s[after] === '"'));
+    if (role === "item") return n === "]" || (n === "," && (after >= s.length || '"{[-0123456789tfn'.includes(s[after])));
+    return true;
+  };
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (c === "\\") {
+        const n = s[i + 1];
+        if (n !== undefined && '"\\/bfnrt'.includes(n)) { strOut += c + n; i += 1; continue; }
+        if (n === "u" && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) { strOut += s.slice(i, i + 6); i += 5; continue; }
+        if (n === undefined) continue; // a reply cut right after a backslash: the escape never arrived
+        strOut += "\\\\";
+        continue;
+      }
+      if (c === '"') {
+        if (!ends(i)) { strOut += '\\"'; continue; }
+        inStr = false;
+        out += strOut + c;
+        const top = stack[stack.length - 1];
+        if (role === "key" && top) { try { top.key = JSON.parse(strOut + c) as string; } catch { top.key = ""; } }
+        strOut = "";
+        continue;
+      }
+      if (c < " ") { strOut += SHORT[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`; continue; }
+      strOut += c;
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (c === '"') {
+      inStr = true;
+      strOut = c;
+      role = !top ? "" : top.open === "[" ? "item" : top.expectKey ? "key" : "value";
+      continue;
+    }
+    if (c === ":" && top?.open === "{") {
+      top.expectKey = false;
+      out += c;
+      // The root's findings written as bare objects: supply the array's `[`.
+      const j = nextNonWs(i + 1);
+      if (stack.length === 1 && top.key === "findings" && s[j] === "{") { out += s.slice(i + 1, j) + "["; stack.push({ open: "[", expectKey: false, key: "" }); i = j - 1; }
+      continue;
+    }
+    if (c === "," && top?.open === "{") { top.expectKey = true; out += c; continue; }
+    if (c === "{" || c === "[") { stack.push({ open: c, expectKey: c === "{", key: "" }); out += c; continue; }
+    if (c === "}" || c === "]") {
+      stack.pop();
+      out += c;
+      if (!stack.length) return { text: out, end: i + 1 };
+      continue;
+    }
+    out += c;
+  }
+  return { text: inStr ? out + strOut : out, end: s.length };
+}
+
+/** The last review object in `text` read again after normalizeReviewFormat, when it then closes and is a
+ * review: with where it starts in `text` and where the root closes there (end exclusive). */
+export function formatRepairedReviewRange(text: string): JsonObjectSlice | null {
+  const s = String(text || "");
+  const start = lastReviewStart(s);
+  if (start < 0) return null;
+  const normalized = normalizeReviewFormatSpan(s.slice(start));
+  let value: unknown;
+  try { value = JSON.parse(normalized.text); } catch { return null; }
+  if (!isReviewObject(value)) return null;
+  return { json: normalized.text, start, end: start + normalized.end };
 }
 
 export type ReviewTextStatus = "complete" | "recovered-truncated" | "truncated" | "invalid" | "none";
@@ -220,6 +373,8 @@ export type ReviewTextClass = { status: ReviewTextStatus; json?: string };
 export function classifyReviewText(text: string): ReviewTextClass {
   const strict = lastReviewJson(text);
   if (strict) return { status: "complete", json: strict };
+  const formatted = formatRepairedReviewRange(text);
+  if (formatted) return { status: "complete", json: formatted.json };
   const recovered = recoverTruncatedReviewJson(text);
   if (recovered) return { status: "recovered-truncated", json: recovered };
   const start = lastReviewStart(text);
@@ -255,11 +410,11 @@ export function extractChatJsonRange(text: string): JsonObjectSlice | null {
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   const plain = lastJsonObjectRange(s, isReviewObject, true);
   if (plain) return plain;
-  // Only a transcript that yields nothing as written is read again without citation markers.
+  // Only a transcript that yields nothing as written is read again without citation markers, and only
+  // then with its format normalized (formatRepairedReviewRange: syntax supplied, nothing reworded).
   const cleaned = withoutCitationMarkers(s);
-  if (!cleaned) return null;
-  const fromCleaned = lastJsonObjectRange(cleaned, isReviewObject, true);
-  if (!fromCleaned) return null;
+  const fromCleaned = cleaned ? lastJsonObjectRange(cleaned, isReviewObject, true) : null;
+  if (!fromCleaned) return formatRepairedReviewRange(s);
   const idx = s.lastIndexOf(fromCleaned.json);
   if (idx < 0) return { json: fromCleaned.json, start: -1, end: -1 };
   return { json: fromCleaned.json, start: idx, end: idx + fromCleaned.json.length };
@@ -285,9 +440,15 @@ export function extractChatJsonParts(text: string): { json: string; residual: st
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   const plain = tryParts(s);
   if (plain) return plain;
-  // Only a transcript that yields nothing as written is read again without citation markers.
+  // Only a transcript that yields nothing as written is read again without citation markers, then with
+  // its format normalized (the text around the object stays residual, as written).
   const cleaned = withoutCitationMarkers(s);
-  return cleaned ? tryParts(cleaned) : null;
+  const fromCleaned = cleaned ? tryParts(cleaned) : null;
+  if (fromCleaned) return fromCleaned;
+  const span = formatRepairedReviewRange(s);
+  if (!span) return null;
+  const around = unwrapFence(s.slice(0, span.start), s.slice(span.end));
+  return { json: span.json, residual: `${around.before}\n${around.after}`.trim() };
 }
 
 /** Remove the complete code fence directly around the accepted object, and nothing else: an opening

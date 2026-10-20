@@ -17,6 +17,7 @@ import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarge
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { truncatedReviewField } from "./extract-chat-json";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
@@ -336,7 +337,7 @@ export function publicJobs(jobs: Job[]) {
   return jobs.map((j) => {
     // rawReview is verbatim model output that can echo private PR source — treat it like storedLegs
     // and never expose it on the unauthenticated /api/harbor; surface only a bounded boolean.
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, localReleasePrompt: _lrp, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, localReleasePrompt: _lrp, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, coverageCutReview: _cut, ...rest } = j;
     return {
       ...rest,
       hasRawReview: Boolean(j.rawReview),
@@ -1353,6 +1354,8 @@ export async function submitHarborChat(
   const unusableNotes: string[] = [];
   // Why each salvaged leg is posted verbatim, kept for the body and the loop handoff (Job.rawCauses).
   const rawCauses: Partial<Record<ReviewProvider, RawCause>> = {};
+  // Complete verdicts whose reply was cut off in its coverage list only (gateLeg `coverageCut`).
+  const coverageCut = new Map<ReviewProvider, string>();
   // Each reviewer's complete-verdict state (gateLeg): only these earn clean credit.
   const complete = new Set<ReviewProvider>();
   // A released held local leg's rejected reply is always evidence (docs §1). Any other leg the gate
@@ -1368,7 +1371,7 @@ export async function submitHarborChat(
   }));
   const posts = first.some((g) => g.gate.ok);
   for (const g of first) {
-    const { leg, gate, verdict, unusable, cause } = !g.gate.ok && posts
+    const { leg, gate, verdict, unusable, cause, coverageCut: cutReply } = !g.gate.ok && posts
       ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg)) }
       : g;
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
@@ -1380,6 +1383,7 @@ export async function submitHarborChat(
     gates.push(gate);
     byProvider.set(leg.provider, gate);
     if (verdict) complete.add(leg.provider);
+    if (verdict && cutReply) coverageCut.set(leg.provider, cutReply);
     if (gate.rawReview && cause) rawCauses[leg.provider] = cause;
   }
   // The first active chat reviewer is the canonical verdict. A failed secondary chat leg is
@@ -1536,6 +1540,12 @@ export async function submitHarborChat(
   // The legs the block holds only in part: the outcome, header and note describe the block as posted.
   const rawTruncated = salvaged?.truncated.length ? salvaged.truncated : undefined;
   const rawLegs = salvaged?.legs;
+  // The cut-off replies whose complete, empty verdict counts (gateLeg `coverageCut`): posted verbatim as
+  // evidence under the clean line, in the room the salvaged block left.
+  const cutLegs = [...canonicalByProvider.keys()].filter((p) => coverageCut.has(p));
+  const coverageCutReview = cutLegs.length
+    ? salvagedReview(cutLegs.map((provider) => ({ provider, rawReview: coverageCut.get(provider) })), Math.max(0, MAX_RAW_REVIEW_BODY - (rawReview?.length ?? 0)))?.text
+    : undefined;
   // Only a complete verdict counts (gateLeg), never payload presence or the absence of raw text:
   // that decides both whether local verified and which chat reviewers were clean.
   const structured = [...complete];
@@ -1622,6 +1632,8 @@ export async function submitHarborChat(
       rawCauses: rawReview ? rawCausesForBody : undefined,
       rawTruncated,
       rawLegs,
+      coverageCutProviders: cutLegs.length ? cutLegs : undefined,
+      coverageCutReview: coverageCutReview || undefined,
       investigatedSafe: merged.investigatedSafe,
       assumptions: nextAssumptions,
       skippedProviders: blockingSkipped,
@@ -1630,7 +1642,7 @@ export async function submitHarborChat(
       auxiliaryProviderFailures: auxiliaryFailures,
       coverage: [...coverageByFile.values()],
       droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
-      plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}.`,
+      plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}${cutLegs.length ? `; no finding in the complete verdict of ${cutLegs.join(" + ")}, reply posted as coverage evidence` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,
       updatedAt: Date.now(),
@@ -1657,11 +1669,27 @@ function gateLeg(
   sample: SamplePr,
   rejectedEvidence: boolean,
   preserveSchemaRejectedEvidence = false,
-): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
+): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause; coverageCut?: string } {
   const parsed = parseChatSubmission(leg.raw);
-  // A reply cut off after its verdict with no finding (extract-chat-json recoverTruncatedReviewJson):
-  // never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.
+  // A reply cut off after its verdict with no finding (extract-chat-json recoverTruncatedReviewJson).
   if (parsed?.truncated === true && !(Array.isArray(parsed.findings) && parsed.findings.length)) {
+    // Its `findings` array arrived whole, closed and empty (recovery requires that) and the verdict is not
+    // REQUEST_CHANGES: only the coverage list was cut. That is the reviewer's complete verdict with no
+    // finding (Horim 2026-10-20): it counts, the review reads "no major issues" and passes the gate, and the
+    // reply posts verbatim beside it with coverage marked incomplete. It must still pass the gate as it is
+    // (an Instant-tier empty reply without investigated_safe stays rejected). A reply cut before or inside
+    // its findings never reaches here: it does not recover, so it stays raw / incomplete (#1091).
+    // `truncated: true` alone does not say WHERE the reply stopped: the cut must be proven to sit in its
+    // coverage list (truncatedReviewField over the reply's own text, every field before coverage whole). A
+    // reply cut in investigated_safe, assumptions, a later field, or a half-written key stays incomplete.
+    const cutText = leg.originalText?.trim() || leg.raw;
+    if (parsed.merge_recommendation !== "REQUEST_CHANGES" && Array.isArray(parsed.findings) && truncatedReviewField(cutText) === "coverage") {
+      const gate = gateLiveSubmission(parsed, sample, state.settings);
+      if (gate.ok && !gate.rawReview && !gate.findings.length && !gate.malformed && !gate.overflow) {
+        return { gate, verdict: true, coverageCut: cutText };
+      }
+    }
+    // Otherwise never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.
     const evidence = verdictEvidence(parsed, { ...leg, raw: leg.originalText?.trim() || leg.raw });
     return {
       gate: gateLiveSubmission(evidence, sample, state.settings),

@@ -1,0 +1,198 @@
+{
+ "parser_commit": "ebb1cdcf",
+ "source": "Mac-Studio .data/review-history/jobs snapshot 2026-10-20 18:52 KST",
+ "window": "createdAt >= 2026-10-06 00:00 KST",
+ "total_cases": 163,
+ "jobs": 149,
+ "old24": 24,
+ "new": 139,
+ "by_provider": {
+  "grok": 88,
+  "local": 17,
+  "chatgpt": 58
+ },
+ "by_repo": {
+  "TheMetalabs/aicc-center": 139,
+  "TheMetalabs/Chatgpt-Code-Review-Github-Connect": 2,
+  "TheMetalabs/WalkieBoard": 22
+ },
+ "by_cause_at_time": {
+  "grok:json_invalid": 88,
+  "local:gate_rejected_parsed": 17,
+  "chatgpt:json_invalid": 54,
+  "chatgpt:gate_rejected_parsed": 4
+ },
+ "by_outcome": {
+  "raw_block": 141,
+  "findings_body": 4,
+  "clean_body": 4,
+  "no_review": 14
+ },
+ "converted_all": 156,
+ "structured_all": 92,
+ "converted_chat": 139,
+ "structured_chat": 75,
+ "n_chat": 146,
+ "trunc_zero_findings": 64,
+ "findings_complete": 157,
+ "findings_complete_empty": 78,
+ "findings_complete_empty_by_merge": {
+  "APPROVE": 50,
+  "COMMENT": 24,
+  "REQUEST_CHANGES": 4
+ },
+ "per_class_all": {
+  "truncated:inside_coverage": {
+   "n": 131,
+   "converted": 131,
+   "structured": 67
+  },
+  "leading_ui_label": {
+   "n": 91,
+   "converted": 90,
+   "structured": 39
+  },
+  "only_one_leg_succeeded": {
+   "n": 66,
+   "converted": 64,
+   "structured": 45
+  },
+  "missing_code_fence": {
+   "n": 41,
+   "converted": 38,
+   "structured": 31
+  },
+  "unclosed_fence": {
+   "n": 27,
+   "converted": 26,
+   "structured": 20
+  },
+  "gate_rejected_parsed": {
+   "n": 21,
+   "converted": 21,
+   "structured": 21
+  },
+  "coverage_missing_bracket": {
+   "n": 21,
+   "converted": 21,
+   "structured": 11
+  },
+  "invalid_escape_or_control_char": {
+   "n": 8,
+   "converted": 7,
+   "structured": 7
+  },
+  "prose_mixed": {
+   "n": 4,
+   "converted": 4,
+   "structured": 4
+  },
+  "empty_or_label_only": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "multiple_json_objects": {
+   "n": 2,
+   "converted": 2,
+   "structured": 2
+  },
+  "truncated:before_findings": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "unescaped_inner_quote": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "findings_missing_bracket": {
+   "n": 1,
+   "converted": 0,
+   "structured": 0
+  },
+  "truncated:inside_findings": {
+   "n": 1,
+   "converted": 0,
+   "structured": 0
+  }
+ },
+ "per_class_chat": {
+  "truncated:inside_coverage": {
+   "n": 131,
+   "converted": 131,
+   "structured": 67
+  },
+  "leading_ui_label": {
+   "n": 91,
+   "converted": 90,
+   "structured": 39
+  },
+  "only_one_leg_succeeded": {
+   "n": 58,
+   "converted": 56,
+   "structured": 37
+  },
+  "unclosed_fence": {
+   "n": 27,
+   "converted": 26,
+   "structured": 20
+  },
+  "missing_code_fence": {
+   "n": 25,
+   "converted": 22,
+   "structured": 15
+  },
+  "coverage_missing_bracket": {
+   "n": 21,
+   "converted": 21,
+   "structured": 11
+  },
+  "invalid_escape_or_control_char": {
+   "n": 8,
+   "converted": 7,
+   "structured": 7
+  },
+  "gate_rejected_parsed": {
+   "n": 4,
+   "converted": 4,
+   "structured": 4
+  },
+  "empty_or_label_only": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "multiple_json_objects": {
+   "n": 2,
+   "converted": 2,
+   "structured": 2
+  },
+  "prose_mixed": {
+   "n": 2,
+   "converted": 2,
+   "structured": 2
+  },
+  "truncated:before_findings": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "unescaped_inner_quote": {
+   "n": 2,
+   "converted": 0,
+   "structured": 0
+  },
+  "findings_missing_bracket": {
+   "n": 1,
+   "converted": 0,
+   "structured": 0
+  },
+  "truncated:inside_findings": {
+   "n": 1,
+   "converted": 0,
+   "structured": 0
+  }
+ }
+}

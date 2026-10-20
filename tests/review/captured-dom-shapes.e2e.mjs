@@ -43,8 +43,16 @@ test('explicit streaming status blocks completion even during a Stop-control gap
  await page.locator('[data-streaming-response-status]').evaluate(el=>el.remove());await page.clock.runFor(2400);
  assert.equal(await page.evaluate(()=>received),valid);
 });
-test('completed paragraph JSON with lost quote escapes is diagnosed, not endlessly labeled generating or invented',async t=>{
- const malformed='{"findings":[],"highest_risk":"value === "quoted""}';
+test('completed paragraph JSON with lost quote escapes is read format-only: the quotes escaped, no word changed',async t=>{
+ const lost='{"findings":[],"highest_risk":"value === "quoted""}';
+ const page=await pageFor(t,answer('<p></p>'));await page.locator('.markdown p').evaluate((el,text)=>el.textContent=text,lost);
+ await page.evaluate(()=>{window.received=null;waitUntilReviewOrQuota('ChatGPT').then(raw=>window.received=raw);});await page.clock.runFor(2400);
+ const got=await page.evaluate(()=>received);
+ assert.deepEqual(JSON.parse(got),{findings:[],highest_risk:'value === "quoted"'});
+});
+test('completed paragraph JSON with a structural defect is diagnosed, not endlessly labeled generating or invented',async t=>{
+ // Lost quote escapes AND a missing comma between keys: format-only normalization never supplies a comma.
+ const malformed='{"findings":[] "highest_risk":"value === "quoted""}';
  const page=await pageFor(t,answer('<p></p>'));await page.locator('.markdown p').evaluate((el,text)=>el.textContent=text,malformed);
  await page.evaluate(()=>{window.received=null;waitUntilReviewOrQuota('ChatGPT').then(raw=>window.received=raw);});await page.clock.runFor(2400);
  assert.equal(await page.evaluate(()=>__ashlarRunnerState.observation.state),'response_completed_json_invalid');

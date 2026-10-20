@@ -60,6 +60,7 @@ export function skippedNotes(job: Pick<Job, "skippedProviders" | "incompleteProv
 const RAW_CAUSE_TEXT: Record<RawCause, string> = {
   unparseable: "the reply was not valid review JSON",
   "unread-rows": "the reply parsed, but its findings past the gate's row cap were not inspected",
+  truncated: "the reply was cut off before it finished (no finding, coverage incomplete)",
   "not-a-verdict": "the reply could not be used as a complete structured review",
 };
 

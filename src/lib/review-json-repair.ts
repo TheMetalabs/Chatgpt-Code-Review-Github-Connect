@@ -123,7 +123,8 @@ export function inspectReviewFormat(raw: string, kind: RepairSchema): FormatChec
     // `coverage` is a legitimate, prompt-requested field (self-reported model coverage). It never
     // affects the verdict and is parsed leniently downstream, so it must be allowed here — otherwise
     // every review that follows the prompt trips "unknown_field" → a spurious repair request.
-    keys(value,["findings","merge_recommendation","highest_risk","investigated_safe","assumptions","coverage"],"review");
+    keys(value,["findings","merge_recommendation","highest_risk","investigated_safe","assumptions","coverage","truncated"],"review");
+    if (value.truncated !== undefined && value.truncated !== true) errors.push("truncated:true_only");
     findings(value.findings,"findings");
     if (value.merge_recommendation !== undefined && (typeof value.merge_recommendation!=="string" || !["REQUEST_CHANGES","COMMENT","APPROVE"].includes(value.merge_recommendation))) errors.push("merge_recommendation:invalid_enum");
     if (value.highest_risk !== undefined && typeof value.highest_risk !== "string") errors.push("highest_risk:string_required");

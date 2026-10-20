@@ -18,8 +18,9 @@ function parseReviewSlice(slice: string): string | null {
 /** `slice` with the escapes JSON forbids made literal, for a model that wrote LaTeX or regex text into a
  * string (live 2026-10-20, Grok: a LaTeX ldots command inside a review string, "Invalid \escape"). Only
  * inside strings: a backslash that does not start one of JSON's escapes (quote, backslash, slash, b, f, n,
- * r, t, uXXXX) is doubled, so the text keeps its backslash; a raw control character in a string is
- * escaped. Applied only after the strict parse failed. Mirrors extension/json.js repairJsonEscapes. */
+ * r, t, uXXXX) is doubled, so the text keeps its backslash; every raw control character U+0000-U+001F in
+ * a string is escaped (\b \f \n \r \t, else \uXXXX). Applied only after the strict parse failed.
+ * Mirrors extension/json.js repairJsonEscapes. */
 export function repairJsonEscapes(slice: string): string {
   let out = "";
   let inStr = false;
@@ -34,9 +35,12 @@ export function repairJsonEscapes(slice: string): string {
       out += "\\\\";
       continue;
     }
-    if (c === "\n") { out += "\\n"; continue; }
-    if (c === "\r") { out += "\\r"; continue; }
-    if (c === "\t") { out += "\\t"; continue; }
+    // Every raw control character (U+0000-U+001F) is invalid inside a JSON string.
+    if (c < " ") {
+      const short: Record<string, string> = {"\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"};
+      out += short[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`;
+      continue;
+    }
     out += c;
   }
   return out;
@@ -97,6 +101,112 @@ export function lastJsonObject(text: string, accept: (value: unknown) => boolean
 /** Walk backward from each closing brace so thinking traces with extra `{` cannot swallow the payload. */
 export function lastReviewJson(text: string): string | null {
   return lastJsonObjectRange(text, isReviewObject, true)?.json ?? null;
+}
+
+// ---- A review cut off mid-answer (live 2026-10-20: all 24 raw captures ended inside `coverage`) ----
+
+/** Where the last review object starts in `text`: its opening brace, before a review key. Whatever sits
+ * before it (a "JSON" / "Grok" / "×N" label, an unclosed ```json fence, an `<escape>` tag, prose) is not
+ * part of the object and is never read. -1 when none. */
+export function lastReviewStart(text: string): number {
+  const re = /\{\s*"(?:merge_recommendation|findings|highest_risk|investigated_safe|assumptions|coverage|keep)"\s*:/g;
+  const s = String(text || "");
+  let last = -1;
+  for (let m = re.exec(s); m; m = re.exec(s)) last = m.index;
+  return last;
+}
+
+type ReviewScan = { complete: boolean; inString: boolean; findingsEnd: number; cuts: { end: number; closers: string }[] };
+
+/** One forward pass over a review slice: whether its root closed, where the top-level `findings` array
+ * ended (-1: it did not), and every place it could be cut cleanly with the closers that would finish it. */
+function scanReview(s: string): ReviewScan {
+  const stack: string[] = [];
+  const cuts: { end: number; closers: string }[] = [];
+  let inStr = false, esc = false, strStart = -1;
+  let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') {
+        inStr = false;
+        if (stack.length === 1 && stack[0] === "{") {
+          let j = i + 1;
+          while (j < s.length && /\s/.test(s[j])) j += 1;
+          if (s[j] === ":") {
+            let key = "";
+            try { key = JSON.parse(s.slice(strStart, i + 1)) as string; } catch { key = ""; }
+            afterFindingsKey = key === "findings";
+          }
+        }
+      }
+      continue;
+    }
+    if (c === '"') { inStr = true; strStart = i; continue; }
+    if (c === "{" || c === "[") {
+      if (c === "[" && afterFindingsKey && stack.length === 1) findingsActive = true;
+      afterFindingsKey = false;
+      stack.push(c);
+    } else if (c === "}" || c === "]") {
+      stack.pop();
+      if (stack.length === 0) { rootClosed = true; break; }
+      if (c === "]" && findingsActive && stack.length === 1) { findingsEnd = i + 1; findingsActive = false; }
+      cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join("") });
+    }
+  }
+  return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, cuts };
+}
+
+/** A review whose text stopped before it finished, recovered ONLY when everything the verdict rests on
+ * arrived: `merge_recommendation` and the whole `findings` array. What follows (coverage, notes) is kept
+ * up to its last complete element and the open string, array and object are closed there; the result
+ * carries `truncated: true` so nothing downstream reads it as a full, clean review. A reply cut inside
+ * `findings`, or one that never reached `merge_recommendation`, is not recovered (null): a dropped
+ * finding is worse than a missing one. A missing `[` after `"coverage":` (Grok's page text) is supplied. */
+export function recoverTruncatedReviewJson(text: string): string | null {
+  const s = String(text || "");
+  const start = lastReviewStart(s);
+  if (start < 0) return null;
+  const slice = s.slice(start).replace(/("coverage"\s*:\s*)(\{)/, "$1[$2");
+  const scan = scanReview(slice);
+  if (scan.complete || scan.findingsEnd < 0) return null;
+  for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
+    const cut = scan.cuts[n];
+    if (cut.end < scan.findingsEnd) break;
+    const candidate = slice.slice(0, cut.end) + cut.closers;
+    for (const body of [candidate, repairJsonEscapes(candidate)]) {
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") return JSON.stringify({ ...parsed, truncated: true });
+      } catch { /* try the escape-repaired form, then an earlier cut */ }
+    }
+  }
+  return null;
+}
+
+export type ReviewTextStatus = "complete" | "recovered-truncated" | "truncated" | "invalid" | "none";
+export type ReviewTextClass = { status: ReviewTextStatus; json?: string };
+
+/** What a captured reply is, never a silent null: "complete" (a whole review object, invalid escapes
+ * made literal when the strict parse failed), "recovered-truncated" (cut off but its verdict and
+ * findings intact: json carries `truncated: true`), "truncated" (cut off before its findings finished:
+ * nothing to recover, the reply is partial), "invalid" (a review object that closed but does not
+ * parse) or "none" (no review object in the text). */
+export function classifyReviewText(text: string): ReviewTextClass {
+  const strict = lastReviewJson(text);
+  if (strict) return { status: "complete", json: strict };
+  const recovered = recoverTruncatedReviewJson(text);
+  if (recovered) return { status: "recovered-truncated", json: recovered };
+  const start = lastReviewStart(text);
+  if (start < 0) return { status: "none" };
+  return { status: scanReview(String(text).slice(start)).complete ? "invalid" : "truncated" };
+}
+
+/** extractChatJson, then a truncated review recovered by recoverTruncatedReviewJson. */
+export function extractChatJsonRecovering(text: string): string | null {
+  return extractChatJson(text) ?? recoverTruncatedReviewJson(text);
 }
 
 /** ChatGPT's citation marker (live aicc #455/#457): the model writes

@@ -1,7 +1,7 @@
 import { prScopeSection } from "./pr-scope.ts";
 import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
-import { extractChatJson } from "./extract-chat-json.ts";
+import { extractChatJsonRecovering } from "./extract-chat-json.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import { crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
 import { extractReviewPolicy, policyPathsFor } from "./github-snapshot.ts";
@@ -363,7 +363,7 @@ export function buildMergePrompt(opts: {
 export function parseChatSubmission(raw: string): Record<string, unknown> | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  const extracted = extractChatJson(trimmed);
+  const extracted = extractChatJsonRecovering(trimmed);
   const body = extracted || trimmed;
   try {
     const parsed = JSON.parse(body) as unknown;

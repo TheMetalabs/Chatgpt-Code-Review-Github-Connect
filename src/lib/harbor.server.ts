@@ -1432,12 +1432,21 @@ export async function submitHarborChat(
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
   const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
+  // A complete verdict with no finding is what a clean review is built from: a failed leg beside it must
+  // not vanish (below). Beside findings, or with no complete verdict at all, nothing posts as clean.
+  // (A verify-clean round has its own guard: the local verifier re-reads the snapshot before any clean
+  // result posts, and that flow keeps its auxiliary-evidence handling.)
+  const wouldReadClean = !localVerifies({ role, providers }) && complete.size > 0 &&
+    ![...complete].some((p) => (byProvider.get(p)?.findings.length ?? 0) > 0);
   for (const provider of incompletePayloadProviders) {
     // An auxiliary reply that never became review JSON is out-of-band evidence. A malformed text
     // fragment can contain severity-looking prose (or a partial finding object); that marker is not
     // a gated finding and must not poison a complete canonical verdict. Valid structured findings
-    // remain in `byProvider` and are merged below.
-    if (isAuxiliaryChat(provider) && rawCauses[provider] === "unparseable") {
+    // remain in `byProvider` and are merged below. Beside a CLEAN canonical verdict it is not exempt:
+    // the failed leg is a reviewer that did not finish, so its reply posts verbatim and the result is
+    // never "no major issues" (live aicc-center#1091: Grok's truncated REQUEST_CHANGES with a P1 was
+    // dropped beside ChatGPT's clean verdict).
+    if (isAuxiliaryChat(provider) && rawCauses[provider] === "unparseable" && !wouldReadClean) {
       auxiliaryProviderFailures[provider] = "unparseable";
     }
   }
@@ -1472,6 +1481,7 @@ export async function submitHarborChat(
     incompleteProviders.push(canonicalProvider);
   }
   const canonicalGates = [...canonicalByProvider.values()];
+  const truncatedLegs = [...canonicalByProvider].filter(([, gate]) => gate.truncated).map(([provider]) => provider);
   const rawCausesForBody = Object.fromEntries(
     Object.entries(rawCauses).filter(([provider]) => !auxiliaryProviders.has(provider as ReviewProvider)),
   ) as Partial<Record<ReviewProvider, RawCause>>;
@@ -1619,7 +1629,7 @@ export async function submitHarborChat(
       auxiliaryProviderFailures: auxiliaryFailures,
       coverage: [...coverageByFile.values()],
       droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
-      plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}.`,
+      plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,
       updatedAt: Date.now(),
@@ -1648,6 +1658,17 @@ function gateLeg(
   preserveSchemaRejectedEvidence = false,
 ): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
   const parsed = parseChatSubmission(leg.raw);
+  // A reply cut off after its verdict with no finding (extract-chat-json recoverTruncatedReviewJson):
+  // never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.
+  if (parsed?.truncated === true && !(Array.isArray(parsed.findings) && parsed.findings.length)) {
+    const evidence = verdictEvidence(parsed, { ...leg, raw: leg.originalText?.trim() || leg.raw });
+    return {
+      gate: gateLiveSubmission(evidence, sample, state.settings),
+      verdict: false,
+      unusable: "the reply was cut off before it finished (coverage incomplete)",
+      cause: "truncated",
+    };
+  }
   const gate = gateLiveSubmission(parsed, sample, state.settings);
   if (gate.ok && gate.rawReview) {
     // The bridge wraps schema-rejected chat JSON in a raw_review envelope when repair is off. The

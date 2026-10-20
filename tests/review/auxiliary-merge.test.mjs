@@ -32,7 +32,9 @@ async function posted(app, out) {
   return app.reviews[0].body;
 }
 
-test('canonical ChatGPT clean stays clean beside malformed auxiliary Grok raw', async (t) => {
+test('a CLEAN ChatGPT verdict does not stay clean beside a malformed auxiliary Grok reply: its reply posts verbatim', async (t) => {
+  // Reversed from the original contract (aicc-center#1091, 2026-10-20): Grok's truncated REQUEST_CHANGES
+  // with a P1 was dropped beside ChatGPT's clean verdict and the review read "no major issues".
   const app = await appFixture({reviewLocal: false, reviewGrok: true});
   t.after(() => app.close());
   const out = await app.mention('auxiliary-malformed-raw');
@@ -43,11 +45,28 @@ test('canonical ChatGPT clean stays clean beside malformed auxiliary Grok raw', 
   ], {force: true});
   const body = await posted(app, out);
   const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
-  assert.equal(body.split('\n')[0], CLEAN_REVIEW_BODY);
-  assert.equal(isZeroFindings(body, {authoredByBot: true}), true);
-  assert.equal(body.includes(REVIEW_RAW_START), false, 'auxiliary malformed raw is out-of-band evidence');
+  assert.notEqual(body.split('\n')[0], CLEAN_REVIEW_BODY);
+  assert.equal(isZeroFindings(body, {authoredByBot: true}), false);
+  assert.equal(body.includes(REVIEW_RAW_START), true, 'the failed reviewer\'s reply is posted as evidence');
+  assert.match(body, /Review posted verbatim — the reply was not valid review JSON/);
+  assert.match(body, /No complete review from grok/);
+  assert.deepEqual({...job.auxiliaryProviderFailures}, {});
+  assert.deepEqual({...job.rawCauses}, {grok: 'unparseable'});
+});
+
+test('a malformed auxiliary Grok reply is still out-of-band beside a ChatGPT verdict that has findings', async (t) => {
+  const app = await appFixture({reviewLocal: false, reviewGrok: true});
+  t.after(() => app.close());
+  const out = await app.mention('auxiliary-malformed-with-findings');
+  await eventually(() => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId)?.status === 'awaiting_chat', 'snapshot not ready');
+  await app.harbor.submitHarborChat(out.jobId, grokFinding, [
+    {provider: 'chatgpt', raw: grokFinding},
+    {provider: 'grok', raw: malformedWithFindingMarker},
+  ], {force: true});
+  const body = await posted(app, out);
+  const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
+  assert.equal(body.includes(REVIEW_RAW_START), false);
   assert.deepEqual({...job.auxiliaryProviderFailures}, {grok: 'unparseable'});
-  assert.deepEqual(job.rawCauses ?? {}, {});
 });
 
 test('bridge-salvaged schema-rejected auxiliary Grok stays blocking evidence', async (t) => {

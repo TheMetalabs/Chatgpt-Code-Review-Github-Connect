@@ -245,6 +245,32 @@ function stopButtonVisible(root = document) {
   return false;
 }
 
+/** UI labels Grok renders before an answer (live 2026-10-20: "Grok", "×15 JSON ×5" ahead of the review
+ * JSON): the sender name, a repeat counter, a code block's language tag, a copy control's name. Only
+ * leading lines made of nothing else are dropped; the answer's own text is never touched. */
+function grokStripUiLabels(text) {
+  const label = /^(?:(?:grok|×\s*\d+|json|copy|복사)\s*)+$/i;
+  const lines = String(text || "").split("\n");
+  let start = 0;
+  while (start < lines.length && (!lines[start].trim() || label.test(lines[start].trim()))) start += 1;
+  return lines.slice(start).join("\n").trim();
+}
+/** The rendered text of an answer turn without Grok's leading UI labels (json.js declares the
+ * ChatGPT reading; this declaration replaces it on grok.com). */
+function cleanTurnText(el) {
+  return grokStripUiLabels(visibleText(el));
+}
+
+/** A structured answer that ends inside a string or container is handed on as truncated only after its
+ * text has stood still this long with the stream gone: a hidden or throttled tab can show identical
+ * partial text on two polls while Grok is still writing, and a leg ended there posts a cut-off reply. */
+function grokIncompleteSettleMs() { return 45_000; } // a function: this file is re-injected (no top-level const)
+function grokIncompleteSettled(text) {
+  const seen = globalThis.__ashlarGrokIncomplete;
+  if (!seen || seen.text !== text) { globalThis.__ashlarGrokIncomplete = {text, since: Date.now()}; return false; }
+  return Date.now() - seen.since >= grokIncompleteSettleMs();
+}
+
 /** Ancestors of a bubble that hold this answer's action row and no other turn. The composer stays
  * out: its stop button belongs to whatever request is in flight, not to this answer. */
 function grokAnswerRoot(bubble) {
@@ -319,7 +345,8 @@ function grokReplyDoneVisible(root) {
   const bubble = root.matches?.("[data-testid='assistant-message']") ? root : root.querySelector("[data-testid='assistant-message']");
   if (!bubble) return false;
   if (grokStreamVisible(document)) return false;
-  const text = (bubble.innerText || bubble.textContent || "").trim();
+  // The sender label alone ("Grok") is a bubble Grok has not filled yet, not an answer.
+  const text = grokStripUiLabels(bubble.innerText || bubble.textContent || "");
   // Grok can expose copy/feedback controls for a collapsed reasoning turn before it has mounted
   // the final answer. Those controls are not completion evidence: a transcript containing only
   // "Analyzing …" lines and the elapsed-time label must keep polling for the late answer.
@@ -333,6 +360,7 @@ function grokReplyDoneVisible(root) {
   // reply is eligible for repair only after this submission recorded its own stream and the
   // stream controls disappeared; a pre-stream Copy must keep polling for the final answer.
   if (incomplete && !grokSawCurrentStream(root)) return false;
+  if (incomplete && !grokIncompleteSettled(text)) return false;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;
     const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();

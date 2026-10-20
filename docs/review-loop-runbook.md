@@ -151,6 +151,16 @@ code, so a future skill or change can find the rule instead of re-learning it.
   carries `userInput` and `renderDiffers` (history/log event `turn_render_differs`). A preserved
   `edited`/`regenerated` leg whose page reports `userInput:false` stays in the ledger and is swept.
   ChatGPT and fix runs keep the DOM-only verdict.
+- **Partial and raw Grok answers (1.1.73).** The raw observation texts of the 2026-10-20 run (jobs 1330,
+  1250, 1314, 1387) were the sender label alone, a reply cut off mid array, and LaTeX inside a JSON
+  string. `final:false` on an observation says nothing (the server writes it on every one), and the
+  `cause=edited` cleanup follows a captured source; it does not end the leg. Fixes: a Grok bubble that
+  holds only UI labels ("Grok", "×N", "JSON") is not an answer and those leading labels are stripped; an
+  incomplete structured answer is handed on as truncated only after standing still 45 s with the stream
+  gone; the review JSON is read from the code block literally (a folded block's hidden tail included)
+  before the rendered text; a close is held back (`cause: generating`) while Grok's stop control is up;
+  and a review string with invalid escapes (`\ldots`, `\(`, a raw newline) is read again with those made
+  literal after the strict parse failed (`repairJsonEscapes`, extension and server).
 
 ### Deploys
 

@@ -15,6 +15,33 @@ function parseReviewSlice(slice: string): string | null {
   }
 }
 
+/** `slice` with the escapes JSON forbids made literal, for a model that wrote LaTeX or regex text into a
+ * string (live 2026-10-20, Grok: a LaTeX ldots command inside a review string, "Invalid \escape"). Only
+ * inside strings: a backslash that does not start one of JSON's escapes (quote, backslash, slash, b, f, n,
+ * r, t, uXXXX) is doubled, so the text keeps its backslash; a raw control character in a string is
+ * escaped. Applied only after the strict parse failed. Mirrors extension/json.js repairJsonEscapes. */
+export function repairJsonEscapes(slice: string): string {
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < slice.length; i += 1) {
+    const c = slice[i];
+    if (!inStr) { out += c; if (c === '"') inStr = true; continue; }
+    if (c === '"') { out += c; inStr = false; continue; }
+    if (c === "\\") {
+      const n = slice[i + 1];
+      if (n !== undefined && '"\\/bfnrt'.includes(n)) { out += c + n; i += 1; continue; }
+      if (n === "u" && /^[0-9a-fA-F]{4}$/.test(slice.slice(i + 2, i + 6))) { out += slice.slice(i, i + 6); i += 5; continue; }
+      out += "\\\\";
+      continue;
+    }
+    if (c === "\n") { out += "\\n"; continue; }
+    if (c === "\r") { out += "\\r"; continue; }
+    if (c === "\t") { out += "\\t"; continue; }
+    out += c;
+  }
+  return out;
+}
+
 /** Slice of `text` that is the last balanced JSON object `accept` validates, with offsets. */
 export type JsonObjectSlice = { json: string; start: number; end: number }; // end exclusive
 
@@ -24,7 +51,7 @@ export type JsonObjectSlice = { json: string; start: number; end: number }; // e
  * (and its start/end offsets into `text`). Shared by the review extractor and the
  * fix-agent extractor (design §6 mechanism A).
  */
-export function lastJsonObjectRange(text: string, accept: (value: unknown) => boolean): JsonObjectSlice | null {
+export function lastJsonObjectRange(text: string, accept: (value: unknown) => boolean, repair = false): JsonObjectSlice | null {
   const s = String(text || "");
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
@@ -46,7 +73,13 @@ export function lastJsonObjectRange(text: string, accept: (value: unknown) => bo
           try {
             if (accept(JSON.parse(slice))) return { json: slice, start: i, end: end + 1 };
           } catch {
-            /* not valid JSON at this slice; keep walking */
+            // Strict parse failed: a review (only) is read again with invalid escapes made literal.
+            if (repair) {
+              const fixed = repairJsonEscapes(slice);
+              try {
+                if (fixed !== slice && accept(JSON.parse(fixed))) return { json: fixed, start: i, end: end + 1 };
+              } catch { /* not valid JSON even repaired; keep walking */ }
+            }
           }
           break;
         }
@@ -63,7 +96,7 @@ export function lastJsonObject(text: string, accept: (value: unknown) => boolean
 
 /** Walk backward from each closing brace so thinking traces with extra `{` cannot swallow the payload. */
 export function lastReviewJson(text: string): string | null {
-  return lastJsonObject(text, isReviewObject);
+  return lastJsonObjectRange(text, isReviewObject, true)?.json ?? null;
 }
 
 /** ChatGPT's citation marker (live aicc #455/#457): the model writes
@@ -87,12 +120,12 @@ export function extractChatJsonRange(text: string): JsonObjectSlice | null {
   const s = String(text || "");
   if (!s.trim()) return null;
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
-  const plain = lastJsonObjectRange(s, isReviewObject);
+  const plain = lastJsonObjectRange(s, isReviewObject, true);
   if (plain) return plain;
   // Only a transcript that yields nothing as written is read again without citation markers.
   const cleaned = withoutCitationMarkers(s);
   if (!cleaned) return null;
-  const fromCleaned = lastJsonObjectRange(cleaned, isReviewObject);
+  const fromCleaned = lastJsonObjectRange(cleaned, isReviewObject, true);
   if (!fromCleaned) return null;
   const idx = s.lastIndexOf(fromCleaned.json);
   if (idx < 0) return { json: fromCleaned.json, start: -1, end: -1 };
@@ -111,7 +144,7 @@ export function extractChatJsonParts(text: string): { json: string; residual: st
   const s = String(text || "");
   if (!s.trim()) return null;
   const tryParts = (src: string): { json: string; residual: string } | null => {
-    const span = lastJsonObjectRange(src, isReviewObject);
+    const span = lastJsonObjectRange(src, isReviewObject, true);
     if (!span) return null;
     const around = unwrapFence(src.slice(0, span.start), src.slice(span.end));
     return { json: span.json, residual: `${around.before}\n${around.after}`.trim() };

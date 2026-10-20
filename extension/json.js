@@ -3,12 +3,42 @@ function isReviewObject(value) {
   return "findings" in value || "merge_recommendation" in value || "keep" in value;
 }
 
+/** `slice` with the escapes JSON forbids made literal, for a model that wrote LaTeX or regex text into a
+ * string (live 2026-10-20, Grok: a LaTeX ldots command inside a review string, "Invalid \escape"). Only
+ * inside strings: a backslash that does not start one of JSON's escapes (quote, backslash, slash, b, f, n,
+ * r, t, uXXXX) is doubled, so the text keeps its backslash; a raw control character in a string is
+ * escaped. Used only after the strict parse failed (parseReviewSlice); mirrors
+ * src/lib/extract-chat-json.ts repairJsonEscapes. */
+function repairJsonEscapes(slice) {
+  let out = "", inStr = false;
+  for (let i = 0; i < slice.length; i += 1) {
+    const c = slice[i];
+    if (!inStr) { out += c; if (c === '"') inStr = true; continue; }
+    if (c === '"') { out += c; inStr = false; continue; }
+    if (c === "\\") {
+      const n = slice[i + 1];
+      if (n !== undefined && '"\\/bfnrt'.includes(n)) { out += c + n; i += 1; continue; }
+      if (n === "u" && /^[0-9a-fA-F]{4}$/.test(slice.slice(i + 2, i + 6))) { out += slice.slice(i, i + 6); i += 5; continue; }
+      out += "\\\\";
+      continue;
+    }
+    if (c === "\n") { out += "\\n"; continue; }
+    if (c === "\r") { out += "\\r"; continue; }
+    if (c === "\t") { out += "\\t"; continue; }
+    out += c;
+  }
+  return out;
+}
+
 function parseReviewSlice(slice) {
   try {
     const parsed = JSON.parse(slice);
     return isReviewObject(parsed) ? slice : null;
   } catch {
-    return null;
+    // Only a slice the strict parse rejected is read again with invalid escapes made literal.
+    const repaired = repairJsonEscapes(slice);
+    if (repaired === slice) return null;
+    try { return isReviewObject(JSON.parse(repaired)) ? repaired : null; } catch { return null; }
   }
 }
 
@@ -324,6 +354,17 @@ function boundAnswerText(kind, root, stats) {
 
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
+  // Grok: the answer's code blocks hold its JSON LITERALLY (rendered Markdown rewrites escapes and
+  // drops characters, and a folded block's hidden tail is only in the code element); the rendered
+  // corpus is the fallback for an answer written outside a fence. ChatGPT reads the corpus only.
+  if (globalThis.__ashlarRunnerState?.provider === "grok") {
+    let blocks = [];
+    try { blocks = assistantCodeBlocks(opts?.root); } catch { blocks = []; }
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const hit = extractChatJson(blocks[i]);
+      if (hit && (allowThin || !findingsJsonTooThin(hit))) return hit;
+    }
+  }
   const chunks = assistantCorpus(opts?.root);
   for (let i = chunks.length - 1; i >= 0; i -= 1) {
     const hit = extractChatJson(chunks[i]);
@@ -1791,6 +1832,14 @@ function installReviewRunner(name, run) {
       // send recorded none: fixVerdictPermanent) or one the worker gives up identifying (preserve)
       // stays open but is no longer Ashlar's: free its managed slot, or it counts against tab
       // capacity (untracked binding) until the user closes it by hand.
+      // Grok: a verdict that would close the tab is held back while the answer is still being written (its
+      // stop control is up): the worker asks again, and a close never cuts a generation short.
+      if (owned && !fixRun && msg.type === "ashlar-can-close" && state.provider === "grok" && typeof stopButtonVisible === "function" && stopButtonVisible()) {
+        reply({ok:true,releaseProtocol:1,blank:false,unsent:false,ownership:"unknown",cause:"generating",generating:true,owned:false,canClose:false,
+          reason:"pending",userInput:userInputSeen(),renderDiffers:Boolean(state.turnRenderDiffers),running:Boolean(state.running),
+          hasResult:Boolean(state.result),url:globalThis.location?.href || ""});
+        return;
+      }
       const permanent = fixVerdictPermanent(verdict);
       // A review leg the generating lease failed (#87) under a Stop that never clears can never prove
       // a close: the tab is kept ("stalled", preserved and retired like a takeover), and its managed

@@ -188,3 +188,17 @@ code, so a future skill or change can find the rule instead of re-learning it.
 - Extension and server PRs are predeployed before merge. When both change, deploy the server first
   (#122: extension 1.1.52 against an older server ends a salvaged leg as a failure instead of posting
   it).
+- **JSON conversion rate (1.1.75).** Over the 163 raw/failed legs of 2026-10-06..10-20
+  (`tests/review/fixtures/raw-corpus-v2`, `tests/review/raw-corpus-v2.test.mjs`): (1) format-only
+  normalization (`normalizeReviewFormat`, extension and server): a bare `"` inside a string that cannot end
+  it (shell / UI text) is escaped, a missing `[` after the root's `"findings":` is supplied, text after the
+  root is dropped; no word of the reply changes. The server also re-reads a worker's salvage envelope from
+  its page text before posting it verbatim. (2) Gate rule (Horim): a reply cut off in `coverage` after a
+  complete verdict whose `findings` array is complete, closed and EMPTY and whose merge_recommendation is
+  not REQUEST_CHANGES is that reviewer's verdict: the review's first line is "Didn't find any major
+  issues." (the gate passes), a "Coverage incomplete" note names the reviewer and posts its reply verbatim
+  (redacted from the public snapshot), the coverage marker carries `incomplete=<providers>` and the
+  findings marker `coverage=incomplete` (`Job.coverageCutProviders`). It must still pass the gate as it is
+  (an empty reply without investigated_safe stays an Instant-tier skip). A reply cut before or inside its
+  findings, or REQUEST_CHANGES with no finding, stays raw / incomplete (aicc-center#1091). (3) Prompt: one
+  JSON object only, every inner `"` escaped, keys in order with `findings` before `coverage`.

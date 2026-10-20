@@ -135,6 +135,32 @@ test('a recovered truncated reply with no finding is never a complete verdict; o
   }
 });
 
+test('a truncated reply with no finding never earns clean credit, even with a raw_review text riding along', () => {
+  const why = /cut off before it finished/;
+  assert.match(incompleteVerdict({ok: true, truncated: true, findings: [], rawReview: 'the reviewer\'s own text'}, {}), why);
+  assert.match(incompleteVerdict({ok: true, truncated: true, findings: []}, {}), why);
+  assert.equal(incompleteVerdict({ok: true, truncated: true, findings: [{severity: 'P1'}], rawReview: 'x'}, {}), undefined, 'findings are a verdict');
+  assert.equal(incompleteVerdict({ok: true, rawReview: 'x'}, {}), undefined, 'an ordinary salvage keeps its exit');
+});
+
+test('the missing "[" is supplied after the ROOT coverage key only, never inside a string or a nested object', () => {
+  const finding = {severity: 'P2', file: 'a.ts', line: 1, side: 'RIGHT', title: 'T', failure_scenario: 's', root_cause: 'r',
+    evidence: 'code: {"coverage": {"a": 1}} and \\"coverage\\": { in prose', recommended_fix: 'f', recommended_test: 't',
+    extra: {coverage: {file: 'nested.ts', status: 'cleared'}}};
+  const head = JSON.stringify({merge_recommendation: 'REQUEST_CHANGES', highest_risk: 'r', findings: [finding]}).slice(0, -1);
+  // The root's coverage lost its "[" (Grok page text) and is cut off after one whole entry.
+  const text = `Grok\n\nJSON\n${head},"coverage":{"file":"a.ts","status":"cleared","reason":"read"},{"file":"b.ts","status":"not_cl`;
+  for (const [name, recover] of [['server', recoverTruncatedReviewJson], ['extension', ext.recoverTruncatedReviewJson]]) {
+    const recovered = JSON.parse(recover(text));
+    assert.deepEqual(recovered.findings, [finding], `${name}: the finding, nested coverage object and quoted text unchanged`);
+    assert.deepEqual(recovered.coverage, [{file: 'a.ts', status: 'cleared', reason: 'read'}], `${name}: "[" supplied for the root coverage alone`);
+    assert.equal(recovered.truncated, true);
+  }
+  // No root coverage at all: nothing is inserted anywhere.
+  const without = `${head},"highest_risk_note":"x"`;
+  for (const recover of [recoverTruncatedReviewJson, ext.recoverTruncatedReviewJson]) assert.deepEqual(JSON.parse(recover(without)).findings, [finding]);
+});
+
 test('a reply cut off BEFORE its findings finished is classified truncated, never recovered and never null-silent', () => {
   const {text} = bundle['job-mvg2ii4n-41.chatgpt.json'];
   const cut = text.slice(0, /(?<!\\)"findings"\s*:\s*\[/.exec(text).index + 400);

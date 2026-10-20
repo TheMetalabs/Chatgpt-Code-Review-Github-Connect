@@ -262,10 +262,11 @@ export function incompleteVerdict(
   leg: { unparsedText?: string; residualReplies?: string },
 ): string | undefined {
   if (!gate.ok) return gate.reason;
-  if (gate.rawReview) return undefined; // already salvaged verbatim
   // A reply cut off mid-answer (its coverage list never finished) with no finding is not a clean
-  // result: it never earns clean credit. One that carries findings is a verdict (they are merged).
+  // result: it never earns clean credit, even when a raw_review text rides along (checked BEFORE the
+  // salvaged-verbatim exit below). One that carries findings is a verdict (they are merged).
   if (gate.truncated && !gate.findings?.length) return "the reply was cut off before it finished (coverage incomplete)";
+  if (gate.rawReview) return undefined; // already salvaged verbatim
   if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
   if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;

@@ -82,15 +82,22 @@ function lastReviewJson(text) {
 function lastReviewStart(text) {
   const re = /\{\s*"(?:merge_recommendation|findings|highest_risk|investigated_safe|assumptions|coverage|keep)"\s*:/g;
   const s = String(text || "");
-  let last = -1;
-  for (let m = re.exec(s); m; m = re.exec(s)) last = m.index;
+  let last = -1, objectEnd = -1;
+  for (let m = re.exec(s); m; m = re.exec(s)) {
+    // A review key opening an object INSIDE the review being read (a nested `{"coverage": ...}`) is not
+    // another review: only an object that starts after the previous one ended can be the last review.
+    if (m.index < objectEnd) continue;
+    last = m.index;
+    const scan = scanReview(s.slice(m.index));
+    objectEnd = scan.rootEnd >= 0 ? m.index + scan.rootEnd : Infinity;
+  }
   return last;
 }
 
 function scanReview(s) {
   const stack = [], cuts = [];
   let inStr = false, esc = false, strStart = -1;
-  let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false;
+  let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false, coverageObjectAt = -1, rootEnd = -1;
   for (let i = 0; i < s.length; i += 1) {
     const c = s[i];
     if (inStr) {
@@ -105,6 +112,10 @@ function scanReview(s) {
             let key = "";
             try { key = JSON.parse(s.slice(strStart, i + 1)); } catch { key = ""; }
             afterFindingsKey = key === "findings";
+            // The ROOT object's `coverage` whose value is an object, not an array (a missing `[`).
+            let k = j + 1;
+            while (k < s.length && /\s/.test(s[k])) k += 1;
+            if (key === "coverage" && s[k] === "{") coverageObjectAt = k;
           }
         }
       }
@@ -117,12 +128,12 @@ function scanReview(s) {
       stack.push(c);
     } else if (c === "}" || c === "]") {
       stack.pop();
-      if (stack.length === 0) { rootClosed = true; break; }
+      if (stack.length === 0) { rootClosed = true; rootEnd = i + 1; break; }
       if (c === "]" && findingsActive && stack.length === 1) { findingsEnd = i + 1; findingsActive = false; }
       cuts.push({end: i + 1, closers: [...stack].reverse().map(open => (open === "{" ? "}" : "]")).join("")});
     }
   }
-  return {complete: rootClosed && !inStr, inString: inStr, findingsEnd, cuts};
+  return {complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts};
 }
 
 /** A review whose text stopped before it finished, recovered ONLY when everything the verdict rests on
@@ -134,8 +145,14 @@ function recoverTruncatedReviewJson(text) {
   const s = String(text || "");
   const start = lastReviewStart(s);
   if (start < 0) return null;
-  const slice = s.slice(start).replace(/("coverage"\s*:\s*)(\{)/, "$1[$2");
-  const scan = scanReview(slice);
+  let slice = s.slice(start);
+  let scan = scanReview(slice);
+  // The `[` a page's text left out after the root's "coverage": is supplied there only (string-aware: found
+  // by the structural scan at the root object, never by a pattern over the text).
+  if (scan.coverageObjectAt >= 0) {
+    slice = `${slice.slice(0, scan.coverageObjectAt)}[${slice.slice(scan.coverageObjectAt)}`;
+    scan = scanReview(slice);
+  }
   if (scan.complete || scan.findingsEnd < 0) return null;
   for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
     const cut = scan.cuts[n];

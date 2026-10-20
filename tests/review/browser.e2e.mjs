@@ -1539,19 +1539,30 @@ async function harvestAfterSend(page){
  await page.clock.runFor(3200);
  return {out:await page.evaluate(()=>window.fixOut),code};
 }
+// The send's outcome (sent, or the error and its code) is settled by promise turns and page timers that
+// can trail the fake clock's last tick on a loaded runner (a pre-existing flake: ~25% of runs of this test
+// fail on a CPU-starved origin/main). Keep the fake clock moving until the outcome is terminal.
+async function settledFill(page){
+ const read=()=>page.evaluate(()=>({...window.filled,sends:window.sends,sent:window.sent===true,composer:document.querySelector('#prompt-textarea').value}));
+ let state=await read();
+ for(let i=0;i<100&&!state.sent&&state.error===undefined;i++){await page.clock.runFor(200);await new Promise(resolve=>setTimeout(resolve,10));state=await read();}
+ return state;
+}
 test('real DOM: a temporary-chat fix whose sent turn shows ChatGPT\'s file card (in or beside the message) is confirmed and harvested; one without the file is not its send',async t=>{
  const {attachment,typed,text}=await fixDelivery();
  const got={};
  for(const render of ['card','card-rich','beside']){
   const {page,fill,journal}=await attachmentPage(t,{render,collapse:true});
-  const sent=await fill(text);
+  await fill(text);
+  const sent=await settledFill(page);
   const j=await journal();
   const {out,code}=await harvestAfterSend(page);
   got[render]={sent:[sent.sends,sent.sent,sent.code],url:await page.evaluate(()=>location.href),
    journal:[j.phase,j.submittedUsers,j.exact===typed,j.attachments],answer:out.raw===code?'harvested':out};
  }
  const {page,fill,journal}=await attachmentPage(t,{render:'none',collapse:true});
- const none=await fill(text,61_000);
+ await fill(text,61_000);
+ const none=await settledFill(page); // the rejection lands a few real ticks after the fake clock ran
  got.none={sent:[none.sends,none.sent,none.code],clicks:await page.evaluate(()=>window.clicks),phase:(await journal()).phase};
  const shown={sent:[1,true,undefined],url:TEMP_URL,journal:['sent',1,true,[attachment.name]],answer:'harvested'};
  assert.deepEqual(got,{card:shown,'card-rich':shown,beside:shown,none:{sent:[1,false,'send_unconfirmed'],clicks:1,phase:'attempted'}});

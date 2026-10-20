@@ -1,0 +1,1106 @@
+[
+ {
+  "id": "job-mvg2el50-26",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1077",
+  "posted": "2026-10-20 11:35:41",
+  "final": false,
+  "truncated": false,
+  "len": 14278,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\"\"",
+  "tail": "\"   \\\"reason\\\": \\\"Inspected the added anonymizedAt field in list\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 14079",
+   "pos": 14079,
+   "ctx": "\"d test results were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 14263",
+    "pos": 14263,
+    "ctx": "\"ted the added anonymizedAt field in list\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg2ii4n-41",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1086",
+  "posted": "2026-10-20 11:36:34",
+  "final": false,
+  "truncated": false,
+  "len": 15351,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\" {\\n      \\\"file\\\": \\\"backend/test/e2e/store-settings-policy.e2e\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 15278",
+   "pos": 15278,
+   "ctx": "\"d test results were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 15343",
+    "pos": 15343,
+    "ctx": "\"ckend/test/e2e/store-settings-policy.e2e\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg2lbkt-56",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1083",
+  "posted": "2026-10-20 11:39:05",
+  "final": false,
+  "truncated": false,
+  "len": 10754,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\"\\\",\\n      \\\"reason\\\": \\\"Classification and anonymization changes\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 10567",
+   "pos": 10567,
+   "ctx": "\"ion call sites were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 10746",
+    "pos": 10746,
+    "ctx": "\"Classification and anonymization changes\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg2skzi-93",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1076",
+  "posted": "1970-01-01 09:00:00",
+  "final": false,
+  "truncated": false,
+  "len": 11322,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\"t callback forwarding were inspected, but all row action and\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 11085",
+   "pos": 11085,
+   "ctx": "\"ponent contract was not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 11314",
+    "pos": 11314,
+    "ctx": "\"g were inspected, but all row action and\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg2wn6q-113",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1076",
+  "posted": "2026-10-20 11:46:38",
+  "final": false,
+  "truncated": false,
+  "len": 11472,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"highest_ri\"",
+  "tail": "\"  \\\"status\\\": \\\"not_cleared\\\",\\n      \\\"reason\\\": \\\"The anonymizedAt\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 11324",
+   "pos": 11324,
+   "ctx": "\"ip-tab behavior was not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 11464",
+    "pos": 11464,
+    "ctx": "\"ared\\\",\\n      \\\"reason\\\": \\\"The anonymizedAt\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg35r08-155",
+  "prov": "chatgpt",
+  "repo": "WalkieBoard",
+  "pr": "234",
+  "posted": "2026-10-20 11:53:05",
+  "final": false,
+  "truncated": false,
+  "len": 10165,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n<escape>{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\"\"",
+  "tail": "\"ot_cleared\\\",\\n      \\\"reason\\\": \\\"The updated IPC and voice-host\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 10002",
+   "pos": 10002,
+   "ctx": "\"execution have not been verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 10142",
+    "pos": 10142,
+    "ctx": "\"reason\\\": \\\"The updated IPC and voice-host\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": true,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg4bxzc-269",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1077",
+  "posted": "2026-10-20 12:26:54",
+  "final": false,
+  "truncated": false,
+  "len": 14990,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\"\"",
+  "tail": "\" but its complete integration with member loading and dialog\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 14718",
+   "pos": 14718,
+   "ctx": "\"ractions were not fully verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 14975",
+    "pos": 14975,
+    "ctx": "\"tegration with member loading and dialog\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg4f95p-288",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 12:30:53",
+  "final": false,
+  "truncated": false,
+  "len": 16011,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\" \\\"file\\\": \\\"frontend/src/__tests__/pages/store/captureContract\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 15930",
+   "pos": 15930,
+   "ctx": "\"ions for queued capture behavior.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 16003",
+    "pos": 16003,
+    "ctx": "\"rc/__tests__/pages/store/captureContract\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg56lep-352",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1086",
+  "posted": "2026-10-20 12:51:14",
+  "final": false,
+  "truncated": false,
+  "len": 9281,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"hig\"",
+  "tail": "\"rm-ai.controller.ts\\\",\\n      \\\"status\\\": \\\"not_cleared\\\",\\n      \\\"\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 9148",
+   "pos": 9148,
+   "ctx": "\"egration tests were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 9266",
+    "pos": 9266,
+    "ctx": "\",\\n      \\\"status\\\": \\\"not_cleared\\\",\\n      \\\"\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg5qoxb-427",
+  "prov": "grok",
+  "repo": "WalkieBoard",
+  "pr": "244",
+  "posted": "2026-10-20 13:05:04",
+  "final": false,
+  "truncated": false,
+  "len": 3181,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\nJSON\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"APP\"",
+  "tail": "\"\\\"only the new test and Waits hunk reviewed; surrounding test\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 2954",
+   "pos": 2954,
+   "ctx": "\"ons not present in review context\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 3153",
+    "pos": 3153,
+    "ctx": "\"nd Waits hunk reviewed; surrounding test\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg5tl50-441",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 13:10:58",
+  "final": false,
+  "truncated": false,
+  "len": 14379,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\"\"",
+  "tail": "\"ason\\\": \\\"The changed close-label behavior is visible, but all\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 14175",
+   "pos": 14175,
+   "ctx": "\"d callbacks were not established.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 14364",
+    "pos": 14364,
+    "ctx": "\"close-label behavior is visible, but all\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg5tl50-441",
+  "prov": "grok",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 13:10:58",
+  "final": false,
+  "truncated": false,
+  "len": 10050,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\nJSON\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQ\"",
+  "tail": "\"\\\": \\\"cleared\\\", \\\"reason\\\": \\\"queue-instead-of-navigate assertion\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 9870",
+   "pos": 9870,
+   "ctx": "\"nt addition inferred from isLive test\\\" }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 10022",
+    "pos": 10022,
+    "ctx": "\"n\\\": \\\"queue-instead-of-navigate assertion\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg5y0mm-466",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1083",
+  "posted": "2026-10-20 13:12:56",
+  "final": false,
+  "truncated": false,
+  "len": 16061,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"hig\"",
+  "tail": "\"ion-task-context.ts\\\",\\n      \\\"status\\\": \\\"not_cleared\\\",\\n      \\\"\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 15912",
+   "pos": 15912,
+   "ctx": "\"h all persisted context variants.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 16046",
+    "pos": 16046,
+    "ctx": "\",\\n      \\\"status\\\": \\\"not_cleared\\\",\\n      \\\"\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg5y0mm-466",
+  "prov": "grok",
+  "repo": "aicc-center",
+  "pr": "1083",
+  "posted": "2026-10-20 13:12:56",
+  "final": false,
+  "truncated": false,
+  "len": 4121,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n\\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\"",
+  "tail": "\",\\n{\\\"file\\\": \\\"backend/src/common/guards/store-scope.guard.ts\\\",\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected double-quoted property name in JSON at position 3870",
+   "pos": 3870,
+   "ctx": "\" read, codes added with status/krMsg\\\"},\\n{\\\"file\\\": \\\"backend/src/common/error-codes\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Expected double-quoted property name in JSON at position 3870",
+    "pos": 3870,
+    "ctx": "\" read, codes added with status/krMsg\\\"},\\n{\\\"file\\\": \\\"backend/src/common/error-codes\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg61ie4-490",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1086",
+  "posted": "2026-10-20 13:14:33",
+  "final": false,
+  "truncated": false,
+  "len": 8971,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"highest_ri\"",
+  "tail": "\"capture-intake/services/receipt.service.ts\\\",\\n      \\\"status\\\":\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 8860",
+   "pos": 8860,
+   "ctx": "\" module wiring were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unexpected end of JSON input",
+    "pos": null,
+    "ctx": null
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg853lo-704",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 14:13:51",
+  "final": false,
+  "truncated": false,
+  "len": 12981,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\"\"",
+  "tail": "\"alization paths were not verified.\\\"\\n    },\\n    {\\n      \\\"file\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 12947",
+   "pos": 12947,
+   "ctx": "\"lization paths were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 12966",
+    "pos": 12966,
+    "ctx": "\" not verified.\\\"\\n    },\\n    {\\n      \\\"file\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvg91dpo-773",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1083",
+  "posted": "2026-10-20 14:38:49",
+  "final": false,
+  "truncated": false,
+  "len": 13633,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"hig\"",
+  "tail": "\"b/store/members/components/MemberNotesTab.js\\\",\\n      \\\"status\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 13515",
+   "pos": 13515,
+   "ctx": "\"tion contracts were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 13618",
+    "pos": 13618,
+    "ctx": "\"onents/MemberNotesTab.js\\\",\\n      \\\"status\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgaxcro-842",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 15:34:49",
+  "final": false,
+  "truncated": false,
+  "len": 14243,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\"he added presentation tests; they were not executed.\\\"\\n    },\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 14234",
+   "pos": 14234,
+   "ctx": "\"on tests; they were not executed.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unexpected end of JSON input",
+    "pos": null,
+    "ctx": null
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgbfzck-854",
+  "prov": "grok",
+  "repo": "WalkieBoard",
+  "pr": "243",
+  "posted": "2026-10-20 15:45:41",
+  "final": false,
+  "truncated": false,
+  "len": 3403,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n\\\"merge_recommendation\\\": \\\"APPROVE\\\",\\n\\\"highes\"",
+  "tail": "\"eavy-lock_test_sim.sh\\\", \\\"status\\\": \\\"cleared\\\", \\\"reason\\\": \\\"PATH\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected double-quoted property name in JSON at position 2275",
+   "pos": 2275,
+   "ctx": "\"entation-only hunk reviewed in full\\\" },\\n{ \\\"file\\\": \\\"scripts/local-gate-job.sh\\\", \\\"\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Expected double-quoted property name in JSON at position 2275",
+    "pos": 2275,
+    "ctx": "\"entation-only hunk reviewed in full\\\" },\\n{ \\\"file\\\": \\\"scripts/local-gate-job.sh\\\", \\\"\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgc6vw3-890",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 16:09:33",
+  "final": false,
+  "truncated": false,
+  "len": 15353,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"REQUEST_CHANGES\\\",\\n  \\\"hi\"",
+  "tail": "\"ing and tab filtering; the complete status-page data-loading\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 15107",
+   "pos": 15107,
+   "ctx": "\"r; all callers were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 15345",
+    "pos": 15345,
+    "ctx": "\"g; the complete status-page data-loading\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgc6vw3-890",
+  "prov": "grok",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 16:09:33",
+  "final": false,
+  "truncated": false,
+  "len": 9669,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\nJSON\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"APP\"",
+  "tail": "\"matches implemented ids-only bulk and persisted input\\\" }\\n  ]\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 9637",
+   "pos": 9637,
+   "ctx": "\"ted ids-only bulk and persisted input\\\" }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Expected ',' or '}' after property value in JSON at position 9641",
+    "pos": 9641,
+    "ctx": "\"ids-only bulk and persisted input\\\" }\\n  ]\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgdiywz-937",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1077",
+  "posted": "2026-10-20 16:51:05",
+  "final": false,
+  "truncated": false,
+  "len": 12835,
+  "head": "\"JSON\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"hig\"",
+  "tail": "\"tests__/MembershipSplitDialog.test.js\\\",\\n      \\\"status\\\": \\\"not\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'J', \"JSON\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 12699",
+   "pos": 12699,
+   "ctx": "\"cution results were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 12820",
+    "pos": 12820,
+    "ctx": "\"litDialog.test.js\\\",\\n      \\\"status\\\": \\\"not\""
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvge0ycx-954",
+  "prov": "chatgpt",
+  "repo": "aicc-center",
+  "pr": "1090",
+  "posted": "2026-10-20 16:58:16",
+  "final": false,
+  "truncated": false,
+  "len": 10511,
+  "head": "\"```json\\n{\\n  \\\"merge_recommendation\\\": \\\"COMMENT\\\",\\n  \\\"highest_ri\"",
+  "tail": "\"eared\\\",\\n      \\\"reason\\\": \\\"The changed capture-shell interface\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token '`', \"```json\n{\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 10332",
+   "pos": 10332,
+   "ctx": "\"e-flow callers were not verified.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unterminated string in JSON at position 10503",
+    "pos": 10503,
+    "ctx": "\"n\\\": \\\"The changed capture-shell interface\""
+   }
+  },
+  "signals": {
+   "leadingLabel": false,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 1,
+   "multiTopLevel": false
+  }
+ },
+ {
+  "id": "job-mvgezanw-981",
+  "prov": "grok",
+  "repo": "aicc-center",
+  "pr": "1091",
+  "posted": "2026-10-20 17:24:22",
+  "final": false,
+  "truncated": false,
+  "len": 7653,
+  "head": "\"Grok\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\nJSON\\n\\n\\n\\n\\n{\\n  \\\"merge_recommendation\\\": \\\"REQ\"",
+  "tail": "\"vices/store/storeAiMediaSettingsService.js\\\",\\n      \\\"status\\\":\"",
+  "strict": {
+   "ok": false,
+   "err": "Unexpected token 'G', \"Grok\n\n\n\n\n\n\"... is not valid JSON",
+   "pos": null,
+   "ctx": null
+  },
+  "fence": "none",
+  "brace": {
+   "ok": false,
+   "err": "Expected ',' or ']' after array element in JSON at position 7526",
+   "pos": 7526,
+   "ctx": "\"ng the mirrored error codes read.\\\"\\n    }\""
+  },
+  "balanced": {
+   "complete": false,
+   "trailing": null,
+   "parse": {
+    "ok": false,
+    "err": "Unexpected end of JSON input",
+    "pos": null,
+    "ctx": null
+   }
+  },
+  "signals": {
+   "leadingLabel": true,
+   "escapeTag": false,
+   "ctrlChars": 0,
+   "rawNewlineInString": null,
+   "badEscapes": [],
+   "smartQuotes": 0,
+   "trailingComma": false,
+   "fences": 0,
+   "multiTopLevel": false
+  }
+ }
+]

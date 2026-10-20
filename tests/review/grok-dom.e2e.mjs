@@ -186,7 +186,7 @@ test('grok keeps polling a truncated structured answer despite Copy', async t =>
    document.getElementById('grok-strip').remove();
    document.querySelector('[data-testid="assistant-message"] p').textContent = answer;
    const settling = replyDoneVisible(); // a structured answer that is still incomplete must stand still first
-   globalThis.__ashlarGrokIncomplete.since -= 50_000;
+   globalThis.__ashlarIncompleteReview.since -= 50_000;
    return {before, settling, after: replyDoneVisible()};
  }, {partial, answer: partial + ']}', strip: grokStrip()});
  assert.deepEqual(out, {before: false, settling: false, after: true});
@@ -209,7 +209,7 @@ test('grok sends an unclosed string to repair after the stream ends, but waits w
    noteSawStream(record, {stop: true, streaming: true});
    document.getElementById('grok-strip').remove();
    const settling = replyDoneVisible(); // truncated text must stand still before it is handed on
-   globalThis.__ashlarGrokIncomplete.since -= 50_000;
+   globalThis.__ashlarIncompleteReview.since -= 50_000;
    const after = replyDoneVisible();
    return {before, streaming, settling, after};
  }, grokStrip());
@@ -1112,18 +1112,18 @@ test('grok: the incomplete-answer settle clock belongs to one run and one respon
     globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
     sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
     const first = replyDoneVisible();
-    globalThis.__ashlarGrokIncomplete.since -= 50_000; // this response's text stood still long enough
+    globalThis.__ashlarIncompleteReview.since -= 50_000; // this response's text stood still long enough
     const settled = replyDoneVisible();
     document.querySelector('[data-testid="assistant-message"]').id = 'response-answer-B'; // another response, the same text
     const otherResponse = replyDoneVisible();
-    globalThis.__ashlarGrokIncomplete.since -= 50_000;
+    globalThis.__ashlarIncompleteReview.since -= 50_000;
     const settledB = replyDoneVisible();
-    globalThis.__ashlarGrokIncomplete.since -= 50_000;
+    globalThis.__ashlarIncompleteReview.since -= 50_000;
     // another run in the tab, with its own journal of the same sent turn
     sessionStorage.setItem('ashlar:submission:job:run2', JSON.stringify(record));
     Object.assign(globalThis.__ashlarRunnerState, {runId: 'run2', confirmedSubmission: {key: 'ashlar:submission:job:run2', record}});
     const otherRun = replyDoneVisible();
-    return {first, settled, otherResponse, settledB, otherRun, scope: globalThis.__ashlarGrokIncomplete.scope};
+    return {first, settled, otherResponse, settledB, otherRun, scope: globalThis.__ashlarIncompleteReview.scope};
   }, {record: SENT});
   assert.deepEqual(out, {first: false, settled: true, otherResponse: false, settledB: true, otherRun: false, scope: 'job:run2:answer-B'});
 });

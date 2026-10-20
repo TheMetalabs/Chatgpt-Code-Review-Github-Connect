@@ -262,17 +262,11 @@ function cleanTurnText(el) {
 }
 
 /** A structured answer that ends inside a string or container is handed on as truncated only after its
- * text has stood still this long with the stream gone: a hidden or throttled tab can show identical
- * partial text on two polls while Grok is still writing, and a leg ended there posts a cut-off reply. */
-function grokIncompleteSettleMs() { return 45_000; } // a function: this file is re-injected (no top-level const)
+ * text has stood still with the stream gone (json.js reviewTextSettled, 45 s, shared with ChatGPT): a hidden
+ * or throttled tab can show identical partial text on two polls while Grok is still writing. */
 function grokIncompleteSettled(text, bubble) {
-  // Scoped to the run and this response: another run, another answer in the tab, or changed text starts over.
-  const run = globalThis.__ashlarRunnerState;
-  const turns = [...document.querySelectorAll("[data-testid='assistant-message']")];
-  const scope = `${run?.jobId || ""}:${run?.runId || ""}:${turnMessageId(bubble) || turns.indexOf(bubble)}`;
-  const seen = globalThis.__ashlarGrokIncomplete;
-  if (!seen || seen.scope !== scope || seen.text !== text) { globalThis.__ashlarGrokIncomplete = {scope, text, since: Date.now()}; return false; }
-  return Date.now() - seen.since >= grokIncompleteSettleMs();
+  // The one clock both providers share (json.js reviewTextSettled), scoped to the run and this response.
+  return reviewTextSettled(incompleteReviewScope(bubble), text);
 }
 
 /** Ancestors of a bubble that hold this answer's action row and no other turn. The composer stays

@@ -6,8 +6,8 @@ function isReviewObject(value) {
 /** `slice` with the escapes JSON forbids made literal, for a model that wrote LaTeX or regex text into a
  * string (live 2026-10-20, Grok: a LaTeX ldots command inside a review string, "Invalid \escape"). Only
  * inside strings: a backslash that does not start one of JSON's escapes (quote, backslash, slash, b, f, n,
- * r, t, uXXXX) is doubled, so the text keeps its backslash; a raw control character in a string is
- * escaped. Used only after the strict parse failed (parseReviewSlice); mirrors
+ * r, t, uXXXX) is doubled, so the text keeps its backslash; every raw control character U+0000-U+001F in
+ * a string is escaped (\b \f \n \r \t, else \uXXXX). Used only after the strict parse failed (parseReviewSlice); mirrors
  * src/lib/extract-chat-json.ts repairJsonEscapes. */
 function repairJsonEscapes(slice) {
   let out = "", inStr = false;
@@ -22,9 +22,12 @@ function repairJsonEscapes(slice) {
       out += "\\\\";
       continue;
     }
-    if (c === "\n") { out += "\\n"; continue; }
-    if (c === "\r") { out += "\\r"; continue; }
-    if (c === "\t") { out += "\\t"; continue; }
+    // Every raw control character (U+0000-U+001F) is invalid inside a JSON string.
+    if (c < " ") {
+      const short = {"\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"};
+      out += short[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`;
+      continue;
+    }
     out += c;
   }
   return out;
@@ -68,6 +71,104 @@ function lastReviewJson(text) {
     }
   }
   return null;
+}
+
+// ---- A review cut off mid-answer (live 2026-10-20: all 24 raw captures ended inside `coverage`) ----
+// Mirrors src/lib/extract-chat-json.ts (lastReviewStart, scanReview, recoverTruncatedReviewJson,
+// classifyReviewText). Functions only: content scripts are re-injected.
+
+/** Where the last review object starts in `text` (its brace, before a review key); whatever sits before it
+ * (a "JSON" / "Grok" / "×N" label, an unclosed ```json fence, an `<escape>` tag, prose) is never read. */
+function lastReviewStart(text) {
+  const re = /\{\s*"(?:merge_recommendation|findings|highest_risk|investigated_safe|assumptions|coverage|keep)"\s*:/g;
+  const s = String(text || "");
+  let last = -1;
+  for (let m = re.exec(s); m; m = re.exec(s)) last = m.index;
+  return last;
+}
+
+function scanReview(s) {
+  const stack = [], cuts = [];
+  let inStr = false, esc = false, strStart = -1;
+  let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') {
+        inStr = false;
+        if (stack.length === 1 && stack[0] === "{") {
+          let j = i + 1;
+          while (j < s.length && /\s/.test(s[j])) j += 1;
+          if (s[j] === ":") {
+            let key = "";
+            try { key = JSON.parse(s.slice(strStart, i + 1)); } catch { key = ""; }
+            afterFindingsKey = key === "findings";
+          }
+        }
+      }
+      continue;
+    }
+    if (c === '"') { inStr = true; strStart = i; continue; }
+    if (c === "{" || c === "[") {
+      if (c === "[" && afterFindingsKey && stack.length === 1) findingsActive = true;
+      afterFindingsKey = false;
+      stack.push(c);
+    } else if (c === "}" || c === "]") {
+      stack.pop();
+      if (stack.length === 0) { rootClosed = true; break; }
+      if (c === "]" && findingsActive && stack.length === 1) { findingsEnd = i + 1; findingsActive = false; }
+      cuts.push({end: i + 1, closers: [...stack].reverse().map(open => (open === "{" ? "}" : "]")).join("")});
+    }
+  }
+  return {complete: rootClosed && !inStr, inString: inStr, findingsEnd, cuts};
+}
+
+/** A review whose text stopped before it finished, recovered ONLY when everything the verdict rests on
+ * arrived: `merge_recommendation` and the whole `findings` array. What follows (coverage, notes) is kept to
+ * its last complete element and the open string, array and object are closed there; the result carries
+ * `truncated: true`. A reply cut inside `findings` (or before `merge_recommendation`) is not recovered
+ * (null): a dropped finding is worse than a missing one. A missing `[` after `"coverage":` is supplied. */
+function recoverTruncatedReviewJson(text) {
+  const s = String(text || "");
+  const start = lastReviewStart(s);
+  if (start < 0) return null;
+  const slice = s.slice(start).replace(/("coverage"\s*:\s*)(\{)/, "$1[$2");
+  const scan = scanReview(slice);
+  if (scan.complete || scan.findingsEnd < 0) return null;
+  for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
+    const cut = scan.cuts[n];
+    if (cut.end < scan.findingsEnd) break;
+    const candidate = slice.slice(0, cut.end) + cut.closers;
+    for (const body of [candidate, repairJsonEscapes(candidate)]) {
+      try {
+        const parsed = JSON.parse(body);
+        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") return JSON.stringify({...parsed, truncated: true});
+      } catch { /* try the escape-repaired form, then an earlier cut */ }
+    }
+  }
+  return null;
+}
+
+/** What a captured reply is, never a silent null: "complete", "recovered-truncated" (json carries
+ * `truncated: true`), "truncated" (cut off before its findings finished), "invalid" (closed, unparseable)
+ * or "none". */
+function classifyReviewText(text) {
+  const strict = lastReviewJson(text);
+  if (strict) return {status: "complete", json: strict};
+  const recovered = recoverTruncatedReviewJson(text);
+  if (recovered) return {status: "recovered-truncated", json: recovered};
+  const start = lastReviewStart(text);
+  if (start < 0) return {status: "none"};
+  return {status: scanReview(String(text).slice(start)).complete ? "invalid" : "truncated"};
+}
+
+/** Whether `text` is a review object that stopped before it finished (a partial answer, whether or not
+ * it can be recovered): the page waits for it to stand still before it calls the answer complete. */
+function reviewJsonTruncated(text) {
+  const status = classifyReviewText(text).status;
+  return status === "recovered-truncated" || status === "truncated";
 }
 
 /** ChatGPT's citation marker (live aicc #457 job-muir6f31-729): the model wrote
@@ -357,22 +458,61 @@ function harvestJson(opts) {
   // Grok: the answer's code blocks hold its JSON LITERALLY (rendered Markdown rewrites escapes and
   // drops characters, and a folded block's hidden tail is only in the code element); the rendered
   // corpus is the fallback for an answer written outside a fence. ChatGPT reads the corpus only.
+  let blocks = [];
   if (globalThis.__ashlarRunnerState?.provider === "grok") {
-    let blocks = [];
     try { blocks = assistantCodeBlocks(opts?.root); } catch { blocks = []; }
-    for (let i = blocks.length - 1; i >= 0; i -= 1) {
-      const hit = extractChatJson(blocks[i]);
-      if (hit && (allowThin || !findingsJsonTooThin(hit))) return hit;
-    }
   }
   const chunks = assistantCorpus(opts?.root);
+  const accepts = hit => hit && (allowThin || !findingsJsonTooThin(hit));
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const hit = extractChatJson(blocks[i]);
+    if (accepts(hit)) return hit;
+  }
   for (let i = chunks.length - 1; i >= 0; i -= 1) {
     const hit = extractChatJson(chunks[i]);
-    if (hit && (allowThin || !findingsJsonTooThin(hit))) return hit;
+    if (accepts(hit)) return hit;
   }
-  const hit = extractChatJson(chunks.join("\n"));
-  if (hit && (allowThin || !findingsJsonTooThin(hit))) return hit;
+  const joined = extractChatJson(chunks.join("\n"));
+  if (accepts(joined)) return joined;
+  // Only a reply that never became a whole review object is read as a truncated one, and only here:
+  // every caller asks once its answer is complete (settled, reviewDoneSettled), never while streaming.
+  // Its verdict and findings are kept, `truncated: true` marks it (recoverTruncatedReviewJson).
+  for (const text of [...blocks, ...chunks, chunks.join("\n")].reverse()) {
+    const recovered = recoverTruncatedReviewJson(text);
+    if (accepts(recovered)) return recovered;
+  }
   return null;
+}
+
+/** How long a partial review (an object that stopped before it finished) must stand still, with the
+ * provider's stream gone, before the page calls the answer complete: a hidden or throttled tab can show
+ * identical partial text on two polls while the provider is still writing (live 2026-10-20: ChatGPT and
+ * Grok captured replies cut off inside `coverage`). A function: content scripts are re-injected. */
+function incompleteReviewSettleMs() {
+  return 45_000;
+}
+/** The key of one response in one run: the settle clock belongs to it, never to the text alone. */
+function incompleteReviewScope(el) {
+  const run = globalThis.__ashlarRunnerState;
+  let index = -1;
+  try { index = [...globalThis.document.querySelectorAll(turnSelector("assistant"))].indexOf(el); } catch { index = -1; }
+  let id = "";
+  try { id = el ? turnMessageId(el) : ""; } catch { id = ""; }
+  return `${run?.jobId || ""}:${run?.runId || ""}:${id || index}`;
+}
+function reviewTextSettled(scope, text) {
+  const seen = globalThis.__ashlarIncompleteReview;
+  if (!seen || seen.scope !== scope || seen.text !== text) { globalThis.__ashlarIncompleteReview = {scope, text, since: Date.now()}; return false; }
+  return Date.now() - seen.since >= incompleteReviewSettleMs();
+}
+/** `done` for both providers: a bound answer that is still a partial review object is not done until its
+ * text has stood still for incompleteReviewSettleMs(). Anything else is `done` as given. */
+function reviewDoneSettled(done, bound) {
+  if (!done || !bound?.root) return done;
+  let text = "";
+  try { text = assistantCorpus(bound.root).join("\n\n"); } catch { return done; }
+  if (!text || !reviewJsonTruncated(text)) return done;
+  return reviewTextSettled(incompleteReviewScope(bound.message || bound.root), text);
 }
 
 /** Metadata only. The browser journal survives reload; raw text is not a step log. */
@@ -506,7 +646,7 @@ function currentRepairSource() {
   if (!bound.identified || !bound.root || !bound.responseId) return unavailable();
   if (bound.followup) { state.tabRepurposed = true; state.takeoverCause ||= "user_turn"; }
   const stop = bound.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-  const done = !stop && !responseStreaming(bound.root) && replyDoneVisible(bound.root);
+  const done = !stop && !responseStreaming(bound.root) && replyDoneVisible(bound.root) && reviewDoneSettled(true, bound);
   const text = done ? assistantCorpus(bound.root).join("\n\n") : "";
   if (!done || !text.trim() || text.length > 500_000) return unavailable();
   // A replaced listener is not a replaced async invocation. Only a collector
@@ -642,7 +782,7 @@ async function pollBoundResponse() {
   }
   const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
-  const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+  const done = reviewDoneSettled(chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)}), bound);
   const poll = {runner, bound, stop, streaming, done, submission};
   // The page records that this send saw a stream. ChatGPT defines no noteSawStream. Checks only read it.
   if (typeof noteSawStream === "function") noteSawStream(submission, poll);
@@ -807,7 +947,7 @@ function snapshotBoundResponse() {
   if (bound?.identified && runner) runner.boundObserved = true;
   const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
-  const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+  const done = reviewDoneSettled(chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)}), bound);
   const poll = {runner, bound, stop, streaming, done, submission};
   if (typeof noteSawStream === "function") noteSawStream(submission, poll);
   return poll;

@@ -161,6 +161,56 @@ test('the missing "[" is supplied after the ROOT coverage key only, never inside
   for (const recover of [recoverTruncatedReviewJson, ext.recoverTruncatedReviewJson]) assert.deepEqual(JSON.parse(recover(without)).findings, [finding]);
 });
 
+test('a coverage entry still open is dropped whole: a cut never lands on one of its inner delimiters', () => {
+  const finding = {severity: 'P2', file: 'a.ts', line: 1, side: 'RIGHT', title: 'T', failure_scenario: 's', root_cause: 'r', evidence: 'e', recommended_fix: 'f', recommended_test: 't'};
+  const head = JSON.stringify({merge_recommendation: 'REQUEST_CHANGES', highest_risk: 'r', investigated_safe: [], findings: [finding]}).slice(0, -1);
+  const whole = {file: 'a.ts', status: 'cleared', reason: 'read it', files: ['x', 'y'], detail: {note: 'complete'}};
+  const done = JSON.stringify(whole);
+  // Each text stops just after an INNER delimiter of the second, unfinished entry (a nested object or array).
+  const open = '{"file":"b.ts","status":"not_cleared","reason":"half"';
+  for (const [name, tail] of [
+    ['nested object closed', `${open},"detail":{"note":"x"}`],
+    ['nested array closed', `${open},"files":["p","q"]`],
+    ['two levels closed', `${open},"detail":{"a":{"b":[1,2]}}`],
+    ['next key begun', `${open},"detail":{"note":"x"},"stat`],
+  ]) {
+    const text = `JSON\n${head},"coverage":[${done},${tail}`;
+    for (const [who, recover] of [['server', recoverTruncatedReviewJson], ['extension', ext.recoverTruncatedReviewJson]]) {
+      const recovered = JSON.parse(recover(text));
+      assert.deepEqual(recovered.coverage, [whole], `${name} (${who}): only the whole entry survives`);
+      assert.deepEqual(recovered.findings, [finding], `${name} (${who}): findings untouched`);
+      assert.equal(recovered.truncated, true);
+    }
+  }
+  // A complete second entry (nested parts and all) is kept; so is a text cut right after its closing brace.
+  const second = {file: 'b.ts', status: 'not_cleared', reason: 'half', detail: {note: 'x'}, files: ['p']};
+  const both = `${head},"coverage":[${done},${JSON.stringify(second)}`;
+  for (const recover of [recoverTruncatedReviewJson, ext.recoverTruncatedReviewJson]) {
+    assert.deepEqual(JSON.parse(recover(both)).coverage, [whole, second]);
+    assert.deepEqual(JSON.parse(recover(`${both},{"file":"c.ts","sta`)).coverage, [whole, second]);
+  }
+  // The same on the missing-"[" form (Grok page text).
+  const noBracket = `${head},"coverage":${done},${open},"detail":{"note":"x"}`;
+  for (const recover of [recoverTruncatedReviewJson, ext.recoverTruncatedReviewJson]) assert.deepEqual(JSON.parse(recover(noBracket)).coverage, [whole]);
+});
+
+test('Ashlar\'s own ChatGPT review of #172 head 6604b60 (a real cut-off, posted raw by the live server): recovered, its P2 kept, the half entry dropped', () => {
+  const text = fs.readFileSync(dir + 'pr172-6604b60.chatgpt.txt', 'utf8');
+  assert.equal(extractChatJson(text), null, 'the old, silent null');
+  const want = oracle(text);
+  for (const [name, classify] of [['server', classifyReviewText], ['extension', ext.classifyReviewText]]) {
+    const out = classify(text);
+    assert.equal(out.status, 'recovered-truncated', name);
+    const recovered = JSON.parse(out.json);
+    assert.deepEqual(recovered.findings, want.findings, `${name}: findings exact`);
+    assert.deepEqual(want.findings.map(f => f.severity), ['P2']);
+    assert.equal(recovered.coverage.length, want.coverage, `${name}: whole coverage entries only`);
+    assert.equal(recovered.merge_recommendation, 'REQUEST_CHANGES');
+    assert.equal(recovered.truncated, true);
+  }
+  assert.equal(inspectReviewFormat(classifyReviewText(text).json, 'review').ok, true);
+});
+
 test('a reply cut off BEFORE its findings finished is classified truncated, never recovered and never null-silent', () => {
   const {text} = bundle['job-mvg2ii4n-41.chatgpt.json'];
   const cut = text.slice(0, /(?<!\\)"findings"\s*:\s*\[/.exec(text).index + 400);

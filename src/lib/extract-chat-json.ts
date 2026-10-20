@@ -164,7 +164,13 @@ function scanReview(s: string): ReviewScan {
       stack.pop();
       if (stack.length === 0) { rootClosed = true; rootEnd = i + 1; break; }
       if (c === "]" && findingsActive && stack.length === 1) { findingsEnd = i + 1; findingsActive = false; }
-      cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join("") });
+      // A cut is only clean where a whole element ends: a root-level value (stack length 1: the findings
+      // array, a root array or object) or one element of a root-level array such as `coverage` (length 2,
+      // inside `[`). A delimiter deeper than that closes the INNER part of an element that is still open
+      // (a nested object or array of a half-written coverage entry): cutting there would keep a partial entry.
+      if (stack.length === 1 || (stack.length === 2 && stack[1] === "[")) {
+        cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join("") });
+      }
     }
   }
   return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts };

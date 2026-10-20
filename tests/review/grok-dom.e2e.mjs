@@ -185,9 +185,11 @@ test('grok keeps polling a truncated structured answer despite Copy', async t =>
    const before = replyDoneVisible();
    document.getElementById('grok-strip').remove();
    document.querySelector('[data-testid="assistant-message"] p').textContent = answer;
-   return {before, after: replyDoneVisible()};
+   const settling = replyDoneVisible(); // a structured answer that is still incomplete must stand still first
+   globalThis.__ashlarGrokIncomplete.since -= 50_000;
+   return {before, settling, after: replyDoneVisible()};
  }, {partial, answer: partial + ']}', strip: grokStrip()});
- assert.deepEqual(out, {before: false, after: true});
+ assert.deepEqual(out, {before: false, settling: false, after: true});
 });
 
 test('grok sends an unclosed string to repair after the stream ends, but waits while streaming', async t => {
@@ -206,10 +208,12 @@ test('grok sends an unclosed string to repair after the stream ends, but waits w
    const streaming = replyDoneVisible();
    noteSawStream(record, {stop: true, streaming: true});
    document.getElementById('grok-strip').remove();
+   const settling = replyDoneVisible(); // truncated text must stand still before it is handed on
+   globalThis.__ashlarGrokIncomplete.since -= 50_000;
    const after = replyDoneVisible();
-   return {before, streaming, after};
+   return {before, streaming, settling, after};
  }, grokStrip());
- assert.deepEqual(out, {before: false, streaming: false, after: true});
+ assert.deepEqual(out, {before: false, streaming: false, settling: false, after: true});
 });
 
 test('grok accepts a finished one-line answer that starts with Analyzing', async t => {
@@ -1054,4 +1058,72 @@ test('delayed after-send snapshots stop once the run has left the tab', async t 
   });
   assert.deepEqual(out.live, ['send_attempted', 'after_send_1s']);
   assert.deepEqual(out.after, ['send_attempted', 'after_send_1s'], 'the 3s snapshot was not taken');
+});
+
+// Live 2026-10-20 (jobs 1330/1250/1314/1387): Grok answers read as the sender label alone ("Grok"), with
+// "Grok / ×15 JSON / ×5" labels ahead of the JSON, cut off mid array, and with LaTeX in a string.
+const SENT = {phase: 'sent', expected: 'review', baseline: 0, submittedUsers: 1, messageId: 'user-A', sawStream: true, sawStreamKey: 'user-A'};
+test('grok: a bubble holding only the sender label is not an answer, with the composer idle and a stream seen', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div data-testid="assistant-message" id="response-answer-A" role="article"><span>Grok</span></div></main>${COMPOSER}`);
+  const result = await page.evaluate(({record}) => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+    return {done: replyDoneVisible(), corpus: assistantCorpus()};
+  }, {record: SENT});
+  assert.equal(result.done, false, 'the label alone is a bubble Grok has not filled');
+  assert.deepEqual(result.corpus, [], 'and it is no text at all');
+});
+test('grok: leading UI labels ("Grok", "×15 JSON", "×5") are not part of the answer text', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div data-testid="assistant-message" id="response-answer-A" role="article"><div>Grok</div><div>&times;15 JSON</div><div>&times;5</div><pre><code>${ANSWER}</code></pre></div></main>${COMPOSER}`);
+  const corpus = await page.evaluate(() => assistantCorpus());
+  assert.equal(corpus.length, 1);
+  assert.equal(corpus[0].startsWith('{'), true, corpus[0].slice(0, 30));
+  assert.equal(JSON.parse(corpus[0]).merge_recommendation, 'APPROVE');
+  // An answer that only starts with a word that looks like a label is untouched.
+  const prose = await openGrok(t, `<main><div data-testid="assistant-message" id="response-answer-B" role="article"><p>JSON parsing looks fine here.</p></div></main>${COMPOSER}`);
+  assert.deepEqual(await prose.evaluate(() => assistantCorpus()), ['JSON parsing looks fine here.']);
+});
+test('grok: the review JSON is read from the code block literally, including the tail a folded block hides', async t => {
+  const full = JSON.stringify({findings: [{severity: 'P1', file: 'a.ts', line: 1, title: 'say \\"hi\\"', evidence: 'x'}], merge_recommendation: 'REQUEST_CHANGES'}, null, 2);
+  const lines = full.split('\n'), head = lines.slice(0, 4).join('\n'), tail = lines.slice(4).join('\n');
+  const esc = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div data-testid="assistant-message" id="response-answer-A" role="article">
+    <pre style="max-height:20px;overflow:hidden;white-space:pre;line-height:20px"><code>${esc(head)}\n<span style="display:none">${esc(tail)}</span></code></pre></div></main>${COMPOSER}`);
+  const read = await page.evaluate(() => {
+    globalThis.__ashlarRunnerState = {provider: 'grok'};
+    const grok = harvestJson({allowThin: true});
+    globalThis.__ashlarRunnerState = {provider: 'chatgpt'};
+    return {grok, chatgpt: harvestJson({allowThin: true})};
+  });
+  assert.equal(JSON.parse(read.grok).merge_recommendation, 'REQUEST_CHANGES', 'Grok reads the whole block');
+  assert.equal(read.chatgpt, null, 'ChatGPT keeps reading the rendered corpus, which shows only the head');
+});
+
+test('grok: the incomplete-answer settle clock belongs to one run and one response, not to the text alone', async t => {
+  const partial = '{"findings":"P1';
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article"><p>${partial}</p></div>
+    <button aria-label="Copy response" style="width:64px;height:32px">copy</button></div></main>${COMPOSER}`);
+  const out = await page.evaluate(({record}) => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
+    const first = replyDoneVisible();
+    globalThis.__ashlarGrokIncomplete.since -= 50_000; // this response's text stood still long enough
+    const settled = replyDoneVisible();
+    document.querySelector('[data-testid="assistant-message"]').id = 'response-answer-B'; // another response, the same text
+    const otherResponse = replyDoneVisible();
+    globalThis.__ashlarGrokIncomplete.since -= 50_000;
+    const settledB = replyDoneVisible();
+    globalThis.__ashlarGrokIncomplete.since -= 50_000;
+    // another run in the tab, with its own journal of the same sent turn
+    sessionStorage.setItem('ashlar:submission:job:run2', JSON.stringify(record));
+    Object.assign(globalThis.__ashlarRunnerState, {runId: 'run2', confirmedSubmission: {key: 'ashlar:submission:job:run2', record}});
+    const otherRun = replyDoneVisible();
+    return {first, settled, otherResponse, settledB, otherRun, scope: globalThis.__ashlarGrokIncomplete.scope};
+  }, {record: SENT});
+  assert.deepEqual(out, {first: false, settled: true, otherResponse: false, settledB: true, otherRun: false, scope: 'job:run2:answer-B'});
 });

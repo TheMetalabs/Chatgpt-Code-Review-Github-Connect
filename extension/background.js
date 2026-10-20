@@ -956,7 +956,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.72";
+const WORKER_BUILD = "1.1.73";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -1523,7 +1523,7 @@ async function ledgerRecordTab(job, provider, tabId) {
  * or opened before the ledger), so every Grok tab that reaches a terminal state is named. */
 async function ledgerEndLeg(job, provider, state, preserved, cause) {
   if (provider !== "grok" || !Number.isInteger(state.tabId)) return;
-  const keep = preserved && !USER_HELD_CAUSES.includes(cause);
+  const keep = preserved && (!USER_HELD_CAUSES.includes(cause) || inferredTakeover(cause, state.userInputEvidence));
   await updateTabLedger(ledger => {
     if (!keep) { delete ledger[state.tabId]; return; }
     ledger[state.tabId] = {...(ledger[state.tabId] || {tabId: state.tabId, jobId: job.jobId, runId: state.runId, createdAt: Date.now()}),
@@ -1568,6 +1568,7 @@ async function grokLedgerTabHeld(tab, entry) {
     return !(blank?.ok === true && blank.ownership === "owned");
   }
   const cause = result?.cause;
+  if (inferredTakeover(cause, result?.userInput)) return false;
   if (["draft", "user_turn", "edited", "regenerated"].includes(cause)) return true;
   return result?.ownership === "takenOver" && cause !== "navigated";
 }
@@ -1704,6 +1705,13 @@ function compactFinalCapturedSource(state) {
   if(state.observation)delete state.observation.text;
   if(state.repairAttempt?.sourceHash===state.sourceCapture.sourceHash)delete state.repairAttempt.text;
   return true;
+}
+
+/** A takeover the page inferred from the DOM alone: "edited" or "regenerated" with the page reporting
+ * no trusted user input. Grok re-renders Ashlar's own prompt and answer, so that is not evidence of a
+ * user, and such a tab stays Ashlar's (ledger) instead of being released as the user's. */
+function inferredTakeover(cause, userInput) {
+  return ["edited", "regenerated"].includes(cause) && userInput === false;
 }
 
 /** Why a tab is kept open (the preserve_<cause> history stage; a function so tests can read it). */
@@ -2238,6 +2246,10 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // is ever proven. Kept and retired at once, like a takeover.
   if (result.reason === "stalled") return preserveFixTab(job, provider, jobs, "review stalled under a stuck Stop; tab preserved", tab, "stalled");
   const verdict = tabVerdict(result, job.kind);
+  // Whether the page saw trusted user input (json.js noteUserInput); absent from an older page. A verdict
+  // of edited/regenerated with explicit `false` is an inference from the DOM alone (inferredTakeover).
+  state.userInputEvidence = typeof result.userInput === "boolean" ? result.userInput : undefined;
+  if (result.renderDiffers === true) void tabLog("turn_render_differs", {provider, jobId: job.jobId, tabId: tab.id, outcome: verdict.ownership});
   if (verdict.ownership === "unknown") {
     // Another conversation than the one the run was bound in (an in-page move can leave the old DOM
     // on screen): the user's, and waiting cannot change a recorded identity.

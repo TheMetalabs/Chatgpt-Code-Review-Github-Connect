@@ -3,12 +3,42 @@ function isReviewObject(value) {
   return "findings" in value || "merge_recommendation" in value || "keep" in value;
 }
 
+/** `slice` with the escapes JSON forbids made literal, for a model that wrote LaTeX or regex text into a
+ * string (live 2026-10-20, Grok: a LaTeX ldots command inside a review string, "Invalid \escape"). Only
+ * inside strings: a backslash that does not start one of JSON's escapes (quote, backslash, slash, b, f, n,
+ * r, t, uXXXX) is doubled, so the text keeps its backslash; a raw control character in a string is
+ * escaped. Used only after the strict parse failed (parseReviewSlice); mirrors
+ * src/lib/extract-chat-json.ts repairJsonEscapes. */
+function repairJsonEscapes(slice) {
+  let out = "", inStr = false;
+  for (let i = 0; i < slice.length; i += 1) {
+    const c = slice[i];
+    if (!inStr) { out += c; if (c === '"') inStr = true; continue; }
+    if (c === '"') { out += c; inStr = false; continue; }
+    if (c === "\\") {
+      const n = slice[i + 1];
+      if (n !== undefined && '"\\/bfnrt'.includes(n)) { out += c + n; i += 1; continue; }
+      if (n === "u" && /^[0-9a-fA-F]{4}$/.test(slice.slice(i + 2, i + 6))) { out += slice.slice(i, i + 6); i += 5; continue; }
+      out += "\\\\";
+      continue;
+    }
+    if (c === "\n") { out += "\\n"; continue; }
+    if (c === "\r") { out += "\\r"; continue; }
+    if (c === "\t") { out += "\\t"; continue; }
+    out += c;
+  }
+  return out;
+}
+
 function parseReviewSlice(slice) {
   try {
     const parsed = JSON.parse(slice);
     return isReviewObject(parsed) ? slice : null;
   } catch {
-    return null;
+    // Only a slice the strict parse rejected is read again with invalid escapes made literal.
+    const repaired = repairJsonEscapes(slice);
+    if (repaired === slice) return null;
+    try { return isReviewObject(JSON.parse(repaired)) ? repaired : null; } catch { return null; }
   }
 }
 
@@ -324,6 +354,17 @@ function boundAnswerText(kind, root, stats) {
 
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
+  // Grok: the answer's code blocks hold its JSON LITERALLY (rendered Markdown rewrites escapes and
+  // drops characters, and a folded block's hidden tail is only in the code element); the rendered
+  // corpus is the fallback for an answer written outside a fence. ChatGPT reads the corpus only.
+  if (globalThis.__ashlarRunnerState?.provider === "grok") {
+    let blocks = [];
+    try { blocks = assistantCodeBlocks(opts?.root); } catch { blocks = []; }
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const hit = extractChatJson(blocks[i]);
+      if (hit && (allowThin || !findingsJsonTooThin(hit))) return hit;
+    }
+  }
   const chunks = assistantCorpus(opts?.root);
   for (let i = chunks.length - 1; i >= 0; i -= 1) {
     const hit = extractChatJson(chunks[i]);
@@ -1504,7 +1545,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
   // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
   // 4101062732). Any other text is an edit.
-  if (!promptIs(turn, submission.expected)) return takeOver("edited");
+  if (!promptIs(turn, submission.expected)) {
+    if (!turnDiffersByRender(state, fix)) return takeOver("edited");
+    state.turnRenderDiffers = true; // diagnostic: Grok shows the sent prompt differently, with no user input
+  }
   // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
   // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
   if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {
@@ -1588,6 +1632,64 @@ function persistTakeover(state) {
   try { sessionStorage.setItem(`ashlar:takenover:${state.jobId}:${state.runId}`, state.takeoverCause || "user_turn"); } catch { /* in-memory only */ }
 }
 
+/** Trusted user input on this page: the one evidence a user edit, regenerate or follow-up needs and
+ * that neither Ashlar's automation nor Grok's own rendering can produce. Ashlar's clicks and key events
+ * are synthetic (dispatchEvent / element.click(): isTrusted false), and a page script cannot create a
+ * trusted event; a locked screen sends none. A rendered turn that differs from Ashlar's prompt (Grok
+ * re-renders a sent prompt as Markdown after the answer completes) is an edit only when this saw input.
+ * Scoped to the run: only input that could change the conversation counts (typing, pasting or dropping
+ * into an editable area, or pressing an edit / regenerate control), it is stored per (job, run) so a
+ * reload keeps it and another run in the tab never inherits it, and it counts only after the run's send
+ * was confirmed (the journal's `sentAt`: Ashlar's own writing is over). Never read as permission to close. */
+function userInputCounts(event) {
+  const target = event?.target;
+  const type = String(event?.type || "");
+  const editable = el => Boolean(el?.closest?.('textarea, input, [contenteditable]:not([contenteditable="false"]), form[data-composer], [data-testid="chat-input"]'));
+  if (type === "keydown") return !["Shift", "Control", "Alt", "Meta", "Tab", "CapsLock", "Escape"].includes(event?.key) && editable(target);
+  if (type === "paste" || type === "drop" || type === "beforeinput") return editable(target);
+  const control = target?.closest?.('button, [role="button"], a');
+  const label = `${control?.getAttribute?.("aria-label") || ""} ${control?.getAttribute?.("title") || ""} ${control?.textContent || ""}`;
+  return editable(target) || /\b(edit|regenerate|retry|try again|rewrite|redo)\b|수정|재생성|다시 생성|다시 시도/i.test(label);
+}
+function userInputKey(state) {
+  return state?.jobId && state.runId ? `ashlar:userinput:${state.jobId}:${state.runId}` : "";
+}
+function noteUserInput(event, now = Date.now()) {
+  if (!event || event.isTrusted !== true || !userInputCounts(event)) return false;
+  const state = globalThis.__ashlarRunnerState, key = userInputKey(state);
+  if (!key) return false; // no run is bound to this page: nothing of a run's to take over
+  state.userInputAt = now;
+  try { sessionStorage.setItem(key, String(now)); } catch { /* in-memory only */ }
+  return true;
+}
+/** Whether trusted input reached this run's conversation after its send was confirmed. A journal with no
+ * `sentAt` (written before it existed) counts any input the run recorded. */
+function userInputAfterSend(state) {
+  let at = state?.userInputAt;
+  if (!Number.isFinite(at)) {
+    try { const stored = sessionStorage.getItem(userInputKey(state)); at = stored ? Number(stored) : NaN; } catch { at = NaN; }
+  }
+  if (!Number.isFinite(at)) return false;
+  let sentAt;
+  try { sentAt = Number((state.confirmedSubmission?.record || savedSubmission())?.sentAt); } catch { sentAt = NaN; }
+  return Number.isFinite(sentAt) ? at > sentAt : true;
+}
+function userInputSeen() {
+  return userInputAfterSend(globalThis.__ashlarRunnerState);
+}
+function installUserInputWitness() {
+  if (globalThis.__ashlarInputWitness || typeof globalThis.document?.addEventListener !== "function") return;
+  globalThis.__ashlarInputWitness = true;
+  for (const type of ["keydown", "pointerdown", "mousedown", "touchstart", "paste", "drop"]) {
+    try { globalThis.document.addEventListener(type, event => noteUserInput(event), {capture: true, passive: true}); } catch { /* the page keeps its DOM-only verdicts */ }
+  }
+}
+/** Whether the rendered sent turn's difference from Ashlar's prompt is Grok's rendering, not the user: a
+ * Grok review (a fix and ChatGPT keep the DOM-only verdict) with no trusted input after the send. */
+function turnDiffersByRender(state, fix) {
+  return !fix && state.provider === "grok" && !userInputAfterSend(state);
+}
+
 function releaseManagedSlot(state) {
   state.slotReleased = true;
   try { sessionStorage.setItem(`ashlar:released:${state.jobId}:${state.runId}`, "true"); } catch { /* Only causes conservative recount on reload. */ }
@@ -1613,6 +1715,7 @@ function installReviewRunner(name, run) {
   if (state.listener && state.protocol === "observed-submission-v8") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
   state.protocol = "observed-submission-v8";
+  installUserInputWitness();
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation,
     observing: state.boundObserved === true });
   state.listener = (msg, _sender, reply) => {
@@ -1758,6 +1861,14 @@ function installReviewRunner(name, run) {
       // send recorded none: fixVerdictPermanent) or one the worker gives up identifying (preserve)
       // stays open but is no longer Ashlar's: free its managed slot, or it counts against tab
       // capacity (untracked binding) until the user closes it by hand.
+      // Grok: a verdict that would close the tab is held back while the answer is still being written (its
+      // stop control is up): the worker asks again, and a close never cuts a generation short.
+      if (owned && !fixRun && msg.type === "ashlar-can-close" && state.provider === "grok" && typeof stopButtonVisible === "function" && stopButtonVisible()) {
+        reply({ok:true,releaseProtocol:1,blank:false,unsent:false,ownership:"unknown",cause:"generating",generating:true,owned:false,canClose:false,
+          reason:"pending",userInput:userInputSeen(),renderDiffers:Boolean(state.turnRenderDiffers),running:Boolean(state.running),
+          hasResult:Boolean(state.result),url:globalThis.location?.href || ""});
+        return;
+      }
       const permanent = fixVerdictPermanent(verdict);
       // A review leg the generating lease failed (#87) under a Stop that never clears can never prove
       // a close: the tab is kept ("stalled", preserved and retired like a takeover), and its managed
@@ -1766,6 +1877,7 @@ function installReviewRunner(name, run) {
         typeof stopButtonVisible === "function" && stopButtonVisible();
       if (permanent || stalled || msg.preserve === true) releaseManagedSlot(state);
       reply({ok:true,releaseProtocol:1,blank:false,unsent:false,...verdict,owned:owned && !stalled,canClose:owned && !stalled,
+        userInput:userInputSeen(),renderDiffers:Boolean(state.turnRenderDiffers),
         reason:stalled ? "stalled" : owned ? "complete" : permanent ? "repurposed" : "pending",
         running:Boolean(state.running),hasResult:Boolean(state.result || repairedCollectionResult(state) || sourceReceiptFor(state)),
         stopped:Boolean(state.runStopped),url:globalThis.location?.href || ""});

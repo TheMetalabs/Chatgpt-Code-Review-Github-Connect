@@ -142,6 +142,27 @@ code, so a future skill or change can find the rule instead of re-learning it.
   `tab_closed`, `tab_preserved`, `tab_closed_by_sweep`, `tab_close_failed`, `cleanup_failed`,
   `allocating_reclaimed`, ...) ride the bridge ping into the server log as `[ashlar] tab-event ...`
   lines, and the worker status carries the ledger counts (`tabs`).
+- **"edited" needs user input (1.1.73).** A review's `edited` verdict was decided by DOM text alone, and
+  Grok re-renders a sent prompt (Markdown) once its answer completes, so all 5 Grok legs of the
+  2026-10-20 locked-screen run ended `tab_preserved cause=edited` and 1.1.72 released them from the
+  ledger as the user's. On a Grok review the page now counts a rendered-text difference as an edit only
+  after TRUSTED input that could change the conversation (`isTrusted` typing/paste/drop into an editable
+  area, or a press on an edit/regenerate control) made after the run's send was confirmed
+  (`sentAt` in the journal), kept per job and run in sessionStorage; Ashlar's synthetic clicks, bare
+  pointer events and Grok's rendering produce none. The can-close reply
+  carries `userInput` and `renderDiffers` (history/log event `turn_render_differs`). A preserved
+  `edited`/`regenerated` leg whose page reports `userInput:false` stays in the ledger and is swept.
+  ChatGPT and fix runs keep the DOM-only verdict.
+- **Partial and raw Grok answers (1.1.73).** The raw observation texts of the 2026-10-20 run (jobs 1330,
+  1250, 1314, 1387) were the sender label alone, a reply cut off mid array, and LaTeX inside a JSON
+  string. `final:false` on an observation says nothing (the server writes it on every one), and the
+  `cause=edited` cleanup follows a captured source; it does not end the leg. Fixes: a Grok bubble that
+  holds only UI labels ("Grok", "×N", "JSON") is not an answer and those leading labels are stripped; an
+  incomplete structured answer is handed on as truncated only after standing still 45 s with the stream
+  gone; the review JSON is read from the code block literally (a folded block's hidden tail included)
+  before the rendered text; a close is held back (`cause: generating`) while Grok's stop control is up;
+  and a review string with invalid escapes (`\ldots`, `\(`, a raw newline) is read again with those made
+  literal after the strict parse failed (`repairJsonEscapes`, extension and server).
 
 ### Deploys
 

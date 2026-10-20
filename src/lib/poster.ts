@@ -241,6 +241,9 @@ export type LiveGateResult = {
   investigatedSafe: string[];
   assumptions: string[];
   coverage?: ModelCoverage[];
+  /** The reply was cut off after its verdict and findings (extract-chat-json recoverTruncatedReviewJson):
+   * the findings are all there, the coverage list and notes are not. */
+  truncated?: boolean;
   dropped: string[];
   /** How many findings were dropped for their shape (a required field missing, no valid line):
    * the reviewer reported them, so a result that lost one is not the reviewer's full verdict. */
@@ -324,6 +327,7 @@ export function gateLiveSubmission(
       ? (submitted.assumptions as unknown[]).map((x) => String(x).slice(0, 400)).slice(0, 12)
       : [],
     coverage: parseCoverage(submitted.coverage),
+    truncated: submitted.truncated === true ? true : undefined,
     dropped,
     malformed,
     overflow,

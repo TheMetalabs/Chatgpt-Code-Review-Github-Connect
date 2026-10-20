@@ -163,6 +163,23 @@ code, so a future skill or change can find the rule instead of re-learning it.
   before the rendered text; a close is held back (`cause: generating`) while Grok's stop control is up;
   and a review string with invalid escapes (`\ldots`, `\(`, a raw newline) is read again with those made
   literal after the strict parse failed (`repairJsonEscapes`, extension and server).
+- **Cut-off replies, both providers (1.1.74).** All 24 raw captures of 2026-10-20 (18 ChatGPT, 6 Grok;
+  real texts in `tests/review/fixtures/raw-capture-20261020`) were reviews that stopped inside their last
+  array, `coverage`, after the verdict and every finding had arrived, and the page called them complete
+  (`response_completed_json_invalid`), so every review posted raw. Now: a partial review object is not
+  `done` for ChatGPT either until its text stood still 45 s with the stream gone (`reviewDoneSettled`,
+  one clock per run + response); then `recoverTruncatedReviewJson` keeps the verdict and ALL findings,
+  the whole coverage entries, closes the open string/array/object and marks `truncated: true` (labels,
+  an unclosed fence, an `<escape>` tag before `{` and a missing `[` after `"coverage":` are tolerated).
+  A reply cut inside `findings` is never recovered (`classifyReviewText` says `truncated`). The server
+  recovers the same way for salvaged or late text. A truncated leg with findings is a verdict (they
+  merge); one without is evidence, never clean (`RawCause` `truncated`). A malformed auxiliary leg
+  beside a CLEAN canonical verdict is no longer dropped (aicc-center#1091): its reply posts verbatim
+  and the review is not "no major issues". Inside a verify-clean round the malformed auxiliary reply's
+  TEXT stays out of the posted body, but it is never clean credit: the round posts `incomplete` (no
+  "no major issues", no `total=0` marker, note "<provider> returned no usable review") whatever local
+  verification said, and a recovered truncated auxiliary leg's findings merge and block clean exactly as
+  elsewhere. `repairJsonEscapes` escapes every control character U+0000-U+001F.
 
 ### Deploys
 

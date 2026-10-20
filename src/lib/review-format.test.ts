@@ -56,7 +56,8 @@ describe("review-format", () => {
     assert.match(body, /not valid review JSON/i);
   });
 
-  it("keeps a canonical clean verdict clean when an auxiliary chat reviewer is unparseable", () => {
+  it("never reads a canonical clean verdict as clean when an auxiliary chat reviewer is unparseable (its text stays out of the body)", () => {
+    // aicc-center#1091 (PR #172): a reviewer that returned no usable review is not "found nothing".
     const body = reviewSummaryBody(
       {
         headSha: "abc1234ffff",
@@ -69,9 +70,12 @@ describe("review-format", () => {
       [],
       "ashlar-bot",
     );
-    assert.match(body, new RegExp(`^${CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`));
-    assert.match(body, /ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0/);
-    assert.doesNotMatch(body, /raw:start|unparseable|No complete review from grok/);
+    assert.doesNotMatch(body, new RegExp(CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(body, /no major issues/i);
+    assert.match(body, /- No complete review from grok \(its reply was not usable and is kept out of this review\)/);
+    assert.match(body, /Not a clean pass/);
+    assert.match(body, /<!-- ashlar-outcome incomplete -->\s*$/);
+    assert.doesNotMatch(body, /ashlar-findings total=0|raw:start/);
   });
 
   it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {

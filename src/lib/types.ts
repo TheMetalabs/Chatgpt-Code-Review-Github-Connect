@@ -526,8 +526,9 @@ export type LocalReviewRole = "race" | "verify-clean";
  * not valid review JSON (salvaged before the gate: unparseable, or JSON the review schema rejects);
  * `unread-rows` — it parsed, but the gate set
  * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
- * could not use in full (docs/local-verify-clean.md §1). */
-export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
+ * could not use in full (docs/local-verify-clean.md §1); `truncated` — the reply was cut off after its
+ * verdict with no finding to merge (its coverage never finished), so it is evidence, never a clean result. */
+export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict" | "truncated";
 export type AuxiliaryProviderFailure = RawCause | "skipped";
 
 /** One salvaged leg's place in Job.rawReview: its piece ends at `end` (exclusive). */

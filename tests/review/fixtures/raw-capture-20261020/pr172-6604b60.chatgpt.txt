@@ -1,0 +1,123 @@
+```json
+{
+  "merge_recommendation": "REQUEST_CHANGES",
+  "highest_risk": "Truncated-review recovery can accept structurally closed but incomplete coverage entries when it closes nested objects, allowing partial model output to be represented as recovered coverage.",
+  "investigated_safe": [],
+  "assumptions": [
+    "ashlar-policy.md was not present among the accessible uploaded files, so repository-specific severity rules could not be independently checked.",
+    "The supplied snapshot does not expose every changed file in full. Findings are limited to behavior grounded in the supplied diff and snapshot.",
+    "The review did not execute tests or inspect external dependencies."
+  ],
+  "findings": [
+    {
+      "severity": "P2",
+      "file": "src/lib/extract-chat-json.ts",
+      "line": 1064,
+      "side": "RIGHT",
+      "title": "Recovery accepts incomplete nested coverage entries",
+      "failure_scenario": "A truncated review contains a coverage entry whose reason value is an object or array and ends inside that nested value. The scanner records closing delimiters inside the entry, and recovery can append closing delimiters to one of those earlier cut points. JSON.parse can then accept a syntactically valid candidate containing a coverage entry that never arrived in full, and the recovery returns it with truncated:true.",
+      "root_cause": "The recovery loop treats every recorded closing delimiter as a possible complete-element boundary. It validates only that findings is an array and merge_recommendation is a string; it does not establish that a selected cut ends after a complete top-level coverage element.",
+      "evidence": "src/lib/extract-chat-json.ts:1039-1042 records cuts at every closing delimiter; src/lib/extract-chat-json.ts:1064-1072 tries those cuts and accepts any JSON object with an array-valued findings property and string-valued merge_recommendation.",
+      "recommended_fix": "Track complete top-level coverage-array element boundaries separately and restrict recovery candidates to those boundaries or other explicitly safe root-level boundaries. Do not treat a nested object's closing delimiter as proof that its enclosing coverage entry is complete.",
+      "recommended_test": "Add a regression test with a truncated coverage entry containing a nested object or array. Assert that recovery preserves only preceding complete coverage entries and never returns the partial entry."
+    }
+  ],
+  "coverage": [
+    {
+      "file": "docs/review-loop-runbook.md",
+      "status": "not_cleared",
+      "reason": "The changed documentation hunk was inspected, but the repository policy file was unavailable for cross-checking."
+    },
+    {
+      "file": "extension/background.js",
+      "status": "not_cleared",
+      "reason": "The changed hunks were inspected; complete behavior of all polling and response-binding helpers was not independently verified."
+    },
+    {
+      "file": "extension/json.js",
+      "status": "not_cleared",
+      "reason": "The changed recovery and harvesting hunks were inspected, but the entire content-script dependency surface was not verified."
+    },
+    {
+      "file": "extension/manifest.json",
+      "status": "not_cleared",
+      "reason": "The version change was inspected; complete extension packaging and release configuration were not available for verification."
+    },
+    {
+      "file": "extension/site-grok.js",
+      "status": "not_cleared",
+      "reason": "The changed settling logic was inspected, but the full provider-specific runtime integration was not independently verified."
+    },
+    {
+      "file": "src/lib/bridge.server.ts",
+      "status": "not_cleared",
+      "reason": "The canonicalization and delivery hunks were inspected; all downstream bridge lifecycle paths were not independently verified."
+    },
+    {
+      "file": "src/lib/chat-prompt.ts",
+      "status": "not_cleared",
+      "reason": "The changed extraction call was inspected, but the complete submission-parsing call graph was not independently verified."
+    },
+    {
+      "file": "src/lib/extract-chat-json.ts",
+      "status": "not_cleared",
+      "reason": "The recovery scanner and candidate-selection logic were inspected; the nested-coverage recovery defect remains unresolved."
+    },
+    {
+      "file": "src/lib/harbor.server.ts",
+      "status": "not_cleared",
+      "reason": "The changed merge and gate hunks were inspected, but every downstream state transition and posting path was not independently verified."
+    },
+    {
+      "file": "src/lib/local-fallback.ts",
+      "status": "not_cleared",
+      "reason": "The changed incomplete-verdict logic was inspected; complete interactions with all fallback transitions were not independently verified."
+    },
+    {
+      "file": "src/lib/poster.ts",
+      "status": "not_cleared",
+      "reason": "The truncated flag propagation hunk was inspected, but all consumers of the gate result were not independently verified."
+    },
+    {
+      "file": "src/lib/review-format.ts",
+      "status": "not_cleared",
+      "reason": "The changed outcome-rendering hunk was inspected, but all public review rendering and loop consumers were not independently verified."
+    },
+    {
+      "file": "src/lib/review-json-repair.ts",
+      "status": "not_cleared",
+      "reason": "The schema-validation change was inspected, but the full repair-service integration was not independently verified."
+    },
+    {
+      "file": "src/lib/review-loop-runtime.server.ts",
+      "status": "not_cleared",
+      "reason": "The changed handoff-detail logic was inspected, but the complete loop termination and handoff paths were not independently verified."
+    },
+    {
+      "file": "src/lib/review-outcome.ts",
+      "status": "not_cleared",
+      "reason": "The changed outcome classification and auxiliary-failure logic were inspected, but all consumers and state transitions were not independently verified."
+    },
+    {
+      "file": "src/lib/types.ts",
+      "status": "not_cleared",
+      "reason": "The changed RawCause type was inspected, but all serialization and persistence consumers were not independently verified."
+    },
+    {
+      "file": "tests/review/auxiliary-merge.test.mjs",
+      "status": "not_cleared",
+      "reason": "The changed test hunks were inspected, but the complete test suite was not executed."
+    },
+    {
+      "file": "tests/review/grok-dom.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "The changed settling assertions were inspected, but the complete end-to-end suite was not executed."
+    },
+    {
+      "file": "tests/review/local-verify-outcomes.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "The changed outcome tests were inspected, but the complete end-to-end suite was not executed."
+    },
+    {
+      "file": "tests/review/raw-capture-cases.test.mjs",
+      "status": "not_cle

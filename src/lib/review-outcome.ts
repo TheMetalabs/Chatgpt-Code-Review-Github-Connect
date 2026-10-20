@@ -24,7 +24,7 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export type PostedOutcome = Exclude<ReviewOutcome, "verify">;
 
 export type OutcomeJob = Pick<Job, "reviewProviders" | "assumptions" | "rawReview"> &
-  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders" | "incompleteProviders" | "rawCauses" | "rawTruncated">>;
+  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders" | "incompleteProviders" | "rawCauses" | "rawTruncated" | "auxiliaryProviderFailures">>;
 
 /** A Record keyed by the closed enum: adding a kind without deciding its shape fails the typecheck. */
 export const OUTCOME_SHAPE: Record<PostedOutcome, { converged: boolean; unverified: boolean }> = {
@@ -46,11 +46,20 @@ export function skippedNote(providers: readonly ReviewProvider[]): string {
  * the structured `skippedProviders` / `incompleteProviders` the merge stamped, never from assumptions:
  * those also carry reviewer-written text, and a reviewer noting it "skipped" generated fixtures is not
  * a reviewer that did not run. */
-export function skippedNotes(job: Pick<Job, "skippedProviders" | "incompleteProviders">): string[] {
+export function skippedNotes(job: Pick<Job, "skippedProviders" | "incompleteProviders"> & Partial<Pick<Job, "auxiliaryProviderFailures">>): string[] {
+  const auxiliary = auxiliaryFailed(job);
   return [
     job.skippedProviders?.length ? skippedNote(job.skippedProviders) : "",
     job.incompleteProviders?.length ? `No complete review from ${job.incompleteProviders.join(", ")} (reply posted as evidence)` : "",
+    auxiliary.length ? `No complete review from ${auxiliary.join(", ")} (its reply was not usable and is kept out of this review)` : "",
   ].filter(Boolean);
+}
+
+/** The reviewers whose reply never became a review but whose text is kept out of the posted body (an
+ * auxiliary leg in a verify-clean round, harbor's auxiliaryProviderFailures): they gave no verdict, so the
+ * round they were part of is never a clean pass. */
+export function auxiliaryFailed(job: Partial<Pick<Job, "auxiliaryProviderFailures">>): ReviewProvider[] {
+  return Object.keys(job.auxiliaryProviderFailures ?? {}).filter((p): p is ReviewProvider => Object.hasOwn(PROVIDER_LABEL, p));
 }
 
 /** The fixed text for each raw cause: a Record over the closed type, so a new cause cannot render
@@ -60,6 +69,7 @@ export function skippedNotes(job: Pick<Job, "skippedProviders" | "incompleteProv
 const RAW_CAUSE_TEXT: Record<RawCause, string> = {
   unparseable: "the reply was not valid review JSON",
   "unread-rows": "the reply parsed, but its findings past the gate's row cap were not inspected",
+  truncated: "the reply was cut off before it finished (no finding, coverage incomplete)",
   "not-a-verdict": "the reply could not be used as a complete structured review",
 };
 
@@ -105,6 +115,10 @@ export function reviewOutcome(job: OutcomeJob, findings: number): ReviewOutcome 
     return verifier && !job.localVerified && localInFull ? "raw-unverified" : "raw";
   }
   if (job.skippedProviders?.length || incomplete) return "incomplete";
+  // A reviewer that gave no usable verdict (its text kept out of the body) is no clean credit: not clean,
+  // not verified-clean, not unverified-clean. (The verification round itself still runs: the held post
+  // above returns "verify" first, so local re-reads the snapshot.)
+  if (auxiliaryFailed(job).length) return "incomplete";
   if (!verifier) return "clean";
   return job.localVerified ? "verified-clean" : "unverified-clean";
 }
@@ -129,6 +143,8 @@ export function outcomeNote(
     findingsBy: Partial<Record<ReviewProvider, number>>;
     localError?: string;
     localVerified?: boolean;
+    /** The reviewers that returned no usable review whose text is kept out of the body. */
+    auxiliary?: readonly ReviewProvider[];
     /** The reviewers whose reply is in the raw block (the salvaged legs). */
     rawBy?: readonly ReviewProvider[];
     /** Those whose reply the block holds only in part (salvagedReview's `truncated`). */
@@ -136,6 +152,10 @@ export function outcomeNote(
   },
 ): string {
   const chat = input.chat.join(" + ") || "chat";
+  if (outcome === "incomplete" && input.auxiliary?.length) {
+    const agreed = input.verifying ? (input.localVerified ? "; local verification agreed" : `; local verification did not complete (${input.localError || "unavailable"})`) : "";
+    return `${chat} found nothing${agreed}; ${input.auxiliary.join(" + ")} returned no usable review, so this is not a clean pass.`;
+  }
   if (outcome === "verified-clean") return `${chat} found nothing; local verification agreed.`;
   // A skipped chat peer makes the round incomplete whatever local did, so the note is what tells an
   // agreeing verification from a failed one.

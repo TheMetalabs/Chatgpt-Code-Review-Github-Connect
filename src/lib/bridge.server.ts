@@ -11,7 +11,7 @@ import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BINDING_LOST_MS, BRIDGE_CLAIM_MS, CHAT_LEG_STALL_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
 import { fallbackWaivesChat } from "./local-fallback";
-import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
+import { extractChatJson, extractChatJsonRecovering, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 import { createFixRegistry, isFixItemId, type FixItemSummary, type FixOffer, type FixRequest } from "./bridge-fix.server";
@@ -798,7 +798,8 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   // A salvaged leg (the extension's repair is over, live aicc #457) is posted like repair-off: its
   // raw_review envelope as sent, anything else salvaged here, never left for a repair.
   const canonicalLegRaw = (text: string): string => {
-    const parsed = extractChatJson(text);
+    // A reply cut off after its verdict and findings is recovered (truncated: true), never salvaged raw.
+    const parsed = extractChatJsonRecovering(text);
     if (repairAvailable && !salvaged) return parsed ?? text; // route 422s schema errors for a real repair
     if (parsed && inspectReviewFormat(parsed, "review").ok) return parsed;
     return salvaged && parsed && isSalvageEnvelope(parsed) ? parsed : salvageReviewJson(text);

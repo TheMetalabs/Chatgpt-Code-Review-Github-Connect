@@ -20,7 +20,7 @@ export async function appFixture(options={}, githubOptions={}) {
    const selectedRoute=req.url.split('?')[0]==='/api/webhook'?webhookRoute:req.url.split('?')[0]==='/api/bridge'?route:req.url.split('?')[0]==='/api/history'?historyRoute:null;
    if(selectedRoute){
      try{
-       let body='';for await(const chunk of req)body+=chunk;
+       const parts=[];for await(const chunk of req)parts.push(chunk);const body=Buffer.concat(parts).toString('utf8'); // whole bytes: a chunk may split a multi-byte character
        const request=new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{method:req.method,headers:req.headers,...(body?{body}:{})});
        const response=await selectedRoute.server.handlers[req.method]({request});
        res.writeHead(response.status,Object.fromEntries(response.headers));res.end(await response.text());

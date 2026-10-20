@@ -270,8 +270,9 @@ export interface WebhookLog {
   deliveryId: string;
   event: string;
   action: string;
-  hmac: "ok" | "fail";
-  httpStatus: 202 | 403;
+  /** "unverified": rejected before the signature could be checked (e.g. a 413 body over the cap). */
+  hmac: "ok" | "fail" | "unverified";
+  httpStatus: 202 | 403 | 413;
   at: number;
   summary: string;
   skipReason?: string;

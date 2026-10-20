@@ -48,7 +48,7 @@ function Home() {
   const liveJobs = jobs.filter((j) => LIVE_INFLIGHT_STATUSES.includes(j.status));
   const posted = jobs.filter((j) => j.status === "posted" && j.postedReviewId).length;
   const skipped = jobs.filter((j) => j.status === "skipped").length;
-  const rejected = events.filter((e) => e.httpStatus === 403).length;
+  const rejected = events.filter((e) => e.httpStatus !== 202).length;
   const p95 = percentile(
     jobs.map((j) => j.ingressMs).filter(Boolean),
     0.95,

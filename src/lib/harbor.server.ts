@@ -2162,6 +2162,32 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
   }
 }
 
+/** A delivery refused before HMAC verification because its body exceeds the hard cap
+ * (http-body.ts MAX_WEBHOOK_BODY). Recorded — event list, delivery history and the process log —
+ * so an oversized PR is never dropped without a trace. Header values are unverified: kept short. */
+export function recordOversizedWebhook(opts: { deliveryId: string; event: string; bytes: number; max: number; target?: string }) {
+  const clip = (v: string, n: number) => v.replace(/[^\x20-\x7e]/g, "?").slice(0, n);
+  const deliveryId = clip(opts.deliveryId, 80) || "missing";
+  const event = clip(opts.event, 64) || "unknown";
+  const target = opts.target ? ` (${clip(opts.target, 80)})` : "";
+  const reason = `payload too large: ${opts.bytes} bytes > ${opts.max}`;
+  const ev: WebhookLog = {
+    id: nid("ev"),
+    deliveryId,
+    event,
+    action: "unknown",
+    hmac: "unverified",
+    httpStatus: 413,
+    at: Date.now(),
+    summary: `GitHub delivery rejected${target}`,
+    rejectReason: reason,
+  };
+  console.warn(`[webhook] 413 ${event} delivery=${deliveryId}${target}: ${reason}`);
+  noteDeliveryHistory(ev);
+  state = { ...state, events: trim([ev, ...state.events]) };
+  return ev;
+}
+
 export function ingestGitHubWebhook(opts: {
   hmacOk: boolean;
   deliveryId: string;

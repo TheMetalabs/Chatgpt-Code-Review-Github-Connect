@@ -577,13 +577,12 @@ function boundAnswerText(kind, root, stats) {
 
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
-  // Grok: the answer's code blocks hold its JSON LITERALLY (rendered Markdown rewrites escapes and
-  // drops characters, and a folded block's hidden tail is only in the code element); the rendered
-  // corpus is the fallback for an answer written outside a fence. ChatGPT reads the corpus only.
+  // A fenced answer's code element holds JSON LITERALLY (rendered Markdown can rewrite escapes and a
+  // folded block can keep its hidden tail only in the code element). Both providers use it first; the
+  // rendered corpus remains the fallback for an answer written outside a fence or a renderer without a
+  // code-block node.
   let blocks = [];
-  if (globalThis.__ashlarRunnerState?.provider === "grok") {
-    try { blocks = assistantCodeBlocks(opts?.root); } catch { blocks = []; }
-  }
+  try { blocks = assistantCodeBlocks(opts?.root); } catch { blocks = []; }
   const chunks = assistantCorpus(opts?.root);
   const accepts = hit => hit && (allowThin || !findingsJsonTooThin(hit));
   for (let i = blocks.length - 1; i >= 0; i -= 1) {

@@ -178,6 +178,17 @@ describe("finding gate: R1 speculation (integration tuning)", () => {
     }
   });
 
+  it("reads Korean 아마 / 추정 as a hedge only in their hedging forms", () => {
+    // Not hedges: a word that contains 아마 (아마존) and 추정 naming a value (추정 시간, 추정치).
+    assert.equal(one(mk({ title: "아마존 S3 업로드 실패 시 주문 총액이 저장되지 않음" })).action, "keep");
+    assert.equal(one(mk({ title: "배송 추정 시간이 두 배로 저장됨" })).action, "keep");
+    assert.equal(one(mk({ rootCause: "추정치가 아니라 실제 total을 재고 확인 전에 저장한다." })).action, "keep");
+    // Hedges: still a possibility in the headline / the claim.
+    assert.equal(one(mk({ title: "아마 재고 확인 전에 주문이 저장됨" })).reasons[0], "speculative");
+    assert.equal(one(mk({ title: "재고 확인 전에 주문이 저장되는 것으로 추정됨" })).reasons[0], "speculative");
+    assert.equal(one(mk({ rootCause: "재시도 경로에서 저장이 두 번 일어나는 것으로 추정된다." })).action, "demote");
+  });
+
   it("keeps a title whose condition is the failure trigger or the code's own assumption", () => {
     // Not dropped by the title rule (C2 may still demote a hedged P1 headline to P2).
     assert.notEqual(one(mk({ title: "Submit crashes if the cart does not exist" })).action, "drop");

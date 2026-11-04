@@ -458,8 +458,10 @@ const WEAK_HEDGES: { re: RegExp; label: string }[] = [
   { re: /가능성이\s*있/g, label: "가능성이 있" },
   { re: /(?:할|될)\s*수도\s*있/g, label: "수도 있" },
   { re: /것으로\s*(?:보입|보임|보인다|추정)/g, label: "것으로 보임" },
-  { re: /추정/g, label: "추정" },
-  { re: /아마/g, label: "아마" },
+  // Hedging forms only: "추정치" (an estimate) or "배송 추정 시간" names a value, not a guess.
+  { re: /추정(?:됩니다|된다|되며|되어|됨)|(?:으)?로\s*추정(?:되|합니다|한다)/g, label: "추정" },
+  // A whole word: "아마존" (Amazon) is not "아마" (probably).
+  { re: /(?<!\p{L})아마(?:도)?(?!\p{L})/gu, label: "아마" },
 ];
 
 /** A modal hedge (may / might / could / possibly / appears to, and the Korean equivalents). "assumes" and

@@ -11,7 +11,8 @@
  *   (A model refute pass is not part of this gate; the "refute" value an earlier build stored is read
  *   as "rules" — normalizeGateMode.)
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
- *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path.
+ *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path. A note-category
+ *   finding (C1) that fails R3 is routed to notes, not dropped: a note asserts no defect to prove.
  * - R1 speculation: an admitted-unverified premise always drops; a modal hedge in the TITLE (the
  *   headline claim is only a possibility) always drops; a hedge elsewhere in the claim drops only
  *   without a verified quote on a changed line.
@@ -802,6 +803,14 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (weak && !ev.onChanged && !ev.noContent) return drop("speculative", weak);
 
   if (!ev.noContent && ev.verified.length === 0) {
+    // A note-category remark (docs / i18n / style / log wording / test advice) needs no proof: it is
+    // never counted, never inline, never REQUEST_CHANGES. R3 exists to stop an unproven DEFECT claim,
+    // so such a remark becomes a note instead of a drop; noteCategory never matches a defect claim.
+    const category = opts.notes ? noteCategory(f) : undefined;
+    if (category) {
+      const why = ev.quotes.length ? `${ev.quotes.length} quote(s), none found at head` : "no code quote";
+      return { finding: f, action: "note", reasons: [`note:${category}`, `note_evidence_unverified: ${why}`], severityBefore: before };
+    }
     return ev.citedAvailable
       ? drop("evidence_unverified", ev.quotes.length ? `${ev.quotes.length} quote(s), none found at head` : "no code quote")
       : drop("evidence_unavailable", "neither the cited file nor a quote can be checked");

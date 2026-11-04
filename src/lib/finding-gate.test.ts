@@ -337,6 +337,30 @@ describe("finding gate: C1 notes", () => {
     });
   }
 
+  // A note-category remark with no verifiable quote (none, or one that is not at head) is still a note:
+  // R3 exists to stop unproven DEFECT claims, and a note is never counted or posted inline.
+  const noQuote: [string, Partial<Finding>, string][] = [
+    ["style without a quote", { title: "Ref assigned during render", rootCause: "A ref is written in the render body instead of an effect.", evidence: "src/orders/submit.ts:7 ref written in render" }, "note:style"],
+    ["log wording with an unverifiable quote", { severity: "P2", title: "Log message wording is misleading", rootCause: "The log line says saved before the commit.", evidence: "src/orders/submit.ts:9 `logger.info(\"order persisted\", { id });`" }, "note:log"],
+    ["i18n with prose evidence", { severity: "P2", title: "Hard-coded Korean text in the confirmation email", rootCause: "The subject string is not localized.", evidence: "the email subject is a literal" }, "note:i18n"],
+    ["test advice with no evidence", { title: "Spec does not verify the unverified-user branch", rootCause: "No test covers the throw.", evidence: "" }, "note:test"],
+    ["docs with an unverifiable quote", { file: "src/orders/CLAUDE.md", line: 3, title: "Doc wording is vague", evidence: "src/orders/CLAUDE.md:3 \"the caller retries the order on any failure\"" }, "note:docs"],
+  ];
+  for (const [name, patch, reason] of noQuote) {
+    it(`routes ${name} to notes instead of dropping it as unverified`, () => {
+      const d = one(mk(patch));
+      assert.equal(d.action, "note", JSON.stringify(d.reasons));
+      assert.equal(d.reasons[0], reason);
+      assert.ok(d.reasons.some((r) => r.startsWith("note_evidence_unverified")), JSON.stringify(d.reasons));
+    });
+  }
+
+  it("still drops a defect claim without a verified quote, and keeps the unverified reason when notes are off", () => {
+    assert.equal(one(mk({ evidence: "src/orders/submit.ts:7-9 saves before reserving" })).reasons[0], "evidence_unverified");
+    const style = mk({ title: "Ref assigned during render", rootCause: "A ref is written in the render body instead of an effect.", evidence: "ref written in render" });
+    assert.equal(one(style, ctx(), { ...ON, notes: false }).reasons[0], "evidence_unverified");
+  });
+
   it("classifies by the claim: a real defect in a test file stays a finding", () => {
     const c = ctx();
     c.headFiles.set("src/orders/submit.test.ts", "export function fakeClock() {\n  return { advance: (ms: number) => timers.filter((t) => t.at < now + ms).forEach(run) };\n}\n");

@@ -126,6 +126,8 @@ Settings "Finding precision"(`findingGate`, `findingP1ClosedPath`, `findingNotes
   이전 파인딩 반복·자기 철회·diff가 반박하는 주장·같은 응답의 coverage/investigated_safe가 반박·미검증 전제 인정·
   제목 자체가 가능성("may/might/could")·HEAD에 없는 인용은 버린다. 문서/i18n/스타일/로그 문구/테스트 조언은
   "Notes (not findings)" 로(집계·인라인·REQUEST_CHANGES 없음), 닫힌 경로 없는 P0/P1은 P2로. 텍스트는 바꾸지 않는다.
+  노트 범주 파인딩은 검증된 인용이 없어도(인용 없음·HEAD에 없는 인용) 버리지 않고 노트로 보낸다(사유
+  `note_evidence_unverified`) — 노트는 결함 주장이 아니므로 증명이 필요 없다. 인용 없는 결함 주장은 그대로 버린다.
 - **게시:** 게시 직전 HEAD 재확인(이동했으면 게시 안 함), push 가 옛 HEAD 리뷰를 취소, 같은 HEAD 재리뷰가 새 파인딩
   없으면 게시 안 함, 이전 파인딩만 남으면 clean(total=0) 리뷰 대신 건너뜀. `/review-loop` 단계는 이전 파인딩과
   대조하지 않는다(루프는 고쳐지지 않은 파인딩을 새 HEAD에서 다시 봐야 한다).

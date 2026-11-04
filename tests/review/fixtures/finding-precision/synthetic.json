@@ -385,6 +385,21 @@
       "expect": { "action": "note", "reason": "note:test" }
     },
     {
+      "id": "style-i18n-no-quote",
+      "pattern": "style-policy",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 7,
+        "title": "Hard-coded English text in the receipt log",
+        "failure_scenario": "Operators reading a localized console see an English message.",
+        "root_cause": "The message string is not localized.",
+        "evidence": "services/notify/listener.ts:7 the receipt message is a literal",
+        "recommended_fix": "Move the text to the message catalog.",
+        "recommended_test": "n/a"
+      },
+      "expect": { "action": "note", "reason": "note:i18n" }
+    },
+    {
       "id": "stale-head-repost",
       "pattern": "stale-head",
       "label": "fp",

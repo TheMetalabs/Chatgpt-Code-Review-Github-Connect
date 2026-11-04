@@ -12,7 +12,10 @@ import {
   summarizeGate,
   type GateContext,
   type GateOptions,
+  buildGateIndex,
+  verifyEvidence,
 } from "./finding-gate.ts";
+import { SNAPSHOT_DIFF_SEP, snapshotDiffBlock } from "./review-diff.ts";
 import type { Finding } from "./types.ts";
 
 // Synthetic snapshot: a changed order module, an unchanged pricing helper it imports, and the
@@ -689,5 +692,53 @@ describe("finding gate: executable code under a docs/ directory", () => {
     const d = one(mk({ file: "docs/site/refund.ts", line: 2, title: "Refund total doubles every item amount", failureScenario: "A refund of one 10.00 item returns 20.00.", rootCause: "refundTotal multiplies each amount by 2.", evidence: "docs/site/refund.ts:2 `return items.reduce((s, i) => s + i.amount * 2, 0);`" }), c);
     assert.equal(d.action, "keep");
     assert.equal(d.severityAfter ?? d.finding.severity, "P1");
+  });
+});
+
+// Live snapshots (github.server fetchPullSnapshot) carry the diff as compact `--- <path>` + GitHub patch
+// blocks — no `diff --git` / `+++` header. The gate must index those hunks exactly like `git diff`
+// output, or no quote is ever on a changed line (every P1 demoted, every weakly hedged finding dropped).
+describe("finding gate: the live snapshot's compact diff shape", () => {
+  // GitHub compare rows ({filename, patch}), joined the way fetchPullSnapshot joins them.
+  const ROWS = [
+    {
+      filename: "src/orders/submit.ts",
+      patch: `@@ -3,6 +3,8 @@ import { readTotal } from "../pricing/total";
+ export async function submitOrder(cart: Cart, user: User) {
+   const total = readTotal(cart);
+-  await saveOrder({ userId: user.id, items: cart.items });
++  if (!user.verified) throw new Error("unverified user");
++  await saveOrder({ userId: user.id, total, items: cart.items });
++  logger.info("order saved", { userId: user.id });
+   return { ok: true, total };
+ }`,
+    },
+    { filename: "src/orders/CLAUDE.md", patch: "@@ -1,1 +1,3 @@\n # Orders module\n+\n+submitOrder throws on an unverified user so the caller shows the sign-in prompt." },
+  ];
+  const LIVE = ROWS.map((r) => snapshotDiffBlock(r.filename, r.patch)).join(SNAPSHOT_DIFF_SEP);
+
+  it("is the shape fetchPullSnapshot builds (no git headers)", () => {
+    assert.match(LIVE, /^--- src\/orders\/submit\.ts\n@@ /);
+    assert.doesNotMatch(LIVE, /^(?:diff --git|\+\+\+ )/m);
+  });
+
+  it("keeps a grounded P1 at P1 and indexes the changed lines and files", () => {
+    const d = one(mk(), ctx({ diff: LIVE }));
+    assert.equal(d.action, "keep", JSON.stringify(d.reasons));
+    assert.equal(d.finding.severity, "P1");
+    const ev = verifyEvidence(mk(), buildGateIndex(ctx({ diff: LIVE })));
+    assert.equal(ev.onChanged, true);
+    // The same finding against git-format output decides the same way.
+    assert.deepEqual(one(mk(), ctx({ diff: LIVE })).action, one(mk(), ctx()).action);
+  });
+
+  it("keeps a weakly hedged claim proven by a changed-line quote (demoted, not dropped)", () => {
+    const d = one(mk({ rootCause: "saveOrder may run twice when the client retries." }), ctx({ diff: LIVE }));
+    assert.equal(d.action, "demote", JSON.stringify(d.reasons));
+  });
+
+  it("indexes every file of the compact shape, as it does git output", () => {
+    assert.deepEqual([...buildGateIndex(ctx({ diff: LIVE })).diff.files], ["src/orders/submit.ts", "src/orders/CLAUDE.md"]);
+    assert.deepEqual(buildGateIndex(ctx({ diff: LIVE })).diff, buildGateIndex(ctx()).diff);
   });
 });

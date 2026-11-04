@@ -1,6 +1,7 @@
 /**
  * Finding gate — deterministic precision rules applied to a reviewer leg's findings BEFORE they are
- * partitioned for posting (poster.gateLiveSubmission). Pure: no I/O, type-only imports.
+ * partitioned for posting (poster.gateLiveSubmission). Pure: no I/O; its only runtime import is the
+ * pure diff reader review-diff.diffFileBlocks.
  *
  * CONTRACT
  * - gateFindings(findings, ctx, opts) never rewrites a finding's text. Each finding is kept, demoted
@@ -33,6 +34,7 @@
  * text and the head snapshot into keep/drop decisions.
  */
 import type { Finding, Severity } from "./types.ts";
+import { diffFileBlocks } from "./review-diff.ts";
 
 export type GateMode = "off" | "rules";
 export const GATE_MODES: readonly GateMode[] = ["off", "rules"];
@@ -279,44 +281,21 @@ export interface GateIndex {
   changedPaths: Set<string>;
 }
 
+/** The diff's hunk lines. Read with review-diff's diffFileBlocks, so both diff shapes index: `git diff`
+ * output and the live snapshot's compact `--- path` + patch blocks (github.server fetchPullSnapshot),
+ * which carry no `diff --git` / `+++` header — a parser that waited for one indexed nothing in
+ * production, so no quote was ever on a changed line. */
 function parseDiff(diff: string): DiffIndex {
   const changedAll: string[] = [];
   const files = new Set<string>();
-  let file = "";
-  let inHunk = false;
-  for (const raw of String(diff ?? "").split("\n")) {
-    const head = raw.match(/^diff --git a\/(.+?) b\/(.+)$/);
-    if (head) {
-      file = head[2].trim();
-      files.add(file);
-      inHunk = false;
-      continue;
+  for (const block of diffFileBlocks(diff)) {
+    files.add(block.path);
+    for (const raw of block.lines) {
+      const marker = raw[0];
+      if (marker !== "+" && marker !== "-" && marker !== " ") continue;
+      const content = loose(raw.slice(1));
+      if (content) changedAll.push(content);
     }
-    // File headers: `--- a/x` / `+++ b/x` (or /dev/null) end the previous file's hunks even in a diff
-    // without `diff --git` lines.
-    const plus = raw.match(/^\+\+\+ (?:(?:b\/)(.+)|(\/dev\/null))\s*$/) ?? (!inHunk ? raw.match(/^\+\+\+ (.+)$/) : null);
-    if (plus) {
-      const name = (plus[1] ?? "").trim();
-      if (name && name !== "/dev/null") {
-        file = name;
-        files.add(file);
-      }
-      inHunk = false;
-      continue;
-    }
-    if (/^--- (?:a\/|\/dev\/null)/.test(raw) || (raw.startsWith("--- ") && !inHunk)) {
-      inHunk = false;
-      continue;
-    }
-    if (raw.startsWith("@@")) {
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk || !file) continue;
-    const marker = raw[0];
-    if (marker !== "+" && marker !== "-" && marker !== " ") continue;
-    const content = loose(raw.slice(1));
-    if (content) changedAll.push(content);
   }
   return { changedAll, files };
 }
@@ -782,7 +761,7 @@ const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
   },
 ];
 
-// Same test-path shape as review-budget.ts (kept local: this module has type-only imports).
+// Same test-path shape as review-budget.ts (kept local: this module imports nothing but the pure diff reader).
 const isTestPath = (p: string) => /\.spec\.|\.test\.|__tests__|\/tests?\//.test(p);
 const ADD_TEST_FIX = /\b(?:add|write|extend|cover)\b.{0,60}\b(?:tests?|test cases?|specs?|assertions?)\b|테스트(?:를|케이스를)?\s*(?:추가|작성|보강)/i;
 

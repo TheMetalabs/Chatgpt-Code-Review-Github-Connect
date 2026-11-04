@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412, SAMPLE_PRS } from "./samples.ts";
 import { fullFileContext } from "./context-slice.ts";
+import { SNAPSHOT_DIFF_SEP, snapshotDiffBlock } from "./review-diff.ts";
 import {
   CALL_SITES_MAX_CHARS,
   CHANGED_DOCS_MAX_CHARS,
@@ -479,6 +480,20 @@ describe("buildChatParts call sites (CALL_SITES)", () => {
     assert.match(section, /--- src\/view\.ts \(L2-L6\) uses quota \(src\/svc\.ts:1\)\n[\s\S]*4\| {3}const q = quota\(user\);/);
     assert.match(section, /--- src\/job\.ts \(L1-L4\) uses quota \(src\/svc\.ts:1\)\n[\s\S]*3\| {3}return quota\(u\) \* 2;/, "reference modules are searched too");
     assert.doesNotMatch(section, /src\/other\.ts/, "a same-named local function in a file that does not import it is not a call site");
+  });
+
+  it("finds the call sites from the live snapshot's compact diff (as fetchPullSnapshot builds it) and from git output", () => {
+    const rows = [
+      { filename: "src/svc.ts", patch: "@@ -1,3 +1,4 @@\n export function quota(user) {\n+  if (!user) return 0;\n   return user.limit;\n }" },
+      { filename: "src/view.ts", patch: "@@ -3,3 +3,3 @@\n export function render(user) {\n-  const q = 1;\n+  const q = quota(user);\n   return q ?? 0;" },
+    ];
+    const live = rows.map((r) => snapshotDiffBlock(r.filename, r.patch)).join(SNAPSHOT_DIFF_SEP);
+    const git = rows.map((r) => `diff --git a/${r.filename} b/${r.filename}\nindex 1111111..2222222 100644\n--- a/${r.filename}\n+++ b/${r.filename}\n${r.patch}`).join("\n");
+    for (const diff of [live, git]) {
+      const snap = buildChatParts({ sample: { ...sample, diff } }).files.find((f) => f.name === "ashlar-snapshot.md")!.body;
+      const section = /<<<CALL_SITES>>>\n([\s\S]*?)\n<<<END>>>/.exec(snap)?.[1] ?? "";
+      assert.match(section, /--- src\/job\.ts \(L1-L4\) uses quota \(src\/svc\.ts:1\)/, diff.slice(0, 40));
+    }
   });
 
   it("is capped by its budget and per-symbol site count", () => {

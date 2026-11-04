@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events';
 import { TLSSocket } from 'node:tls';
 import { loadTs } from './load-source.mjs';
 import { buildChatParts } from '../../src/lib/chat-prompt.ts';
+import { gateLiveSubmission } from '../../src/lib/poster.ts';
+import { DEFAULT_SETTINGS } from '../../src/lib/types.ts';
 
 // The real fetchPullSnapshot -> gh -> HTTPS decoder; only DNS and the network stream are fakes. The
 // fake GitHub answers by request path: compare, contents at a ref, and the pull itself. Synthetic repo.
@@ -41,6 +43,7 @@ function fakeGithub() {
     ...loadTs('src/lib/github-snapshot.ts'),
     ...loadTs('src/lib/import-resolve.ts'),
     ...loadTs('src/lib/review-budget.ts'),
+    ...loadTs('src/lib/review-diff.ts'),
     ...loadTs('src/lib/types.ts'),
     dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
     https: { request(options, callback) {
@@ -86,4 +89,22 @@ test('a changed module CLAUDE.md is policy at base and context at head', async (
   assert.doesNotMatch(policy, /HEAD_ROUTE_DOC/);
   assert.ok(policy.indexOf('svc/CLAUDE.md') < policy.indexOf('--- AGENTS.md'), 'nearest module doc before the root rules');
   assert.match(prompt, /<<<UNTRUSTED_PR_DESCRIPTION>>>\nPR body\n<<<END>>>/);
+});
+
+// The diff a live snapshot carries is compact `--- path` + patch blocks (no `diff --git` / `+++`). The
+// finding gate must read it: a P1 whose quote sits on a changed line stays P1 and requests changes.
+test('the live snapshot diff (compact blocks) grounds a P1 on a changed line through the gate', async () => {
+  const { api } = fakeGithub();
+  const sample = await api.fetchPullSnapshot('token', target);
+  for (const f of COMPARE.files) assert.ok(sample.diff.split('\n\n--- ').some((b) => b.replace(/^--- /, '') === `${f.filename}\n${f.patch}`), f.filename);
+  assert.doesNotMatch(sample.diff, /^(?:diff --git|\+\+\+ )/m);
+  const finding = {
+    severity: 'P1', file: 'svc/routes.ts', line: 2, side: 'RIGHT', title: 'route() returns the retired version code',
+    failure_scenario: 'Clients pinned to version 1 receive 2 and reject every response.', root_cause: 'route now returns 2 unconditionally.',
+    evidence: 'svc/routes.ts:2 `return 2;`', recommended_fix: 'Keep returning 1 for pinned clients.', recommended_test: 'A pinned client gets 1.',
+  };
+  const gate = gateLiveSubmission({ merge_recommendation: 'REQUEST_CHANGES', findings: [finding], investigated_safe: [] }, sample, DEFAULT_SETTINGS);
+  assert.ok(gate.ok, gate.reason);
+  assert.deepEqual(gate.findings.map((f) => [f.file, f.severity]), [['svc/routes.ts', 'P1']]);
+  assert.equal(gate.mergeRecommendation, 'REQUEST_CHANGES');
 });

@@ -20,6 +20,11 @@
 // Settings (types.ts DEFAULT_SETTINGS). A false positive is "removed" when the gate drops it or moves it
 // to notes; a valid finding is "lost" the same way (a demotion to P2 keeps it posted).
 //
+// Diff shape (--diff-shape=live|git|both, default both): a fixture's diff is usually `git diff` output,
+// but a live review sees the compact `--- path` + patch blocks github.server fetchPullSnapshot builds.
+// "live" converts every case's diff to that shape (review-diff toSnapshotDiff) so the eval measures
+// what production does; "git" keeps the fixture's diff as written; "both" reports each.
+//
 // Out-of-repo fixtures may hold private code: this script only reads them and prints to stdout. Never
 // commit such a fixture or its output.
 import fs from 'node:fs';
@@ -27,6 +32,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {gateFindings} from '../src/lib/finding-gate.ts';
 import {asFinding, findingGateContext} from '../src/lib/poster.ts';
+import {toSnapshotDiff} from '../src/lib/review-diff.ts';
 import {DEFAULT_SETTINGS} from '../src/lib/types.ts';
 import {fixtureSnapshot} from '../tests/review/finding-precision-harness.mjs';
 
@@ -101,7 +107,7 @@ function fromCaseFile(c, meta = {}) {
 }
 
 function fromSynthetic(fx) {
-  const snapshot = fixtureSnapshot(fx.pr);
+  const snapshot = fixtureSnapshot(fx.pr, {diffShape: 'git'}); // as written; evaluate() applies the diff shape
   return fx.cases.map((c) => {
     const {finding, filled} = toFinding(c.finding ?? {});
     const reply = c.reply ?? {};
@@ -135,17 +141,29 @@ export function loadFixture(p) {
 
 const removed = (a) => a === 'drop' || a === 'note';
 
-/** Run every case through the gate twice (off = baseline, then `settings`). */
-export function evaluate(cases, settings = DEFAULT_SETTINGS) {
+export const DIFF_SHAPES = ['live', 'git'];
+
+/** A case's snapshot with its diff in `shape`: "live" = the compact blocks a live snapshot carries
+ * (fetchPullSnapshot), "git" = the fixture's diff as written. */
+export function withDiffShape(snapshot, shape = 'live') {
+  if (shape === 'git') return snapshot;
+  if (shape !== 'live') throw new Error(`unknown diff shape: ${shape}`);
+  return {...snapshot, diff: toSnapshotDiff(snapshot.diff)};
+}
+
+/** Run every case through the gate twice (off = baseline, then `settings`), with its diff in `diffShape`. */
+export function evaluate(cases, settings = DEFAULT_SETTINGS, {diffShape = 'live'} = {}) {
   const opts = (s) => ({mode: s.findingGate ?? 'off', p1ClosedPath: s.findingP1ClosedPath !== false, notes: s.findingNotes !== false, dedupePrior: s.findingDedupePrior !== false});
+  const shaped = new Map();
   return cases.map((c) => {
     if (!c.finding) return {...c, before: {action: 'invalid', reasons: ['finding has no file/line']}, after: {action: 'invalid', reasons: ['finding has no file/line']}};
-    const ctx = findingGateContext(c.snapshot, c.submitted, {priorFindings: c.priorFindings});
+    if (!shaped.has(c.snapshot)) shaped.set(c.snapshot, withDiffShape(c.snapshot, diffShape));
+    const ctx = findingGateContext(shaped.get(c.snapshot), c.submitted, {priorFindings: c.priorFindings});
     const run = (s) => {
       const d = gateFindings([c.finding], ctx, opts(s)).decisions[0];
       return {action: d.action, reasons: d.reasons, severityBefore: d.severityBefore, severityAfter: d.severityAfter ?? d.finding.severity};
     };
-    return {...c, before: run({...settings, findingGate: 'off'}), after: run(settings)};
+    return {...c, diffShape, before: run({...settings, findingGate: 'off'}), after: run(settings)};
   });
 }
 
@@ -190,10 +208,13 @@ export function summarize(results) {
 const pct = (x) => (x == null ? '-' : `${(100 * x).toFixed(1)}%`);
 const pad = (s, n) => String(s).padEnd(n);
 
+const SHAPE_TEXT = {live: 'live (compact `--- path` blocks, as fetchPullSnapshot builds them)', git: 'git (the fixture diff as written)'};
+
 export function formatReport(results, {cases = true} = {}) {
   const out = [];
   const sum = summarize(results);
-  out.push('Finding-precision eval: finding gate off (baseline = what was posted) vs default Settings');
+  const shape = results[0]?.diffShape;
+  out.push(`Finding-precision eval: finding gate off (baseline = what was posted) vs default Settings${shape ? ` — diff shape ${SHAPE_TEXT[shape] ?? shape}` : ''}`);
   out.push(`cases ${results.length}${results.some((r) => r.peer18) ? `, peer18 ${results.filter((r) => r.peer18).length}` : ''}`);
   out.push('');
   const head = ['label', 'subset', 'n', 'valid kept', 'valid lost', 'FP kept (before)', 'FP kept (after)', 'FP removed', 'FP removal', 'demoted P2 (valid/FP)', 'unclear'];
@@ -222,18 +243,26 @@ export function fixturePaths(argv = [], env = process.env) {
   return [DEFAULT_FIXTURE];
 }
 
-export function runEval(paths = [DEFAULT_FIXTURE], settings = DEFAULT_SETTINGS) {
-  const results = evaluate(paths.flatMap(loadFixture), settings);
+export function runEval(paths = [DEFAULT_FIXTURE], settings = DEFAULT_SETTINGS, {diffShape = 'live'} = {}) {
+  const results = evaluate(paths.flatMap(loadFixture), settings, {diffShape});
   return {results, summary: summarize(results)};
+}
+
+/** The diff shapes a CLI run reports: --diff-shape=live|git|both (default both, live first). */
+export function diffShapes(argv = []) {
+  const arg = argv.find((a) => a.startsWith('--diff-shape='))?.slice('--diff-shape='.length) ?? 'both';
+  if (arg === 'both') return [...DIFF_SHAPES];
+  if (!DIFF_SHAPES.includes(arg)) throw new Error(`--diff-shape must be live, git or both (got ${arg})`);
+  return [arg];
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const argv = process.argv.slice(2);
-  const {results, summary} = runEval(fixturePaths(argv));
+  const runs = diffShapes(argv).map((diffShape) => ({diffShape, ...runEval(fixturePaths(argv), DEFAULT_SETTINGS, {diffShape})}));
   if (argv.includes('--json')) {
-    const slim = results.map((r) => ({id: r.id, pr: r.pr, ourLabel: r.ourLabel, peerLabel: r.peerLabel, peer18: r.peer18, before: r.before, after: r.after, filled: r.filled}));
-    console.log(JSON.stringify({summary, results: slim}, null, 2));
+    const slim = (results) => results.map((r) => ({id: r.id, pr: r.pr, ourLabel: r.ourLabel, peerLabel: r.peerLabel, peer18: r.peer18, before: r.before, after: r.after, filled: r.filled}));
+    console.log(JSON.stringify(runs.map(({diffShape, summary, results}) => ({diffShape, summary, results: slim(results)})), null, 2));
   } else {
-    console.log(formatReport(results, {cases: !argv.includes('--quiet')}));
+    console.log(runs.map(({results}) => formatReport(results, {cases: !argv.includes('--quiet')})).join('\n\n'));
   }
 }

@@ -20,6 +20,7 @@ import {
   SCHEMA_MERGE_NOTE,
 } from "./poster.ts";
 import { CANDIDATE_412_DROPPED, FINDING_412, FINDING_421, SAMPLE_PRS } from "./samples.ts";
+import { toSnapshotDiff } from "./review-diff.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
 import type { Finding, Job } from "./types.ts";
 
@@ -455,6 +456,18 @@ describe("gateLiveSubmission: finding gate", () => {
     assert.ok(shadow.ok);
     if (!shadow.ok) return;
     assert.deepEqual(shadow.findings.map((f) => f.title), [FINDING_412.title]);
+  });
+
+  it("keeps a grounded P1 at P1 (REQUEST_CHANGES) on the live snapshot's compact diff shape", () => {
+    // fetchPullSnapshot carries `--- path` + patch blocks, no git headers: the gate must still see the
+    // quote on a changed line, or every P1 is demoted to P2 and nothing requests changes.
+    const live = { ...SAMPLE_PRS["pay-412"], diff: toSnapshotDiff(SAMPLE_PRS["pay-412"].diff) };
+    assert.doesNotMatch(live.diff, /^(?:diff --git|\+\+\+ )/m);
+    const gate = gateLiveSubmission({ merge_recommendation: "REQUEST_CHANGES", findings: [real], investigated_safe: ["ledger checked"] }, live, DEFAULT_SETTINGS);
+    assert.ok(gate.ok);
+    if (!gate.ok) return;
+    assert.deepEqual(gate.findings.map((f) => [f.title, f.severity]), [[FINDING_412.title, "P1"]]);
+    assert.equal(gate.mergeRecommendation, "REQUEST_CHANGES");
   });
 
   it("a note never makes REQUEST_CHANGES, even when the reviewer called it P1", () => {

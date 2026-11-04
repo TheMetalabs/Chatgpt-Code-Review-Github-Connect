@@ -4,7 +4,7 @@ import * as https from "node:https";
 import { SignJWT } from "jose";
 import { changedPolicyDocs, isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
-import { isReviewLineError } from "./review-diff";
+import { isReviewLineError, SNAPSHOT_DIFF_SEP, snapshotDiffBlock } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import {
   GithubTransportError,
@@ -636,9 +636,9 @@ export async function fetchPullSnapshot(
   );
   const diffBlocks = rows
     .filter((f) => f.filename && changedPaths.includes(f.filename))
-    .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: `--- ${f.filename}\n${f.patch ?? ""}` }));
+    .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: snapshotDiffBlock(f.filename as string, f.patch ?? "") }));
   const budgeted = applyBudget(diffBlocks, opts?.diffMaxChars ?? DEFAULT_SETTINGS.promptDiffMaxChars);
-  const diff = budgeted.kept.map((b) => b.patch).join("\n\n");
+  const diff = budgeted.kept.map((b) => b.patch).join(SNAPSHOT_DIFF_SEP);
   const diffDroppedPaths = budgeted.dropped.map((b) => b.path);
   let body = "";
   try {

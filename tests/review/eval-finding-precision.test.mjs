@@ -8,13 +8,13 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {DEFAULT_FIXTURE, evaluate, fixturePaths, formatReport, loadFixture, runEval, summarize} from '../../scripts/eval-finding-precision.mjs';
+import {DEFAULT_FIXTURE, DIFF_SHAPES, diffShapes, evaluate, fixturePaths, formatReport, loadFixture, runEval, summarize} from '../../scripts/eval-finding-precision.mjs';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
-test('synthetic fixture: baseline posts every finding; default Settings remove >= 75% of false positives and lose no valid finding', () => {
-  const {results, summary} = runEval([DEFAULT_FIXTURE]);
+for (const diffShape of DIFF_SHAPES) test(`synthetic fixture [${diffShape} diff]: baseline posts every finding; default Settings remove >= 75% of false positives and lose no valid finding`, () => {
+  const {results, summary} = runEval([DEFAULT_FIXTURE], DEFAULT_SETTINGS, {diffShape});
   const row = summary.find((r) => r.label === 'ourLabel' && r.subset === 'all');
   assert.ok(row, 'ourLabel/all row');
   assert.ok(row.fp >= 14 && row.valid >= 3, `fixture size: ${row.fp} FP, ${row.valid} valid`);
@@ -67,7 +67,10 @@ test('case-file directory fixtures (index.json): labels, peer18 subset, unrecove
     fs.writeFileSync(path.join(dir, 'cases/a.json'), JSON.stringify(a));
     fs.writeFileSync(path.join(dir, 'cases/b.json'), JSON.stringify(b));
     fs.writeFileSync(path.join(dir, 'index.json'), JSON.stringify([{id: 'a', file: 'cases/a.json'}, {id: 'b', file: 'cases/b.json'}]));
+    // The live shape (the default) and git output decide every case the same way.
+    const git = evaluate(loadFixture(dir), DEFAULT_SETTINGS, {diffShape: 'git'});
     const results = evaluate(loadFixture(dir));
+    assert.deepEqual(results.map((r) => r.after), git.map((r) => r.after));
     const [ra, rb] = results;
     assert.deepEqual(ra.filled, ['recommendedTest'], 'an unrecovered text field is filled and reported');
     assert.equal(ra.priorFindings.length, 0, "the review's own sibling finding is never a prior");
@@ -89,11 +92,20 @@ test('fixture selection: path argument, then ASHLAR_EVAL_FIXTURES, then the synt
   assert.deepEqual(fixturePaths(['x.json', '--quiet'], {ASHLAR_EVAL_FIXTURES: 'y'}), ['x.json']);
   assert.deepEqual(fixturePaths([], {ASHLAR_EVAL_FIXTURES: `y${path.delimiter}z`}), ['y', 'z']);
   assert.deepEqual(fixturePaths([], {}), [DEFAULT_FIXTURE]);
+  assert.deepEqual(fixturePaths(['--diff-shape=git'], {}), [DEFAULT_FIXTURE]);
+});
+
+test('diff shape selection: both by default (live first), or one', () => {
+  assert.deepEqual(diffShapes([]), ['live', 'git']);
+  assert.deepEqual(diffShapes(['--diff-shape=git']), ['git']);
+  assert.deepEqual(diffShapes(['--diff-shape=live']), ['live']);
+  assert.throws(() => diffShapes(['--diff-shape=svn']), /live, git or both/);
 });
 
 test('CLI prints the summary table and per-case lines', () => {
   const out = execFileSync(process.execPath, ['--experimental-strip-types', '--no-warnings', path.join(ROOT, 'scripts/eval-finding-precision.mjs')], {cwd: ROOT, encoding: 'utf8', env: {...process.env, ASHLAR_EVAL_FIXTURES: ''}});
   assert.match(out, /^label\s+subset\s+n\s+valid kept\s+valid lost/m);
+  assert.match(out, /diff shape live \(compact `--- path` blocks, as fetchPullSnapshot builds them\)[\s\S]*diff shape git \(the fixture diff as written\)/, 'both tables, live first');
   assert.match(out, /^ourLabel\s+all\s+\d+\s+\d+\/\d+/m);
   assert.match(out, /^valid-two-locations-one-unchanged \| valid\/- \| - \| keep → keep P1 \| -$/m);
 });

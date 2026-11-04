@@ -37,8 +37,10 @@ export async function appFixture(options={}, githubOptions={}) {
  // gate (finding-gate.ts, default 'rules') would rightly drop. A test of the gate itself passes
  // {findingGate:'rules'} (finding-gate-wiring.test.mjs).
  const settings={...types.DEFAULT_SETTINGS,findingGate:'off',reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ // The diff is in the shape fetchPullSnapshot builds: compact `--- path` + patch blocks, no git headers.
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
-  changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],diff:'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n'};
+  changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],
+  diff:'--- a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;'};
  const clock={now:Date.now()};class Clock extends Date{static now(){return clock.now;}}
  const context=vm.createContext({console,Buffer,URL,Request,Response,Headers,TextEncoder,TextDecoder,crypto:globalThis.crypto,AbortController,AbortSignal,performance,setTimeout,clearTimeout,Date:Clock,
    process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token',ASHLAR_HISTORY_TOKEN:'fixture-history-token-32-characters-long'}}});

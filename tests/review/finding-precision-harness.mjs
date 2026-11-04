@@ -4,10 +4,16 @@
 //   pr:   {headSha, baseSha, body, files: {path: [lines]}, referencePaths: [], newFiles: [], modifiedDiffs: [diff lines]}
 //   case: {id, finding: <review JSON finding>, reply?: {investigated_safe, assumptions, coverage}, priorFindings?: [...]}
 import {gateLiveSubmission} from '../../src/lib/poster.ts';
+import {toSnapshotDiff} from '../../src/lib/review-diff.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 
-/** The fixture's PR as the snapshot the gate sees: changed files + reference files at head, the diff. */
-export function fixtureSnapshot(pr) {
+/** Both shapes a snapshot's diff can have: "live" = the compact `--- path` + patch blocks github.server
+ * fetchPullSnapshot builds (what production reviews see), "git" = `git diff` output. */
+export const DIFF_SHAPES = ['live', 'git'];
+
+/** The fixture's PR as the snapshot the gate sees: changed files + reference files at head, the diff
+ * (in `diffShape`; the fixture writes it as git output). */
+export function fixtureSnapshot(pr, {diffShape = 'live'} = {}) {
   const text = (path) => pr.files[path].join('\n') + '\n';
   const refs = new Set(pr.referencePaths ?? []);
   const modifiedDiffs = pr.modifiedDiffs ?? [];
@@ -27,7 +33,7 @@ export function fixtureSnapshot(pr) {
     files: Object.keys(pr.files).filter((p) => !refs.has(p)).map((path) => ({path, content: text(path), language: path.endsWith('.md') ? 'md' : 'ts'})),
     referenceFiles: [...refs].map((path) => ({path, content: text(path), language: 'ts'})),
     changedPaths: [...newFiles, ...modified],
-    diff: [...newDiffs, ...modifiedDiffs].join('\n') + '\n',
+    diff: diffShape === 'git' ? [...newDiffs, ...modifiedDiffs].join('\n') + '\n' : toSnapshotDiff([...newDiffs, ...modifiedDiffs].join('\n')),
   };
 }
 

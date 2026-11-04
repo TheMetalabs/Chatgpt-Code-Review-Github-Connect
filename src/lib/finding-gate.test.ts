@@ -265,6 +265,34 @@ describe("finding gate: R2 self-retraction", () => {
     const d = one(mk({ rootCause: "The sync path is safe, but the retry path saves the order a second time." }));
     assert.notEqual(d.reasons[0], "self_retracted");
   });
+
+  it("reads only the claim: a fix or test plan that says what is safe or needs no change does not retract", () => {
+    for (const patch of [
+      { recommendedFix: "Reserve stock before saveOrder; no code changes needed in callers." },
+      { recommendedFix: "saveOrder 전에 재고를 예약하면 안전합니다." },
+      { recommendedTest: "재고가 충분한 주문은 문제 없음, 마지막 재고 1개에 동시 주문 2건 중 1건만 성공하는지 확인" },
+      { failureScenario: "Two carts reserving the last item both save an order. The rest of this code is fine." },
+    ] as Partial<Finding>[]) {
+      const d = one(mk(patch));
+      assert.equal(d.action, "keep", `${JSON.stringify(patch)} -> ${d.reasons.join("; ")}`);
+    }
+  });
+
+  it("reads a Korean verdict as a retraction only when it concludes the finding itself", () => {
+    // Contrast / another path: not a retraction.
+    for (const rootCause of [
+      "현금 주문은 안전하다. 그러나 카드 주문은 재고 확인 없이 저장된다.",
+      "조회 경로는 문제 없다. 하지만 재시도 경로는 주문을 두 번 저장한다.",
+      "부분 저장은 안전합니다 — 전체 저장은 재고 확인 전에 일어납니다.",
+    ]) {
+      assert.equal(one(mk({ rootCause })).action, "keep", rootCause);
+    }
+    // The finding's own path, a conclusion, or a no-change verdict: a retraction.
+    for (const rootCause of ["가드가 먼저 실행되므로 이 경로는 안전합니다.", "재고 확인이 이미 앞에서 이뤄진다. 따라서 문제 없음.", "문제 없습니다.", "재시도는 멱등이라 수정 불필요."]) {
+      assert.equal(one(mk({ rootCause })).reasons[0], "self_retracted", rootCause);
+    }
+    assert.equal(one(mk({ recommendedFix: "수정할 필요 없음" })).reasons[0], "self_retracted");
+  });
 });
 
 describe("finding gate: R3 evidence verification", () => {

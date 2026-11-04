@@ -10,6 +10,9 @@
  * - mode "off" is the identity (everything kept, no notes); "rules" applies the deterministic rules.
  *   (A model refute pass is not part of this gate; the "refute" value an earlier build stored is read
  *   as "rules" — normalizeGateMode.)
+ * - R2 self-retraction reads the claim only (title, failure scenario, root cause) plus a fix that is a
+ *   no-op as a whole ("No change needed."); a verdict followed by a contrast ("X is safe. But Y") clears
+ *   another path, not the finding.
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
  *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path. A note-category
  *   finding (C1) that fails R3 is routed to notes, not dropped: a note asserts no defect to prove.
@@ -125,10 +128,6 @@ function stripQuoted(s: string): string {
 
 function claimText(f: Finding): string {
   return stripQuoted([f.title, f.failureScenario, f.rootCause].join("\n"));
-}
-
-function allText(f: Finding): string {
-  return stripQuoted([f.title, f.failureScenario, f.rootCause, f.evidence, f.recommendedFix, f.recommendedTest].join("\n"));
 }
 
 const basename = (p: string) => p.split("/").pop() ?? p;
@@ -522,38 +521,61 @@ function weakHedge(text: string): string | undefined {
 // ── R2 self-retraction ────────────────────────────────────────────────────────────────────────────
 
 /** The finding's own conclusion that there is no defect. Each phrase is the reviewer's verdict, never a
- * description of the code ("the loop keeps re-reading the config", "the fraud check's false positives"). */
+ * description of the code ("the loop keeps re-reading the config", "the fraud check's false positives").
+ * Only the claim (title, failure scenario, root cause) is read: "no code changes needed in callers" in
+ * a fix or "정상 금액은 문제 없음" in a test plan describes the remedy, not the finding. */
 const SAFE_WORD = "(?:safe|fine|correct|ok(?:ay)?|handled|guarded|covered|not an? (?:real )?(?:bug|issue|problem|defect)|no (?:bug|issue|problem|defect))";
-const RETRACTION = [
-  /\bno (?:code )?changes? (?:is |are )?(?:needed|required|necessary)\b/i,
-  /\bno (?:fix|action|change) (?:is )?(?:needed|required|necessary)\b/i,
-  /\b(?:this|that) (?:path|code|case|flow|branch|usage|call|code path) is (?:actually |therefore |thus |already )?(?:safe|fine|correct|ok(?:ay)?)(?=\s*(?:[.;!)—–]|$|,?\s*(?:so|and so|therefore|thus|no)\b))/im,
-  /\bso the (?:path|code|case|flow) is (?:actually )?(?:safe|fine|correct)\b/i,
-  /\b(?:so|therefore|thus|hence)\b[^.\n]{0,40}\bnot (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/i,
-  /(?:^|[.!?:]\s*)(?:this|it) is not (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/im,
-  /\bno (?:bug|issue|problem|defect) here\b/i,
-  /\bfalse alarm\b/i,
-  /\b(?:this|it) (?:is|was|looks like) (?:a |likely a )?false positive\b/i,
-  /\bon second thought\b/i,
-  new RegExp(`\\b(?:on |after |upon )?re-?reading (?:this|it|the (?:code|diff|guard|function|logic|line|lines|snippet|file|check|condition))\\b[^\\n]{0,120}?\\b${SAFE_WORD}`, "i"),
-  /(?:^|[.!?]\s+)wait\s*[,—–-]/im,
-  /\b(?:test|tests)\s*:\s*(?:n\/a|none(?: needed)?|not needed)\b/i,
-  /\bfix\s*:\s*(?:n\/a|none|no change(?:s)?(?: needed)?)\b/i,
-  /문제\s*(?:가\s*|는\s*)?없(?:음|습니다|다|어요|네요)/,
-  /(?:수정|변경|조치)\s*(?:이\s*|은\s*)?불필요/,
-  /(?:수정|변경|조치)할\s*필요(?:가|는)?\s*없/,
-  /버그가\s*아니/,
-  /안전(?:합니다|하다|함)(?:[.。]|\s|$)/,
-  /오탐(?:입니다|임|이다|으로\s*(?:보|판단))/,
+/** A Korean subject that is the finding's own code path ("이 경로는", "해당 코드는"). */
+const KO_THIS = "(?:이|해당|그)\\s*(?:경로|코드|부분|케이스|흐름|분기|호출|로직|구현|변경|동작)(?:는|은|도|에는)?\\s*";
+/** A Korean conclusion marker: "…므로 / …때문에 / 따라서 / 결국" before the verdict. */
+const KO_SO = "(?:므로|때문에|으니|니까|따라서|그러므로|결국|즉|결론적으로)";
+const RETRACTION: { re: RegExp; contrastable: boolean }[] = [
+  ...[
+    /\bno (?:code )?changes? (?:is |are )?(?:needed|required|necessary)\b/i,
+    /\bno (?:fix|action|change) (?:is )?(?:needed|required|necessary)\b/i,
+    /\b(?:this|that) (?:path|code|case|flow|branch|usage|call|code path) is (?:actually |therefore |thus |already )?(?:safe|fine|correct|ok(?:ay)?)(?=\s*(?:[.;!)—–]|$|,?\s*(?:so|and so|therefore|thus|no)\b))/im,
+    /\bso the (?:path|code|case|flow) is (?:actually )?(?:safe|fine|correct)\b/i,
+    /\b(?:so|therefore|thus|hence)\b[^.\n]{0,40}\bnot (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/i,
+    /(?:^|[.!?:]\s*)(?:this|it) is not (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/im,
+    /\bno (?:bug|issue|problem|defect) here\b/i,
+    /\b(?:this|it) (?:is|was|looks like) (?:a |likely a )?false positive\b/i,
+    /\b(?:test|tests)\s*:\s*(?:n\/a|none(?: needed)?|not needed)\b/i,
+    /\bfix\s*:\s*(?:n\/a|none|no change(?:s)?(?: needed)?)\b/i,
+    // Korean verdicts, anchored to a conclusion about the finding itself: its own path as the subject
+    // ("이 경로는 안전합니다"), a "…므로 / 따라서" conclusion, or the verdict as a whole sentence — never
+    // "부분 환불은 안전하다" (another path, contrasted with the broken one).
+    new RegExp(`${KO_THIS}(?:실제로\\s*|이미\\s*|충분히\\s*)?(?:안전(?:합니다|하다|함)|문제\\s*(?:가\\s*|는\\s*)?없(?:음|습니다|다|어요|네요))`),
+    new RegExp(`${KO_SO}[^.。!?\\n]{0,30}?(?:안전(?:합니다|하다|함)|문제\\s*(?:가\\s*|는\\s*)?없(?:음|습니다|다|어요|네요))`),
+    /(?:^|[.。!?]\s*|\n)\s*(?:실제로는?\s*)?문제\s*(?:가\s*|는\s*)?없(?:음|습니다|다|어요|네요)\s*(?:[.。!]|$)/m,
+    /(?:수정|변경|조치)\s*(?:이\s*|은\s*)?불필요/,
+    /(?:수정|변경|조치)할\s*필요(?:가|는)?\s*없/,
+    /버그가\s*아(?:니다|닙니다|니며|니므로|님)/,
+    /오탐(?:입니다|임|이다|으로\s*(?:보|판단))/,
+  ].map((re) => ({ re, contrastable: true })),
+  // A reversal mid-reasoning retracts whatever follows it.
+  ...[
+    /\bfalse alarm\b/i,
+    /\bon second thought\b/i,
+    new RegExp(`\\b(?:on |after |upon )?re-?reading (?:this|it|the (?:code|diff|guard|function|logic|line|lines|snippet|file|check|condition))\\b[^\\n]{0,120}?\\b${SAFE_WORD}`, "i"),
+    /(?:^|[.!?]\s+)wait\s*[,—–-]/im,
+  ].map((re) => ({ re, contrastable: false })),
 ];
+/** The verdict is followed by a contrast ("X is safe. But Y …", "안전하다. 그러나 …"): it clears another
+ * path, not the finding. */
+const CONTRAST_AFTER = /^[^.!?。\n]*[.!?。]?\s*(?:however|but|yet|although|그러나|하지만|다만|반면|그런데)(?![A-Za-z])/i;
+/** The verdict is about the rest of the code, not the finding ("the rest of this code is fine"). */
+const OTHER_SUBJECT_BEFORE = /\b(?:rest of|remainder of|other (?:parts? of|code in)|everything else in)\s*$/i;
 
-const NOOP_FIELD = /^(?:n\/?a|none|nothing|no changes?(?: needed| required)?|no fix(?: needed)?|not needed|none needed|-+|없음|불필요|해당 없음)\.?$/i;
+const NOOP_FIELD = /^(?:n\/?a|none|nothing|no changes?(?: needed| required)?|no fix(?: needed)?|not needed|none needed|-+|없음|불필요|해당 없음|(?:수정|변경|조치)\s*(?:이\s*|은\s*)?불필요(?:합니다|함)?|(?:수정|변경|조치)할\s*필요(?:가|는)?\s*없(?:음|습니다|다))\.?$/i;
 
 function selfRetraction(f: Finding): string | undefined {
-  const text = allText(f);
-  for (const re of RETRACTION) {
-    const m = text.match(re);
-    if (m) return m[0].trim();
+  const text = claimText(f);
+  for (const { re, contrastable } of RETRACTION) {
+    for (const m of text.matchAll(new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`))) {
+      const at = m.index ?? 0;
+      if (contrastable && (CONTRAST_AFTER.test(text.slice(at + m[0].length)) || OTHER_SUBJECT_BEFORE.test(text.slice(Math.max(0, at - 24), at)))) continue;
+      return m[0].replace(/^[\s.!?:。]+/, "").trim();
+    }
   }
   if (NOOP_FIELD.test(norm(f.recommendedFix))) return `fix: ${norm(f.recommendedFix)}`;
   return undefined;

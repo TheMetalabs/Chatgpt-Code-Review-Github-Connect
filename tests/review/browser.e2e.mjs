@@ -1644,6 +1644,12 @@ for(const [name,{second,probeFirst,draft}={}] of [['then answers there'],
     assert.deepEqual([early.identity,early.conversation],[undefined,TEMP_CONV],JSON.stringify(early));
    }
   }
+  if(!(probeFirst||draft)){
+   // The move is scheduled 600 fake ms after the turn shows, which can be late inside fill()'s clock
+   // window when promise turns trail the fake timers on a loaded runner: keep the fake clock moving
+   // (bounded) until it lands. No assertion changes.
+   for(let i=0;i<40&&await page.evaluate(()=>location.href)!==TEMP_CONV;i++)await page.clock.runFor(50);
+  }
   assert.deepEqual(await page.evaluate(()=>[window.collectFrom,location.href]),[TEMP_URL,TEMP_CONV],'collecting on "/" when the move landed');
   await page.clock.runFor(1600);
   if(draft){

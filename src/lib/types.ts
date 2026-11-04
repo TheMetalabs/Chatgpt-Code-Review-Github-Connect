@@ -358,6 +358,10 @@ export interface SamplePr {
   /** Unchanged modules that changed files import from, fetched at head so cross-file helper
    * definitions can be attached (chat) or served by the loop's cache (local). Not review targets. */
   referenceFiles?: SnapshotFile[];
+  /** BASE text of changed files that are also policy paths (a module AGENTS.md / CLAUDE.md,
+   * code_review.md): the policy authority, so a PR cannot rewrite the rules it is reviewed by. `files`
+   * holds every changed path at HEAD, these included (github-snapshot.ts changedPolicyDocs). */
+  basePolicyFiles?: SnapshotFile[];
 }
 
 export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";

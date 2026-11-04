@@ -582,3 +582,58 @@ test("a leg whose every group request throws names the errors in its failure and
   assert.ok(out.error.length < 300, "bounded: it reaches GitHub-visible text");
   assert.ok(logged.some((l) => /group src\/a\.ts failed: local LLM HTTP 400/.test(l)), JSON.stringify(logged));
 });
+
+// 2026-11 precision work: grouped-loop findings that said "unverified" or "not in the reviewed group"
+// were false positives, and the PR description reached the loop cut to 800 chars.
+test("the group prompt carries the whole PR description and no longer invites unverified findings", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  const body = `## Summary\n${"- detail line\n".repeat(120)}\n## Rollout\nSHIPS_DARK: the new path stays behind a default-off flag in this PR.`;
+  assert.ok(body.indexOf("SHIPS_DARK") > 800);
+  await runLocalReviewLoop({ ...sampleWith(["src/pay.ts"]), body }, settings, { request, extra: "@ashlar-bot review" });
+  const [system, user] = bodies[0].messages;
+  assert.match(user.content, /<<<UNTRUSTED_PR_DESCRIPTION>>>\n[\s\S]*SHIPS_DARK: the new path stays behind a default-off flag/);
+  assert.match(user.content, /<<<UNTRUSTED_USER_LINE>>>\n@ashlar-bot review\n<<<END>>>/);
+  assert.doesNotMatch(system.content, /report the suspected defect anyway/);
+  assert.match(system.content, /a defect that depends on it is unproven: do not report it — list it in assumptions/);
+  assert.match(system.content, /never report something as unverified or as "not in the reviewed group" — read it, or leave it out/);
+  assert.match(user.content, /Other changed files of this PR \(the same change; read them with file_read_diff or file_read before any claim about them\)/);
+});
+
+test("NOT_IN_SNAPSHOT tells the model an unreadable dependency is unproven, not an evidence citation", async () => {
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/nope.ts" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  const toolMsg = bodies[1].messages.find((m) => m.role === "tool");
+  assert.doesNotMatch(toolMsg.content, /Cite it as an unverified dependency/);
+  assert.match(toolMsg.content, /a defect that depends on it is unproven: list it in assumptions, not findings/);
+});
+
+test("a code group sees the module doc a sibling group's file edits, at head; its policy stays the base text", async () => {
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/CLAUDE.md" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  const s = sampleWith(["src/pay.ts"]);
+  const sample = {
+    ...s,
+    changedPaths: ["src/pay.ts", "src/CLAUDE.md"],
+    files: [...s.files, { path: "src/CLAUDE.md", content: "BASE_DOC_TEXT\nHEAD_DOC_ADDITION", language: "md" }],
+    basePolicyFiles: [{ path: "src/CLAUDE.md", content: "BASE_DOC_TEXT", language: "md" }],
+    diff: `${s.diff}\n\n--- src/CLAUDE.md\n@@ -1 +1,2 @@\n BASE_DOC_TEXT\n+HEAD_DOC_ADDITION`,
+  };
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    await runLocalReviewLoop(sample, settings, { request });
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+  const first = bodies[0].messages[1].content;
+  assert.match(first, /Review only: src\/pay\.ts\./, "the first request is the code group's");
+  assert.match(first, /<<<CHANGED_NON_CODE_FILES>>>[\s\S]*HEAD_DOC_ADDITION/, "the sibling group's doc edit is in view");
+  const policy = /<<<ATTACH:ashlar-policy\.md>>>\n([\s\S]*?)\n<<<END_ATTACH>>>/.exec(first)?.[1] ?? "";
+  assert.match(policy, /BASE_DOC_TEXT/);
+  assert.doesNotMatch(policy, /HEAD_DOC_ADDITION/, "the PR's edit never becomes the policy it is reviewed by");
+  assert.match(bodies[1].messages.find((m) => m.role === "tool").content, /HEAD_DOC_ADDITION/, "file_read serves the head");
+});

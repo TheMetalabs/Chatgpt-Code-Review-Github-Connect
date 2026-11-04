@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractReviewPolicy, isSafeRepoPath, policyPathsFor, snapshotFileRef } from "./github-snapshot.ts";
+import { allocatePolicyText, changedPolicyDocs, extractReviewPolicy, isPolicyDocPath, isSafeRepoPath, nearestPolicyOrder, policyPathsFor, snapshotFileRef } from "./github-snapshot.ts";
 
 describe("github snapshot refs", () => {
   it("includes root + nested AGENTS.md and code_review.md as base-read policy", () => {
@@ -51,6 +51,53 @@ describe("github snapshot refs", () => {
     const out = extractReviewPolicy(md, 2000);
     assert.ok(out.length <= 2000, `respects caller budget, got ${out.length}`);
     assert.match(out, /keep me under a tight budget/);
+  });
+
+  it("reads the module CLAUDE.md chain beside AGENTS.md as base-read policy", () => {
+    const policy = policyPathsFor(["src/payment/webhook.ts"]);
+    for (const p of ["CLAUDE.md", "src/CLAUDE.md", "src/payment/CLAUDE.md", "src/payment/AGENTS.md"]) assert.ok(policy.includes(p), p);
+    assert.equal(snapshotFileRef("src/payment/CLAUDE.md", policy, "base", "head"), "base");
+    assert.ok(isPolicyDocPath("src/payment/CLAUDE.md") && isPolicyDocPath("AGENTS.md") && isPolicyDocPath("code_review.md"));
+    assert.ok(!isPolicyDocPath("src/code_review.md") && !isPolicyDocPath("src/payment/webhook.ts") && !isPolicyDocPath("docs/CLAUDE.md.bak"));
+  });
+
+  it("a changed policy doc is also fetched at head as context (changedPolicyDocs)", () => {
+    const changed = ["src/mail/CLAUDE.md", "src/mail/send.ts", "README.md"];
+    assert.deepEqual(changedPolicyDocs(changed, policyPathsFor(changed)), ["src/mail/CLAUDE.md"]);
+  });
+
+  it("orders policy nearest-first per changed module, root last", () => {
+    const available = ["AGENTS.md", "CLAUDE.md", "code_review.md", "backend/AGENTS.md", "backend/src/mail/CLAUDE.md", "frontend/AGENTS.md", "unrelated/AGENTS.md"];
+    const order = nearestPolicyOrder(["backend/src/mail/send.ts", "frontend/src/app.ts", "backend/src/mail/other.ts"], available);
+    assert.deepEqual(order, [
+      "backend/src/mail/CLAUDE.md", // nearest doc of area 1
+      "frontend/AGENTS.md", // nearest doc of area 2, before area 1's second-nearest
+      "backend/AGENTS.md",
+      "AGENTS.md",
+      "CLAUDE.md",
+      "code_review.md",
+      "unrelated/AGENTS.md", // reached by no changed path: appended
+    ]);
+    // A shallow area reaching the root early does not put root docs ahead of a deep area's module doc.
+    assert.deepEqual(
+      nearestPolicyOrder(["frontend/app.ts", "backend/src/x.ts"], ["AGENTS.md", "frontend/AGENTS.md", "backend/src/CLAUDE.md", "backend/AGENTS.md"]),
+      ["frontend/AGENTS.md", "backend/src/CLAUDE.md", "backend/AGENTS.md", "AGENTS.md"],
+    );
+  });
+
+  it("allocatePolicyText: whole when it fits; otherwise a fair share each, leftover to the nearest", () => {
+    const small = [{ path: "a/AGENTS.md", content: "A rules" }, { path: "AGENTS.md", content: "root rules" }];
+    assert.equal(allocatePolicyText(small, 1_000), "--- a/AGENTS.md\nA rules\n\n--- AGENTS.md\nroot rules");
+    const big = (t: string) => `${t} head\n${"q".repeat(5_000)}\n## Code Review Rules\n- ${t} rule\n`;
+    const out = allocatePolicyText([{ path: "a/AGENTS.md", content: big("A") }, { path: "b/AGENTS.md", content: big("B") }, { path: "AGENTS.md", content: "root rules" }], 3_000);
+    assert.ok(out.length <= 3_000, `bounded (${out.length})`);
+    for (const t of ["A", "B"]) {
+      assert.match(out, new RegExp(`${t} head`));
+      assert.match(out, new RegExp(`- ${t} rule`));
+    }
+    assert.match(out, /--- AGENTS\.md\nroot rules/, "the small root file is whole");
+    assert.ok(out.length > 2_900, "leftover from the small file is reused");
+    assert.equal(allocatePolicyText([{ path: "x/CLAUDE.md", content: "same" }, { path: "x/AGENTS.md", content: "same" }], 100), "--- x/CLAUDE.md\nsame");
   });
 
   it("rejects path traversal", () => {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
+import { addedLineNumbers, callSiteContext, changedExportedSymbols, crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
 
 describe("fullFileContext", () => {
   it("emits every line with a 1-based gutter under a full-range header", () => {
@@ -594,4 +594,72 @@ describe("crossFileDefs", () => {
     assert.doesNotMatch(crossFileDefs(changed, [writeSvc], 10_000), /bare receiver di/);
   });
 
+});
+
+describe("call-site context", () => {
+  it("addedLineNumbers maps a patch's added lines to head line numbers", () => {
+    const patch = "@@ -1,3 +1,4 @@\n a\n+b\n c\n-d\n+e\n@@ -10,1 +11,2 @@\n x\n+y\n\\ No newline at end of file";
+    assert.deepEqual(addedLineNumbers(patch), [2, 4, 12]);
+  });
+
+  it("changedExportedSymbols finds the exported function, class method or value an added line sits in", () => {
+    const content = [
+      "import { x } from './x';", // 1
+      "export function alpha(a) {", // 2
+      "  helper(a);", // 3
+      "  return a + 1;", // 4
+      "}", // 5
+      "function internalOnly() {", // 6
+      "  return 2;", // 7
+      "}", // 8
+      "export class Billing {", // 9
+      "  constructor(private readonly repo: Repo) {}", // 10
+      "  async charge(id: string): Promise<void> {", // 11
+      "    await this.repo.save(id);", // 12
+      "  }", // 13
+      "}", // 14
+      "export const LIMITS = {", // 15
+      "  max: 3,", // 16
+      "};", // 17
+    ].join("\n");
+    const patch = "@@ -1,13 +1,17 @@\n import { x } from './x';\n export function alpha(a) {\n   helper(a);\n+  return a + 1;\n }\n function internalOnly() {\n+  return 2;\n }\n export class Billing {\n   constructor(private readonly repo: Repo) {}\n   async charge(id: string): Promise<void> {\n+    await this.repo.save(id);\n   }\n }\n export const LIMITS = {\n+  max: 3,\n };";
+    assert.deepEqual(changedExportedSymbols(content, patch), [
+      { name: "alpha", kind: "function", line: 2 },
+      { name: "charge", kind: "method", line: 11, owner: "Billing" },
+      { name: "LIMITS", kind: "value", line: 15 },
+    ]);
+  });
+
+  it("callSiteContext: a method's call site counts only in a file that names its class", () => {
+    const changed = [{
+      path: "src/billing.ts",
+      content: ["export class Billing {", "  async charge(id) {", "    return id;", "  }", "}"].join("\n"),
+      patch: "@@ -1,4 +1,5 @@\n export class Billing {\n   async charge(id) {\n+    return id;\n   }\n }",
+    }];
+    const corpus = [
+      { path: "src/api.ts", content: ["import { Billing } from './billing';", "export async function pay(b: Billing) {", "  await b.charge('1');", "}"].join("\n") },
+      { path: "src/card.ts", content: ["export function swipe(card) {", "  return card.charge(2);", "}"].join("\n") },
+    ];
+    const out = callSiteContext(changed, corpus, 5_000);
+    assert.match(out, /--- src\/api\.ts \(L1-L4\) uses Billing\.charge \(src\/billing\.ts:2\)\n[\s\S]*3\| {3}await b\.charge\('1'\);/);
+    assert.doesNotMatch(out, /src\/card\.ts/, "an unrelated .charge( is not a call site");
+    assert.equal(callSiteContext(changed, corpus, 0), "");
+  });
+
+  it("callSiteContext: production callers of every symbol come before any test caller", () => {
+    const fn = (name: string) => ({
+      path: `src/${name}.ts`,
+      content: [`export function ${name}() {`, "  return 1;", "}"].join("\n"),
+      patch: `@@ -1,2 +1,3 @@\n export function ${name}() {\n+  return 1;\n }`,
+    });
+    const corpus = [
+      { path: "tests/first.test.ts", content: "import { first } from '../src/first';\nfirst();", secondary: true },
+      { path: "src/app.ts", content: "import { second } from './second';\nexport const v = second();" },
+    ];
+    const out = callSiteContext([fn("first"), fn("second")], corpus, 5_000);
+    assert.ok(out.indexOf("src/app.ts") >= 0 && out.indexOf("src/app.ts") < out.indexOf("tests/first.test.ts"), out);
+    const tight = callSiteContext([fn("first"), fn("second")], corpus, 200); // room for one block only
+    assert.match(tight, /src\/app\.ts/);
+    assert.doesNotMatch(tight, /tests\/first/, "a tight budget goes to the production caller");
+  });
 });

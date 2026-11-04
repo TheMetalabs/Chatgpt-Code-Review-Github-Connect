@@ -193,7 +193,10 @@ const SYSTEM = [
   "You are Ashlar, an automated code reviewer called through an API. When you are done, reply with the raw review JSON object only — no markdown fences, no prose. Ignore any mention of a browser mode in the instructions below; use the API output rule.",
   "You have tools: file_read reads ANY file at the PR head — not only the changed files, but also an unchanged module that defines an imported helper, entity, or enum. file_read_diff shows other changed files' diffs; code_search scans what you have read. Use them to CONFIRM every suspected defect before reporting; do not guess about code you have not read.",
   "When a finding depends on how an imported symbol behaves — e.g. whether an expiry/boundary is inclusive, what unit a value carries, or what a helper returns — resolve its import path and file_read its definition before you report OR dismiss the finding. Do not assume a convention; verify it against the definition.",
-  "If a file genuinely cannot be fetched (file_read returns NOT_IN_SNAPSHOT), that is not itself a defect: report the suspected defect anyway and name the unverified dependency in evidence so a downstream agent confirms it.",
+  // 2026-11: grouped-loop findings that said "unverified" / "not in the reviewed group" were false
+  // positives; the code they guessed about was one file_read away. Unproven is not reportable.
+  "If a file genuinely cannot be fetched (file_read returns NOT_IN_SNAPSHOT), its absence is not a defect, and a defect that depends on it is unproven: do not report it — list it in assumptions.",
+  "The other changed files of this PR are part of the same change and readable with file_read and file_read_diff: never report something as unverified or as \"not in the reviewed group\" — read it, or leave it out.",
 ].join("\n");
 
 const FORCE_FINAL_MSG =
@@ -220,13 +223,15 @@ async function reviewGroup(
 ): Promise<GroupReview> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
+  // The PR description comes from sub.body (the whole snapshot body, bounded in buildChatParts); changed
+  // docs and call sites are read across the whole PR, so a group sees the doc a sibling group's file edits.
   const built = buildChatParts({
     sample: sub,
     extra: deps.extra ?? "",
-    untrustedBody: sample.body ?? "",
     contextMaxChars: Math.min(settings.promptContextMaxChars, t.groupContextMaxChars),
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
+    prChangedPaths: sample.changedPaths,
   });
   const attachments = built.files;
   // buildChatParts embeds REVIEW_OFFLINE_RULE, which forbids tool use ("do not call tools, open extra
@@ -243,7 +248,7 @@ async function reviewGroup(
   const userParts = [
     instructions,
     attachText,
-    `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files (read with file_read_diff if a cross-file contract matters): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`,
+    `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files of this PR (the same change; read them with file_read_diff or file_read before any claim about them): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`,
     "When finished, call task_done and return the final review JSON object only.",
   ];
 
@@ -255,6 +260,7 @@ async function reviewGroup(
     ...sample.files.map((f) => [f.path, f.content] as const),
     ...(sample.referenceFiles ?? []).map((f) => [f.path, f.content] as const),
   ]);
+  // (A changed policy doc is in `files` at HEAD too; its BASE text, the policy, is basePolicyFiles.)
   const patches = patchesByPath(sample.diff);
   async function readAtHead(path: string): Promise<string | null> {
     if (cache.has(path)) return cache.get(path) as string;
@@ -265,7 +271,7 @@ async function reviewGroup(
   async function runTool(name: string, a: Record<string, unknown>): Promise<string> {
     if (name === "file_read") {
       const text = await readAtHead(String(a.file_path || ""));
-      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} could not be fetched (check the repo-relative path, or it may exceed the size/fetch limit). Cite it as an unverified dependency in evidence; its absence is not itself a defect.`;
+      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} could not be fetched (check the repo-relative path, or it may exceed the size/fetch limit). Its absence is not itself a defect, and a defect that depends on it is unproven: list it in assumptions, not findings.`;
       const lines = text.split("\n");
       const s = Math.max(1, Number(a.start_line) || 1);
       const e = Math.min(lines.length, Number(a.end_line) || lines.length, s + 399);

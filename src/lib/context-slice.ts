@@ -497,3 +497,150 @@ export function crossFileDefs(
   }
   return blocks.join("\n\n");
 }
+
+/** RIGHT-side (head) line numbers of the lines one file's patch adds. */
+export function addedLineNumbers(patch: string): number[] {
+  const out: number[] = [];
+  let n = 0;
+  let inHunk = false;
+  for (const line of String(patch || "").split("\n")) {
+    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (h) {
+      n = Number(h[1]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue; // file headers ("+++ b/x") precede the first hunk
+    if (line.startsWith("+")) out.push(n++);
+    else if (line.startsWith("-") || line.startsWith("\\")) continue;
+    else n += 1;
+  }
+  return out;
+}
+
+export type ChangedSymbol = { name: string; kind: "function" | "value" | "class" | "method"; line: number; owner?: string };
+
+const EXPORT_FN = /^export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/;
+const EXPORT_VAR = /^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/;
+const EXPORT_CLASS = /^export\s+(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/;
+
+/**
+ * Exported functions, values, classes and class methods whose body a patch changes (an added line inside
+ * them, found by indentation like enclosingRange). A change inside a non-exported top-level declaration
+ * yields nothing: its callers are in the same file, which the snapshot already shows.
+ */
+export function changedExportedSymbols(content: string, patch: string): ChangedSymbol[] {
+  const lines = String(content ?? "").split("\n");
+  const out = new Map<string, ChangedSymbol>();
+  for (const added of addedLineNumbers(patch)) {
+    let member: { name: string; line: number } | null = null;
+    for (let i = Math.min(added, lines.length); i >= 1; i -= 1) {
+      const l = lines[i - 1] ?? "";
+      if (!member) {
+        const cm = CLASS_MEMBER.exec(l);
+        if (cm && !KEYWORDS.has(cm[1])) {
+          member = { name: cm[1], line: i };
+          continue;
+        }
+      }
+      if (!l || /^\s/.test(l)) continue; // indented body line or blank: keep scanning up
+      if (/^(?:\/\/|\/\*|\*)/.test(l)) continue; // column-0 comment (JSDoc above a declaration)
+      const cls = EXPORT_CLASS.exec(l);
+      if (cls) {
+        const sym: ChangedSymbol = member && member.name !== "constructor"
+          ? { name: member.name, kind: "method", line: member.line, owner: cls[1] }
+          : { name: cls[1], kind: "class", line: i };
+        if (!out.has(sym.name)) out.set(sym.name, sym);
+        break;
+      }
+      // Not a class: a "member" met on the way up was a 2-space statement (`  helper(x);`) or an
+      // object-literal method inside this top-level declaration, which is what changed.
+      const fn = EXPORT_FN.exec(l) ?? EXPORT_VAR.exec(l);
+      if (fn && !out.has(fn[1])) out.set(fn[1], { name: fn[1], kind: EXPORT_FN.test(l) ? "function" : "value", line: i });
+      break; // the first column-0 code line upward is the enclosing top-level statement
+    }
+  }
+  return [...out.values()].filter((s) => s.name.length >= 3 && !IGNORE_1HOP.has(s.name));
+}
+
+/** Whether `content` imports `name` (ESM import clause, possibly multi-line, or a CJS destructure). */
+function importsName(content: string, name: string): boolean {
+  const word = new RegExp(`(?<![\\w$])${escapeRe(name)}(?![\\w$])`);
+  for (const m of String(content || "").matchAll(/\bimport\s+(?:type\s+)?([^;]*?)\s+from\s+['"][^'"\n]+['"]/g)) {
+    if (word.test(m[1])) return true;
+  }
+  for (const m of String(content || "").matchAll(/\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(/g)) {
+    if (word.test(m[1])) return true;
+  }
+  return false;
+}
+
+const NON_CODE_LINE = /^\s*(?:\/\/|\/\*|\*|import\b|export\s*\{|export\s+\*\s+from\b)|\brequire\s*\(/;
+
+/**
+ * Call-site context for the one-shot reviewer: for each exported function / method / class the diff
+ * changes, up to `maxSitesPerSymbol` places in OTHER snapshot files that use it, each with a few lines
+ * of head context and line-number gutters. WHY: a reviewer that sees only the changed function guesses
+ * how callers use it ("if the caller does not handle X…"); the call sites settle it from the code.
+ * In memory only (no fetch): `corpus` is the head text the snapshot already holds (changed files and
+ * imported reference modules). A function or class counts as used only in a file that imports its name;
+ * a method only in a file that names its class — so a same-named local symbol is not mistaken for it.
+ */
+export function callSiteContext(
+  changed: { path: string; content: string; patch: string }[],
+  corpus: { path: string; content: string; secondary?: boolean }[],
+  maxChars: number,
+  opts: { maxSymbols?: number; maxSitesPerSymbol?: number; contextLines?: number } = {},
+): string {
+  if (maxChars <= 0 || !changed.length || !corpus.length) return "";
+  const maxSymbols = opts.maxSymbols ?? 12;
+  const perSymbol = opts.maxSitesPerSymbol ?? 3;
+  const pad = opts.contextLines ?? 2;
+  const files = corpus.map((f) => ({ path: f.path, content: String(f.content ?? ""), lines: String(f.content ?? "").split("\n"), secondary: Boolean(f.secondary) }));
+  const emitted = new Map<string, SliceRange[]>(); // path -> ranges already shown
+  const blocks: string[] = [];
+  let remaining = maxChars;
+  const symbols = changed
+    .flatMap((c) => changedExportedSymbols(c.content, c.patch).map((s) => ({ ...s, path: c.path, sites: 0 })))
+    .slice(0, maxSymbols);
+  // Two passes: every symbol's primary (production) call sites first, then `secondary` files (tests),
+  // so a symbol only tests call never spends the budget a later symbol's real caller needs.
+  for (const secondary of [false, true]) for (const sym of symbols) {
+    if (remaining <= 0) break;
+    const use =
+      sym.kind === "method"
+        ? new RegExp(`\\.${escapeRe(sym.name)}\\s*\\(`)
+        : new RegExp(`(?<![\\w$.'"\`])${escapeRe(sym.name)}(?![\\w$'"\`])`);
+    let sites = sym.sites;
+    for (const f of files) {
+      if (sites >= perSymbol || remaining <= 0) break;
+      if (f.secondary !== secondary) continue;
+      if (f.path === sym.path) continue; // same-file uses are in the changed file's own snapshot
+      const related = sym.kind === "method"
+        ? new RegExp(`(?<![\\w$])${escapeRe(sym.owner ?? "")}(?![\\w$])`).test(f.content)
+        : importsName(f.content, sym.name);
+      if (!related) continue;
+      for (let i = 1; i <= f.lines.length && sites < perSymbol && remaining > 0; i += 1) {
+        const l = f.lines[i - 1] ?? "";
+        if (l.length > 2000 || NON_CODE_LINE.test(l) || !use.test(l)) continue;
+        const shown = emitted.get(f.path) ?? [];
+        if (shown.some((r) => i >= r.start && i <= r.end)) continue;
+        const range = { start: Math.max(1, i - pad), end: Math.min(f.lines.length, i + pad), reason: "call-site" };
+        const body: string[] = [];
+        for (let n = range.start; n <= range.end; n += 1) body.push(`${n}| ${f.lines[n - 1] ?? ""}`);
+        const label = sym.kind === "method" ? `${sym.owner}.${sym.name}` : sym.name;
+        const text = `--- ${f.path} (L${range.start}-L${range.end}) uses ${label} (${sym.path}:${sym.line})\n${body.join("\n")}`;
+        if (text.length + 2 > remaining) {
+          remaining = 0;
+          break;
+        }
+        blocks.push(text);
+        remaining -= text.length + 2;
+        emitted.set(f.path, [...shown, range]);
+        sites += 1;
+      }
+    }
+    sym.sites = sites;
+  }
+  return blocks.join("\n\n");
+}

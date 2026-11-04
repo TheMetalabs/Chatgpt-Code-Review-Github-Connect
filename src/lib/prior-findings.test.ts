@@ -91,13 +91,21 @@ describe("prior-findings: parse what review-format posts", () => {
 });
 
 describe("prior-findings: duplicates", () => {
-  it("same file and normalised title, or same evidence quote, is a duplicate; lines are ignored", () => {
+  it("same file and near-identical title, or the same quote with a corroborating claim, is a duplicate; lines are ignored", () => {
     const prior = [{ file: finding().file, title: finding().title, evidence: finding().evidence, commitId: OLD }];
     assert.equal(isPriorDuplicate(finding({ line: 99 }), prior), true);
     assert.equal(isPriorDuplicate({ ...finding(), title: "  discount APPLIED twice — when the `coupon` is re-sent " }, prior), true);
-    assert.equal(isPriorDuplicate({ ...finding(), title: "Coupon replays reduce the total again" }, prior), true, "same evidence quote");
+    assert.equal(isPriorDuplicate({ ...finding(), title: "Re-sent coupon discounts the total twice" }, prior), true, "same quote, same claim reworded");
     assert.equal(isPriorDuplicate({ ...finding(), title: "Other", evidence: "src/cart/total.ts:30 `return total;`" }, prior), false);
     assert.equal(isPriorDuplicate({ ...finding(), file: "src/cart/other.ts" }, prior), false, "another file is another finding");
+  });
+
+  it("a different defect quoting the same statement is not a duplicate (the gate's predicate)", () => {
+    // Two independent defects in one statement: the prior one is about replays, the new one about
+    // currency. The quote alone never ties them.
+    const prior = [{ file: finding().file, title: finding().title, evidence: finding().evidence, commitId: OLD }];
+    const other = finding({ title: "Coupon amount in cents is subtracted from a total in won", evidence: finding().evidence });
+    assert.equal(isPriorDuplicate(other, prior), false);
   });
 
   it("same-head repost needs a prior review on that exact head and every finding repeated there", () => {
@@ -113,6 +121,15 @@ describe("prior-findings: duplicates", () => {
     assert.equal(sameHeadRepost([finding(), second], prior, HEAD), false, "second was posted on another head only");
     assert.equal(sameHeadRepost([finding()], { ...prior, reviewedHeads: [OLD] }, HEAD), false, "no review on this head");
     assert.equal(sameHeadRepost([], prior, HEAD), false, "an empty list is not a repost");
+  });
+
+  it("same head: a new defect that quotes the statement an earlier independent defect quoted is not a repost", () => {
+    // noNewFindingsSince would otherwise skip the whole review and hide the new defect.
+    const prior = { reviewedHeads: [HEAD], findings: [{ file: finding().file, title: finding().title, evidence: finding().evidence, commitId: HEAD }] };
+    const other = finding({ id: "f9", title: "Coupon amount in cents is subtracted from a total in won", evidence: finding().evidence });
+    assert.equal(sameHeadRepost([other], prior, HEAD), false);
+    assert.equal(sameHeadRepost([finding(), other], prior, HEAD), false);
+    assert.equal(sameHeadRepost([finding()], prior, HEAD), true, "the repeated finding alone is still a repost");
   });
 
   it("sha comparison accepts abbreviations of at least 7 chars only", () => {

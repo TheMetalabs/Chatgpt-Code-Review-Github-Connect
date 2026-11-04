@@ -5,8 +5,10 @@
 // its review bodies (review-format unanchoredBlock) — so the finding gate can drop re-posts
 // (GateContext.priorFindings) and the poster can skip a review that adds nothing on a head it
 // already reviewed. Pure: the GitHub listing is the caller's (harbor loadPriorFindings), and every
-// parse is fail-soft (an unrecognised comment is simply not a prior finding).
+// parse is fail-soft (an unrecognised comment is simply not a prior finding). What counts as a repeat
+// is the gate's own predicate (finding-gate findPriorDuplicate), never a looser one.
 
+import { extractEvidenceQuotes, findPriorDuplicate } from "./finding-gate.ts";
 import type { BotSettings, PriorFinding } from "./types.ts";
 
 /** A review comment row as github.server listReviewComments returns it (the fields read here). */
@@ -159,34 +161,15 @@ export function collectPriorFindings(input: { comments: readonly PriorCommentRow
   return { findings, reviewedHeads };
 }
 
-/** Text normalised for comparison: case, markdown/code punctuation and whitespace runs ignored. */
-export function normalizeFindingText(s: string | undefined): string {
-  return String(s ?? "")
-    .toLowerCase()
-    .replace(/[`*_~"'“”‘’]/g, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-/** Evidence compared by its leading quote: renderers cut long evidence differently. */
-const EVIDENCE_PREFIX = 120;
-const MIN_EVIDENCE_MATCH = 24;
-
 /**
- * A finding repeats a prior one: the same file and either the same normalised title, or the same
- * (substantial) evidence quote. Line numbers are ignored — they shift between heads.
+ * A finding repeats a prior one — the finding gate's own duplicate predicate (finding-gate
+ * findPriorDuplicate), so the same-head repost check and the gate's dedupe never disagree: the same file
+ * and a near-identical title, or shared quoted code together with a corroborating claim (similar title,
+ * or two shared title words). Shared evidence alone is not a repeat: two independent defects can quote
+ * one statement (an injection and a missing tenant filter on the same DELETE).
  */
-export function isPriorDuplicate(f: { file: string; title: string; evidence?: string }, prior: readonly PriorFinding[]): boolean {
-  const title = normalizeFindingText(f.title);
-  const evidence = normalizeFindingText(f.evidence).slice(0, EVIDENCE_PREFIX);
-  return prior.some((p) => {
-    if (p.file !== f.file) return false;
-    if (title && normalizeFindingText(p.title) === title) return true;
-    const pe = normalizeFindingText(p.evidence).slice(0, EVIDENCE_PREFIX);
-    if (evidence.length < MIN_EVIDENCE_MATCH || pe.length < MIN_EVIDENCE_MATCH) return false;
-    const n = Math.min(evidence.length, pe.length);
-    return evidence.slice(0, n) === pe.slice(0, n);
-  });
+export function isPriorDuplicate(f: { file: string; title: string; evidence?: string; line?: number }, prior: readonly PriorFinding[]): boolean {
+  return findPriorDuplicate(f, { priorFindings: [...prior] }, extractEvidenceQuotes(f.evidence ?? "")) !== undefined;
 }
 
 /** The prior findings posted on exactly this head. */
@@ -200,7 +183,7 @@ export function priorOnHead(prior: readonly PriorFinding[], headSha: string): Pr
  * duplicates" here (whether an empty review posts is the poster's own rule).
  */
 export function sameHeadRepost(
-  findings: readonly { file: string; title: string; evidence?: string }[],
+  findings: readonly { file: string; title: string; evidence?: string; line?: number }[],
   prior: Pick<PriorFindingsResult, "findings" | "reviewedHeads">,
   headSha: string,
 ): boolean {

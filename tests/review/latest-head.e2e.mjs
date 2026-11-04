@@ -197,6 +197,20 @@ test('same head with a new finding posts; a prior review on another head does no
   assert.equal(job(moved, again.jobId).status, 'posted', 'the same-head rule only covers the head the bot already reviewed');
 });
 
+test('same head: a new defect quoting the statement an earlier independent defect quoted still posts', async (t) => {
+  // The repost check uses the gate's duplicate predicate: shared evidence without a corroborating claim
+  // is a new finding, so the review is not skipped as "no new findings".
+  const app = await appFixture({reviewLocal: false}, priorOn('abc123'));
+  t.after(() => app.close());
+  const out = await app.mention('same-head-shared-quote');
+  await ready(app, out);
+  const sameQuote = {...finding, title: 'Exported constant breaks tree-shaking of the config bundle', root_cause: 'Bundlers keep the module for its side-effect-free export.'};
+  await submit(app, out.jobId, reply(sameQuote));
+  await ended(app, out.jobId);
+  assert.equal(job(app, out.jobId).status, 'posted', job(app, out.jobId).skipReason);
+  assert.equal(app.reviews.length, 1);
+});
+
 test('a loop-driven review keeps its same-head verdict (the loop needs one)', async (t) => {
   const app = await appFixture({reviewLocal: false}, priorOn('abc123'));
   t.after(() => app.close());

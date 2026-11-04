@@ -801,7 +801,7 @@ function sharedCount(a: Set<string>, b: Set<string>): number {
   return n;
 }
 
-export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFindings">, verifiedQuotes: string[] = []): PriorFinding | undefined {
+export function findPriorDuplicate(f: Pick<Finding, "file" | "title"> & { line?: number }, ctx: Pick<GateContext, "priorFindings">, verifiedQuotes: string[] = []): PriorFinding | undefined {
   const title = tokens(f.title);
   // The same quoted code (loose-normalized): equal or one containing the other, and the shorter a
   // substantial line — a short common line such as `return { ok: true };` never ties two findings.

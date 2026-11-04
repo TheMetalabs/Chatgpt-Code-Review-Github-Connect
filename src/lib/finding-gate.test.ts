@@ -563,6 +563,16 @@ describe("finding gate: D dedupe against prior findings", () => {
     assert.equal(one(f, ctx({ priorFindings: otherClaim })).action, "keep", "a different claim about the same line is new");
   });
 
+  it("does not tie two findings by a similar title alone", () => {
+    // Jaccard 0.6: the same failure in another function is another finding.
+    const prior = [{ file: "src/orders/submit.ts", title: "Unhandled promise rejection in submitOrder", commitId: "0000000bbbbbbb" }];
+    const f = mk({ title: "Unhandled promise rejection in readTotal" });
+    assert.equal(one(f, ctx({ priorFindings: prior })).action, "keep");
+    // …but it is a repeat on the same posted line, or quoting the same code.
+    assert.equal(one(f, ctx({ priorFindings: [{ ...prior[0], line: f.line }] })).reasons[0], "already_reported");
+    assert.equal(one(f, ctx({ priorFindings: [{ ...prior[0], evidence: "`items: cart.items });`" }] })).reasons[0], "already_reported");
+  });
+
   it("keeps a different file or a different claim, and everything when dedupe is off", () => {
     const prior = [{ file: "src/orders/submit.ts", title: "Order total saved before the stock check" }];
     assert.equal(findPriorDuplicate(mk({ file: "src/orders/other.ts" }), { priorFindings: prior }), undefined);

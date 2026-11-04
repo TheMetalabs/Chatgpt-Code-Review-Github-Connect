@@ -783,10 +783,13 @@ function noteCategory(f: Finding, provenOnChanged: boolean): GateNoteCategory | 
 
 // ── D dedupe against the bot's earlier findings ───────────────────────────────────────────────────
 
-/** The prior finding this one repeats: same file and a near-identical title (token Jaccard ≥ 0.6), the
- * same verified evidence quote (a substantial one), or — at the same posted line — any verified quote
- * shared with a title on the same subject (two or more shared title words). Every prior counts: one on an older head (re-posting a finding on
- * every push is noise) and one already posted on this head (a second review of the same head). */
+/** The prior finding this one repeats, in the same file: a near-identical title (token Jaccard >= 0.8);
+ * a similar title (>= 0.6) on the same posted line or quoting the same verified code; the same
+ * substantial verified quote; or — at the same posted line — any verified quote shared with a title on
+ * the same subject (two or more shared title words). A similar title alone is not enough: "Unhandled
+ * rejection in refund" and "Unhandled rejection in load" are two findings. Every prior counts: one on
+ * an older head (re-posting a finding on every push is noise) and one already posted on this head (a
+ * second review of the same head). */
 function sharedCount(a: Set<string>, b: Set<string>): number {
   let n = 0;
   for (const t of a) if (b.has(t)) n += 1;
@@ -799,18 +802,23 @@ export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFind
   // substantial line — a short common line such as `return { ok: true };` never ties two findings.
   const same = (a: string, b: string) => Math.min(a.length, b.length) >= 24 && (a === b || a.includes(b) || b.includes(a));
   const mine = verifiedQuotes.filter((q) => q.length >= MIN_QUOTE).map(loose);
+  const contains = (a: string, b: string) => a === b || a.includes(b) || b.includes(a);
   for (const p of ctx.priorFindings ?? []) {
     if (!p || p.file !== f.file) continue;
-    if (jaccard(title, tokens(p.title)) >= 0.6) return p;
+    const j = jaccard(title, tokens(p.title));
+    if (j >= 0.8) return p;
+    const sameLine = Boolean(p.line && p.line === f.line);
+    if (j >= 0.6 && sameLine) return p;
     if (mine.length && p.evidence) {
       const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
       if (mine.some((q) => theirs.some((t) => same(q, t)))) return p;
+      // A similar title quoting the same code (any length: the title already ties the subject).
+      if (j >= 0.6 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
       // The same anchor and subject: posted on the same line of the same file, quoting the same code,
       // and the titles share at least two content words. A short line (`id: string;`) ties two
       // findings only together with the line it was posted on; a different claim about the same line
       // (few shared title words) is new.
-      const contains = (a: string, b: string) => a === b || a.includes(b) || b.includes(a);
-      if (p.line && p.line === f.line && sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
+      if (sameLine && sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
     }
   }
   return undefined;

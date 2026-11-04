@@ -13,6 +13,9 @@
  * - R2 self-retraction reads the claim only (title, failure scenario, root cause) plus a fix that is a
  *   no-op as a whole ("No change needed."); a verdict followed by a contrast ("X is safe. But Y") clears
  *   another path, not the finding.
+ * - R5 own-reply contradiction: only an investigated_safe note that states design intent (by design /
+ *   intended / documented as) for a clause matching the title (Jaccard >= 0.6), and never for a
+ *   finding with a verified quote on a changed line.
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
  *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path. A note-category
  *   finding (C1) that fails R3 is routed to notes, not dropped: a note asserts no defect to prove.
@@ -645,7 +648,12 @@ function diffContradiction(f: Finding, idx: GateIndex): string | undefined {
 
 // ── R5 own-reply contradiction ────────────────────────────────────────────────────────────────────
 
-const INTENT = /\b(?:by design|intended|intentional(?:ly)?|deliberate(?:ly)?|expected|as designed|documented|documents|documenting|retr(?:y|ies|ied)|idempotent|safe|guarded|handled)\b|의도|정상|문서화|설계|안전|재시도|멱등/i;
+/** An explicit design-intent statement. Words that only say the code is fine ("safe", "handled",
+ * "guarded", "retries", "expected", "idempotent") are not intent: a reviewer writes them about the
+ * path it cleared, which may be next to — not the same as — the defect a finding reports. */
+const INTENT = /\b(?:by design|as designed|intended|intentional(?:ly)?|deliberate(?:ly)?|on purpose|documented (?:as|in))\b|의도된|의도적|의도한|설계상/i;
+/** Minimum token Jaccard between the finding's title and one clause of the intent note. */
+const INTENT_TITLE_JACCARD = 0.6;
 
 function refersTo(entry: { text: string; path?: string }, f: Finding): boolean {
   if (entry.path && entry.path === f.file) return true;
@@ -659,19 +667,24 @@ function refersTo(entry: { text: string; path?: string }, f: Finding): boolean {
   return false;
 }
 
-function ownReplyContradiction(f: Finding, ctx: GateContext): string | undefined {
-  const entries: { text: string; path?: string; label: string }[] = [
-    ...(ctx.coverage ?? []).filter((c) => c.status !== "not_cleared").map((c) => ({ text: String(c.reason ?? ""), path: c.path, label: `coverage ${c.path}` })),
-    ...(ctx.investigatedSafe ?? []).map((s) => ({ text: String(s ?? ""), label: "investigated_safe" })),
-  ];
+/** R5: the same reply's investigated_safe note states that the very behaviour the finding reports is
+ * intended. Coverage rows are not read: "cleared" there means the reviewer saw no defect in a file,
+ * not that a specific behaviour is by design. A finding proven by a verified quote on a changed line is
+ * never dropped here (a concrete finding outranks a note in the same reply). */
+function ownReplyContradiction(f: Finding, ctx: GateContext, provenOnChanged: boolean): string | undefined {
+  if (provenOnChanged) return undefined;
   const title = tokens(f.title);
   if (title.size < 2) return undefined;
-  for (const e of entries) {
-    if (!e.text.trim() || !INTENT.test(e.text) || !refersTo(e, f)) continue;
-    const words = tokens(e.text.replace(/(?:[\w@.-]+\/)+[\w@.-]+|[\w@-]+\.[A-Za-z]{1,6}\b/g, " "));
-    let shared = 0;
-    for (const t of title) if (words.has(t)) shared += 1;
-    if (shared >= 2 && shared / title.size >= 0.5) return e.label;
+  for (const raw of ctx.investigatedSafe ?? []) {
+    const text = String(raw ?? "");
+    const e = { text };
+    if (!text.trim() || !INTENT.test(text) || !refersTo(e, f)) continue;
+    // The clause that names the behaviour must be (nearly) the finding's own headline.
+    // (Paths and the intent marker itself are not part of the behaviour.)
+    const plain = text.replace(/(?:[\w@.-]+\/)+[\w@.-]+|[\w@-]+\.[A-Za-z]{1,6}\b/g, " ").replace(new RegExp(INTENT.source, "gi"), " ");
+    for (const clause of plain.split(/[;.\n]|\s[—–-]\s|:\s|,\s/)) {
+      if (jaccard(title, tokens(clause)) >= INTENT_TITLE_JACCARD) return "investigated_safe";
+    }
   }
   return undefined;
 }
@@ -836,7 +849,7 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (retraction) return drop("self_retracted", retraction.slice(0, 80));
   const contradicted = diffContradiction(f, idx);
   if (contradicted) return drop("contradicted_by_diff", `${contradicted} is changed in this PR`);
-  const ownReply = ownReplyContradiction(f, ctx);
+  const ownReply = ownReplyContradiction(f, ctx, ev.onChanged);
   if (ownReply) return drop("contradicted_by_own_reply", ownReply);
 
   const claim = claimText(f);

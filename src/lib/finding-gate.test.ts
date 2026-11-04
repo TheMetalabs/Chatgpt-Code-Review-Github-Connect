@@ -373,23 +373,41 @@ describe("finding gate: R4 diff-contradicted claims", () => {
 });
 
 describe("finding gate: R5 own-reply contradiction", () => {
-  it("drops a finding the same reply's coverage calls documented behaviour", () => {
-    const d = one(
-      mk({ title: "submitOrder throws on unverified user", rootCause: "The throw aborts the request instead of returning an error." }),
-      ctx({ coverage: [{ path: "src/orders/CLAUDE.md", status: "cleared", reason: "documents that submitOrder throws on an unverified user by design" }] }),
-    );
-    assert.equal(d.action, "drop");
-    assert.equal(d.reasons[0], "contradicted_by_own_reply");
+  const intent = (note: string) => ctx({ investigatedSafe: [note] });
+  const throwFinding = (p: Partial<Finding> = {}) =>
+    mk({ title: "submitOrder throws on an unverified user", rootCause: "The throw aborts the request instead of returning an error.", evidence: UNCHANGED_EV, ...p });
+
+  it("drops a finding the same reply's investigated_safe note calls intended behaviour", () => {
+    for (const note of [
+      "src/orders/CLAUDE.md documents that submitOrder throws on an unverified user by design",
+      "src/orders/submit.ts: submitOrder throws on an unverified user — intended, the caller shows the sign-in prompt",
+    ]) {
+      const d = one(throwFinding(), intent(note));
+      assert.equal(d.action, "drop", note);
+      assert.equal(d.reasons[0], "contradicted_by_own_reply", note);
+    }
   });
 
-  it("keeps a finding when the safe note is about different behaviour", () => {
-    const d = one(mk(), ctx({ investigatedSafe: ["src/orders/submit.ts: logging is safe, no user data beyond the id"] }));
-    assert.notEqual(d.reasons[0], "contradicted_by_own_reply");
-    const notCleared = one(
-      mk({ title: "submitOrder throws on unverified user" }),
-      ctx({ coverage: [{ path: "src/orders/CLAUDE.md", status: "not_cleared", reason: "documents that submitOrder throws on an unverified user by design" }] }),
-    );
-    assert.notEqual(notCleared.reasons[0], "contradicted_by_own_reply");
+  it("never drops a finding proven by a verified quote on a changed line", () => {
+    const d = one(throwFinding({ evidence: "src/orders/submit.ts:6 `if (!user.verified) throw new Error(\"unverified user\");`" }),
+      intent("src/orders/CLAUDE.md documents that submitOrder throws on an unverified user by design"));
+    assert.equal(d.action, "keep", JSON.stringify(d.reasons));
+  });
+
+  it("reads only explicit design intent about the same behaviour, never coverage rows or 'safe'/'handled' notes", () => {
+    const f = throwFinding();
+    for (const c of [
+      // Not intent: says the path is fine.
+      intent("src/orders/submit.ts: submitOrder throws on an unverified user; the error is handled and safe"),
+      intent("src/orders/submit.ts: unverified user throw is expected and guarded by the caller's retry"),
+      // Intent, but about other behaviour (the title is not the clause).
+      intent("src/orders/submit.ts: logging only the user id is intended"),
+      // A coverage row, even a cleared one that says "by design".
+      ctx({ coverage: [{ path: "src/orders/CLAUDE.md", status: "cleared", reason: "documents that submitOrder throws on an unverified user by design" }] }),
+    ]) {
+      const d = one(f, c);
+      assert.notEqual(d.reasons[0], "contradicted_by_own_reply", JSON.stringify(c.investigatedSafe ?? c.coverage));
+    }
   });
 });
 

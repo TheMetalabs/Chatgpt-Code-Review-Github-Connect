@@ -227,7 +227,8 @@
         "recommended_fix": "Log and return.",
         "recommended_test": "Failed mail does not throw."
       },
-      "expect": { "action": "drop", "reason": "contradicted_by_own_reply" }
+      "gap": "the coverage row is a cleared-file note, not a design-intent statement, and the finding quotes a changed line: R5 never drops a proven finding (left to the model refute pass)",
+      "expect": { "action": "keep", "severity": "P2" }
     },
     {
       "id": "design-intent-dark-launch",
@@ -244,6 +245,25 @@
         "evidence": "services/billing/flags.ts:1 `export const SPLIT_INVOICES = flag(\"split-invoices\", { default: false });`",
         "recommended_fix": "Default the flag on.",
         "recommended_test": "Split path runs with default flags."
+      },
+      "gap": "the finding quotes a changed line: R5 never drops a proven finding on the reply's own intent note (left to the model refute pass)",
+      "expect": { "action": "keep", "severity": "P1" }
+    },
+    {
+      "id": "design-intent-outbox-swallow",
+      "pattern": "design-intent",
+      "label": "fp",
+      "reply": {
+        "investigated_safe": ["services/notify/listener.ts: listener errors are swallowed by the outbox and retried later, by design (the module CLAUDE.md says so)."]
+      },
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 6,
+        "title": "Listener errors are swallowed by the outbox and retried later",
+        "failure_scenario": "A failed receipt mail never reaches the caller; the outbox retries it in the background.",
+        "root_cause": "outbox.dispatch catches the handler error and schedules a retry.",
+        "evidence": "services/outbox/queue.ts:6 `await this.retryLater(event);`",
+        "recommended_fix": "Rethrow after scheduling the retry.",
+        "recommended_test": "A failing handler surfaces its error."
       },
       "expect": { "action": "drop", "reason": "contradicted_by_own_reply" }
     },

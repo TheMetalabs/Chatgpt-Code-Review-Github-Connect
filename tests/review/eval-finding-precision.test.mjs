@@ -13,7 +13,7 @@ import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
-test('synthetic fixture: baseline posts every finding; default Settings remove >= 80% of false positives and lose no valid finding', () => {
+test('synthetic fixture: baseline posts every finding; default Settings remove >= 75% of false positives and lose no valid finding', () => {
   const {results, summary} = runEval([DEFAULT_FIXTURE]);
   const row = summary.find((r) => r.label === 'ourLabel' && r.subset === 'all');
   assert.ok(row, 'ourLabel/all row');
@@ -22,7 +22,10 @@ test('synthetic fixture: baseline posts every finding; default Settings remove >
   assert.ok(results.every((r) => r.before.action === 'keep'), 'off is the identity');
   assert.equal(row.validLost, 0, 'no valid finding is dropped or moved to notes');
   assert.equal(row.validDemoted, 0, 'no valid finding is demoted');
-  assert.ok(row.fpRemovalRate >= 0.8, `FP removal ${row.fpRemoved}/${row.fp}`);
+  // >= 75%: a false positive that quotes a changed line is never dropped on the reply's own intent note
+  // (R5), so the two design-intent cases on changed lines are documented gaps (finding-precision-eval
+  // asserts that only the documented gaps still post).
+  assert.ok(row.fpRemovalRate >= 0.75, `FP removal ${row.fpRemoved}/${row.fp}`);
   console.log(formatReport(results, {cases: false}));
 });
 

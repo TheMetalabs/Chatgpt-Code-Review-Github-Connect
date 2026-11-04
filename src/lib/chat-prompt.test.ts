@@ -15,6 +15,7 @@ import {
   REVIEW_INSTRUCTIONS,
   REVIEW_OFFLINE_RULE,
   buildChatParts,
+  descriptionExcerpt,
   buildChatPrompt,
   buildFpPrompt,
   buildMergePrompt,
@@ -749,3 +750,24 @@ describe("PR description block (every trigger)", () => {
   });
 });
 
+
+describe("descriptionExcerpt (local description)", () => {
+  it("keeps a description that fits as-is", () => {
+    assert.equal(descriptionExcerpt("short", 100), "short");
+  });
+
+  it("keeps the opening and the design-intent paragraphs, in order, with their headings", () => {
+    const text = ["Opening line.", `## Details\n${"filler ".repeat(80)}`, "## Rollout\nThe new path stays behind a default-off flag.", `${"more ".repeat(80)}`].join("\n\n");
+    const out = descriptionExcerpt(text, 300);
+    assert.ok(out.length <= 300, `${out.length}`);
+    assert.match(out, /^Opening line\.\n\n## Rollout\nThe new path stays behind a default-off flag\./);
+    assert.match(out, /\(description excerpt: opening and design-intent paragraphs\)$/);
+    assert.doesNotMatch(out, /filler/);
+  });
+
+  it("cuts an opening paragraph longer than the budget on a line boundary", () => {
+    const out = descriptionExcerpt(Array.from({ length: 40 }, (_, i) => `line ${i} of the summary`).join("\n"), 200);
+    assert.ok(out.length <= 200, `${out.length}`);
+    assert.match(out, /^line 0 of the summary\n/);
+  });
+});

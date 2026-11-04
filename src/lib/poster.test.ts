@@ -389,6 +389,113 @@ describe("gateLiveSubmission", () => {
   });
 });
 
+// The finding gate (finding-gate.ts) as gateLiveSubmission applies it: drops are recorded with their
+// reason, notes ride the result apart from findings, and findingGate "off" keeps the old contract.
+describe("gateLiveSubmission: finding gate", () => {
+  const row = (f: Finding) => ({
+    severity: f.severity,
+    file: f.file,
+    line: f.line,
+    title: f.title,
+    failure_scenario: f.failureScenario,
+    root_cause: f.rootCause,
+    evidence: f.evidence,
+    recommended_fix: f.recommendedFix,
+    recommended_test: f.recommendedTest,
+  });
+  const real = row(FINDING_412);
+  const speculative = row({
+    ...FINDING_412,
+    title: "Ledger capture is not transactional",
+    rootCause: "The ledger store is not in the snapshot, so whether capture() runs in a transaction is unverified.",
+  });
+  const style = row({
+    ...FINDING_412,
+    severity: "P1",
+    line: 8,
+    title: "Rename pi to paymentIntent",
+    failureScenario: "Readers mistake pi for a number.",
+    rootCause: "Naming: the short identifier hides the type.",
+    evidence: "src/payment/webhook.ts:8 `const pi = event.data.object as Stripe.PaymentIntent;`",
+  });
+  const submit = (findings: unknown[], settings = DEFAULT_SETTINGS, extras?: Parameters<typeof gateLiveSubmission>[3]) =>
+    gateLiveSubmission({ merge_recommendation: "REQUEST_CHANGES", findings, investigated_safe: ["ledger checked"] }, SAMPLE_PRS["pay-412"], settings, extras);
+
+  it("drops a speculative finding with its reason, routes a style finding to notes, keeps the real one", () => {
+    const gate = submit([real, speculative, style]);
+    assert.equal(gate.ok, true);
+    if (!gate.ok) return;
+    assert.deepEqual(gate.findings.map((f) => f.title), [FINDING_412.title]);
+    assert.equal(gate.findings[0].severity, "P1");
+    assert.deepEqual(gate.notes?.map((f) => [f.title, f.dropReason]), [["Rename pi to paymentIntent", "note:style"]]);
+    assert.ok(gate.dropped.some((d) => /^gate:speculative src\/payment\/webhook\.ts:10 \(Ledger capture is not transactional\)$/.test(d)), gate.dropped.join("\n"));
+    assert.equal(gate.mergeRecommendation, "REQUEST_CHANGES");
+    assert.deepEqual({ kept: gate.gateStats?.kept, notes: gate.gateStats?.notes, dropped: gate.gateStats?.dropped }, { kept: 1, notes: 1, dropped: 1 });
+  });
+
+  it("a note never makes REQUEST_CHANGES, even when the reviewer called it P1", () => {
+    const gate = submit([style]);
+    assert.ok(gate.ok);
+    if (!gate.ok) return;
+    assert.equal(gate.findings.length, 0);
+    assert.equal(gate.notes?.length, 1);
+    assert.equal(gate.mergeRecommendation, "COMMENT");
+  });
+
+  it("findingGate off keeps every finding on changed code (the pre-gate contract)", () => {
+    const gate = submit([real, speculative, style], { ...DEFAULT_SETTINGS, findingGate: "off" });
+    assert.ok(gate.ok);
+    if (!gate.ok) return;
+    assert.equal(gate.findings.length, 3);
+    assert.equal(gate.notes, undefined);
+    assert.equal(gate.gateStats, undefined);
+    assert.equal(gate.dropped.some((d) => d.startsWith("gate:")), false);
+  });
+
+  it("drops a finding already posted on an earlier head (priorFindings from the caller or the snapshot)", () => {
+    const prior = [{ file: FINDING_412.file, title: "Webhook can capture twice on a Stripe retry", commitId: "0000000" }];
+    const viaExtras = submit([real], DEFAULT_SETTINGS, { priorFindings: prior });
+    assert.ok(viaExtras.ok && viaExtras.findings.length === 0 && viaExtras.dropped.some((d) => d.startsWith("gate:already_reported ")));
+    const viaSnapshot = gateLiveSubmission({ findings: [real], investigated_safe: ["x"] }, { ...SAMPLE_PRS["pay-412"], priorFindings: prior }, DEFAULT_SETTINGS);
+    assert.ok(viaSnapshot.ok && viaSnapshot.findings.length === 0);
+    const off = submit([real], { ...DEFAULT_SETTINGS, findingDedupePrior: false }, { priorFindings: prior });
+    assert.ok(off.ok && off.findings.length === 1);
+  });
+
+  it("demotes a P1 without a closed path to P2 unless findingP1ClosedPath is off", () => {
+    const unchangedOnly = row({ ...FINDING_412, evidence: "src/ledger.ts:7 `captured.push(row);` appends every call" });
+    const on = submit([unchangedOnly]);
+    assert.ok(on.ok && on.findings[0].severity === "P2" && on.mergeRecommendation === "COMMENT");
+    const off = submit([unchangedOnly], { ...DEFAULT_SETTINGS, findingP1ClosedPath: false });
+    assert.ok(off.ok && off.findings[0].severity === "P1");
+  });
+
+  it("the schema merge carries notes (one per file+title) and sums gate counts", () => {
+    const a = submit([real, style]);
+    const b = submit([style]);
+    assert.ok(a.ok && b.ok);
+    if (!a.ok || !b.ok) return;
+    const merged = schemaMergeProviderGates([{ provider: "chatgpt", gate: a }, { provider: "grok", gate: b }], DEFAULT_SETTINGS);
+    assert.equal(merged.notes?.length, 1);
+    assert.equal(merged.gateStats?.notes, 2);
+    assert.equal(merged.gateStats?.kept, 1);
+  });
+
+  it("buildReview renders notes in the body only: no inline comment, not in the marker, not REQUEST_CHANGES", () => {
+    const gate = submit([style]);
+    assert.ok(gate.ok);
+    if (!gate.ok) return;
+    const j = job([], { notes: gate.notes, thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review" } });
+    const review = buildReview(j, [], [], DEFAULT_SETTINGS);
+    assert.ok(review);
+    assert.equal(review!.event, "COMMENT");
+    assert.equal(review!.comments.length, 0);
+    assert.match(review!.body, /Notes \(not findings\)/);
+    assert.match(review!.body, /Rename pi to paymentIntent/);
+    assert.match(review!.body, /<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->/);
+  });
+});
+
 describe("schemaMergeProviderGates", () => {
   it("schema-merges one-sided findings when LLM merge is unavailable", () => {
     const left = {

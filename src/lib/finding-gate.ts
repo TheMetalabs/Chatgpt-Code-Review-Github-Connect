@@ -122,12 +122,11 @@ function isAncestorDir(dir: string, file: string): boolean {
 
 const DOC_FILE = /\.(md|mdx|rst|adoc|txt)$/i;
 const isDocPath = (p: string) => DOC_FILE.test(p) || /(^|\/)docs?\//i.test(p);
-const TEST_FILE = /(^|\/)(__tests__|tests?|spec|e2e)\/|\.(test|spec|e2e)\.[cm]?[jt]sx?$/i;
 
 /** File-path-like tokens in free text (`a/b.ts`, `CLAUDE.md`, `a/b.ts:12`). */
 function pathTokens(text: string): string[] {
   const out = new Set<string>();
-  for (const m of String(text ?? "").matchAll(/(?:^|[\s(\[`'",;:|])((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?::L?\d+(?:-L?\d+)?)?(?=$|[\s)\]`'",;:|.])/g)) {
+  for (const m of String(text ?? "").matchAll(/(?:^|[\s([`'",;:|])((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?::L?\d+(?:-L?\d+)?)?(?=$|[\s)\]`'",;:|.])/g)) {
     const p = m[1].replace(/^\.\//, "");
     if (/^\d+(\.\d+)+$/.test(p)) continue; // version numbers
     out.add(p);
@@ -182,7 +181,7 @@ const MIN_QUOTE = 12;
 /** A quote must look like code (punctuation or spacing), or be long: a bare identifier is a mention. */
 const CODE_SHAPE = /[\s(){}[\];:=<>,?!"'`+\-*/&|]/;
 
-const LOCATOR = /(?:^|[\s(\[,;|])((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.[A-Za-z][A-Za-z0-9]{0,5}):L?(\d+)(?:\s*[-–]\s*L?(\d+))?[:,)\]]?/g;
+const LOCATOR = /(?:^|[\s([,;|])((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.[A-Za-z][A-Za-z0-9]{0,5}):L?(\d+)(?:\s*[-–]\s*L?(\d+))?[:,)\]]?/g;
 
 function cleanQuote(q: string): string {
   let s = norm(q);
@@ -201,8 +200,10 @@ function cleanQuote(q: string): string {
 export function extractEvidenceQuotes(evidence: string): string[] {
   const text = String(evidence ?? "");
   const out: string[] = [];
+  // An elision (`…`, or `...` not starting a spread like `...rows`) splits a quote into the pieces the
+  // reviewer actually copied; the whole quote is kept too.
   const push = (q: string) => {
-    for (const part of q.split(/\s*(?:\.\.\.|…)\s*/)) {
+    for (const part of [q, ...q.split(/\s*…\s*|\s*\.\.\.(?![\w$[{(])\s*/)]) {
       const c = cleanQuote(part);
       if (c.length >= 6) out.push(c);
     }
@@ -235,8 +236,18 @@ export function citedPaths(evidence: string): string[] {
   return [...new Set([...String(evidence ?? "").matchAll(LOCATOR)].map((m) => m[1]))];
 }
 
+/** Code as compared: whitespace collapsed, quote style unified, no spacing around punctuation, no
+ * trailing `;`/`,` — so a quote that re-spaces `f( a,b )` or swaps '' for "" still matches its line. */
+function loose(s: string): string {
+  return norm(s)
+    .replace(/['"`]/g, '"')
+    .replace(/\s*([(){}[\],;:=<>+*/!?&|.-])\s*/g, "$1")
+    .replace(/[;,]+$/, "");
+}
+
 type FileIndex = { path: string; lines: string[]; joined: string };
-type DiffIndex = { changed: Map<string, string[]>; changedAll: string[]; removedAll: string[]; rightAll: string[]; files: Set<string> };
+/** Hunk lines of the diff (`+`, `-` and context), loose-normalized; `files` = paths the diff touches. */
+type DiffIndex = { changedAll: string[]; files: Set<string> };
 
 export interface GateIndex {
   files: FileIndex[];
@@ -245,10 +256,7 @@ export interface GateIndex {
 }
 
 function parseDiff(diff: string): DiffIndex {
-  const changed = new Map<string, string[]>();
   const changedAll: string[] = [];
-  const removedAll: string[] = [];
-  const rightAll: string[] = [];
   const files = new Set<string>();
   let file = "";
   let inHunk = false;
@@ -283,16 +291,10 @@ function parseDiff(diff: string): DiffIndex {
     if (!inHunk || !file) continue;
     const marker = raw[0];
     if (marker !== "+" && marker !== "-" && marker !== " ") continue;
-    const content = norm(raw.slice(1));
-    if (!content) continue;
-    let arr = changed.get(file);
-    if (!arr) changed.set(file, (arr = []));
-    arr.push(content);
-    changedAll.push(content);
-    if (marker === "-") removedAll.push(content);
-    else rightAll.push(content);
+    const content = loose(raw.slice(1));
+    if (content) changedAll.push(content);
   }
-  return { changed, changedAll, removedAll, rightAll, files };
+  return { changedAll, files };
 }
 
 /** Build the lookup structures once per gate call (head content + diff). */
@@ -300,8 +302,8 @@ export function buildGateIndex(ctx: Pick<GateContext, "headFiles" | "diff" | "ch
   const files: FileIndex[] = [];
   for (const [path, content] of ctx.headFiles) {
     if (!content) continue;
-    const lines = String(content).split("\n").map(norm).filter(Boolean);
-    files.push({ path, lines, joined: lines.join(" ") });
+    const lines = String(content).split("\n").map(loose).filter(Boolean);
+    files.push({ path, lines, joined: loose(String(content).split("\n").join(" ")) });
   }
   return { files, diff: parseDiff(ctx.diff), changedPaths: new Set(ctx.changedPaths) };
 }
@@ -311,9 +313,10 @@ function quoteCheckable(q: string): boolean {
 }
 
 /** Where a quote occurs: in head content (any file) or the diff, and whether on a changed hunk line. */
-function locateQuote(q: string, idx: GateIndex): { verified: boolean; path?: string; changed: boolean } {
-  if (!quoteCheckable(q)) return { verified: false, changed: false };
-  const long = q.length >= MIN_QUOTE;
+function locateQuote(quote: string, idx: GateIndex): { verified: boolean; path?: string; changed: boolean } {
+  if (!quoteCheckable(quote)) return { verified: false, changed: false };
+  const q = loose(quote);
+  const long = quote.length >= MIN_QUOTE && q.length >= MIN_QUOTE - 2;
   const lineHit = (line: string) => (long && line.includes(q)) || line === q;
   const coversLine = (line: string) => long && line.length >= MIN_QUOTE && q.includes(line);
   let path: string | undefined;
@@ -339,8 +342,8 @@ export interface EvidenceCheck {
   noContent: boolean;
 }
 
-/** R3: verify a finding's quoted code against the head snapshot and the diff. Quotes from the claim
- * fields' `inline code` count as supporting quotes too (they are never the only place a model puts code). */
+/** R3: verify a finding's quoted code against the head snapshot and the diff. `inline code` in the root
+ * cause / failure scenario counts too: a model sometimes puts its quote there instead of in evidence. */
 export function verifyEvidence(f: Finding, idx: GateIndex): EvidenceCheck {
   const quotes = [
     ...extractEvidenceQuotes(f.evidence),
@@ -367,11 +370,17 @@ const CODE_ACTOR = "(?:client|server|browser|caller|user|code|function|handler|s
 const KO_SECURITY = "(?:토큰|서명|이메일|사용자|입력|요청|인증서|출처|세션|파일|코드)";
 
 const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: number, match: string) => boolean }[] = [
+  // Reviewer voice only: "the validator didn't check the length" describes the code and is a real claim.
   {
-    re: /\b(?:could not|couldn't|cannot|can't|can not|unable to|was unable to|were unable to|did not|didn't)\s+(?:be\s+)?(?:verif(?:y|ied)|confirm(?:ed)?|check(?:ed)?|inspect(?:ed)?|see|find|locate|determine)\b/gi,
+    re: /\b(?:i|we)\s+(?:could not|couldn't|cannot|can't|can not|was unable to|were unable to|am unable to|are unable to|did not|didn't|do not|don't)\s+(?:verify|confirm|check|see|inspect|find|locate|determine|tell)\b/gi,
+    label: "cannot verify",
+  },
+  {
+    re: /\b(?:could not|couldn't|cannot|can't|can not|unable to)\s+(?:be\s+)?(?:verif(?:y|ied)|confirm(?:ed)?)\b/gi,
     label: "cannot verify",
     guard: (text, at) => new RegExp(`\\b${CODE_ACTOR}\\s+(?:\\w+\\s+){0,1}$`, "i").test(text.slice(Math.max(0, at - 30), at)),
   },
+  { re: /\bnot\s+(?:shown|visible)\s+(?:here|in\s+(?:this|the)\s+(?:diff|snapshot|review|excerpt|context))\b/gi, label: "not visible here" },
   {
     re: /\bunverified\b/gi,
     label: "unverified",
@@ -392,7 +401,7 @@ const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: num
   { re: /\b(?:outside|beyond)\s+(?:the\s+|this\s+)?(?:reviewed group|review group|snapshot|provided (?:files|code|context))/gi, label: "outside the reviewed group" },
   { re: /\bpresumably\b/gi, label: "presumably" },
   { re: /\b(?:i|we)\s+(?:assume|cannot tell|can't tell|don't see|do not see|couldn't find|could not find)\b/gi, label: "reviewer assumption" },
-  { re: /\bwithout seeing\b/gi, label: "without seeing" },
+  { re: /\bwithout (?:seeing|access to|the source of)\b/gi, label: "without seeing" },
   { re: /미확인/g, label: "미확인" },
   {
     re: /확인되지\s*않/g,
@@ -444,16 +453,21 @@ function weakHedge(text: string): string | undefined {
 
 // ── R2 self-retraction ────────────────────────────────────────────────────────────────────────────
 
+/** The finding's own conclusion that there is no defect. Each phrase is the reviewer's verdict, never a
+ * description of the code ("the loop keeps re-reading the config", "the fraud check's false positives"). */
+const SAFE_WORD = "(?:safe|fine|correct|ok(?:ay)?|handled|guarded|covered|not an? (?:real )?(?:bug|issue|problem|defect)|no (?:bug|issue|problem|defect))";
 const RETRACTION = [
   /\bno (?:code )?changes? (?:is |are )?(?:needed|required|necessary)\b/i,
   /\bno (?:fix|action|change) (?:is )?(?:needed|required|necessary)\b/i,
-  /\b(?:this|that) (?:path|code|case|flow|branch|usage|call|code path) is (?:actually |therefore |thus |already )?(?:safe|fine|correct|ok(?:ay)?)\b/i,
+  /\b(?:this|that) (?:path|code|case|flow|branch|usage|call|code path) is (?:actually |therefore |thus |already )?(?:safe|fine|correct|ok(?:ay)?)(?=\s*(?:[.;!)—–]|$|,?\s*(?:so|and so|therefore|thus|no)\b))/im,
   /\bso the (?:path|code|case|flow) is (?:actually )?(?:safe|fine|correct)\b/i,
-  /\bnot (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/i,
+  /\b(?:so|therefore|thus|hence)\b[^.\n]{0,40}\bnot (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/i,
+  /(?:^|[.!?:]\s*)(?:this|it) is not (?:actually )?an? (?:real )?(?:bug|issue|problem|defect)\b/im,
   /\bno (?:bug|issue|problem|defect) here\b/i,
-  /\bfalse (?:alarm|positive)\b/i,
+  /\bfalse alarm\b/i,
+  /\b(?:this|it) (?:is|was|looks like) (?:a |likely a )?false positive\b/i,
   /\bon second thought\b/i,
-  /\bre-?reading\b/i,
+  new RegExp(`\\b(?:on |after |upon )?re-?reading (?:this|it|the (?:code|diff|guard|function|logic|line|lines|snippet|file|check|condition))\\b[^\\n]{0,120}?\\b${SAFE_WORD}`, "i"),
   /(?:^|[.!?]\s+)wait\s*[,—–-]/im,
   /\b(?:test|tests)\s*:\s*(?:n\/a|none(?: needed)?|not needed)\b/i,
   /\bfix\s*:\s*(?:n\/a|none|no change(?:s)?(?: needed)?)\b/i,
@@ -462,7 +476,7 @@ const RETRACTION = [
   /(?:수정|변경|조치)할\s*필요(?:가|는)?\s*없/,
   /버그가\s*아니/,
   /안전(?:합니다|하다|함)(?:[.。]|\s|$)/,
-  /오탐/,
+  /오탐(?:입니다|임|이다|으로\s*(?:보|판단))/,
 ];
 
 const NOOP_FIELD = /^(?:n\/?a|none|nothing|no changes?(?: needed| required)?|no fix(?: needed)?|not needed|none needed|-+|없음|불필요|해당 없음)\.?$/i;
@@ -575,7 +589,7 @@ function ownReplyContradiction(f: Finding, ctx: GateContext): string | undefined
 // ── C1 notes routing ──────────────────────────────────────────────────────────────────────────────
 
 /** A concrete runtime failure in the claim: such a finding is never routed to notes by wording alone. */
-const DEFECT_CUE = /\b(?:crash(?:es)?|throws?|exception|leaks?|race|deadlock|double[- ]?(?:charge|capture|post|submit|count|send)|twice|bypass(?:es)?|unauthori[sz]ed|injection|overflow|corrupt(?:s|ion)?|data loss|lost|never (?:terminates|resolves|runs|called|fires)|hangs?|infinite|null pointer|undefined is not|wrong (?:result|value|amount|user|account)|privilege|exposes?|leaked)\b|크래시|예외|누수|경쟁\s*상태|중복\s*(?:결제|처리|실행|발송)|우회|권한\s*상승|데이터\s*손실|무한/i;
+const DEFECT_CUE = /\b(?:crash(?:es)?|throws?|exception|TypeError|ReferenceError|leaks?|leaked|race|deadlock|double[- ]?(?:charge|capture|post|submit|count|send)|twice|bypass(?:es)?|unauthori[sz]ed|injection|xss|csrf|ssrf|vulnerab\w*|overflow|corrupt(?:s|ion)?|data loss|lost|collision|never (?:terminates?|resolves?|runs?|called|fires?|triggers?|sent|delivered)|hangs?|infinite|null pointer|undefined is not|wrong (?!name|naming|wording|words?|labels?|spelling|case|indentation|format)\w+|privilege|exposes?)\b|크래시|예외|누수|경쟁\s*상태|중복\s*(?:결제|처리|실행|발송)|우회|권한\s*상승|데이터\s*손실|무한/i;
 const SENSITIVE = /\b(?:passwords?|passwd|secrets?|api[- ]?keys?|tokens?|credentials?|private keys?|pii|personal data|ssn|card numbers?)\b|개인정보|비밀번호|토큰|민감/i;
 
 const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
@@ -655,13 +669,16 @@ function noteCategory(f: Finding): GateNoteCategory | undefined {
  * every push is noise) and one already posted on this head (a second review of the same head). */
 export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFindings">, verifiedQuotes: string[] = []): PriorFinding | undefined {
   const title = tokens(f.title);
-  const mine = verifiedQuotes.filter((q) => q.length >= MIN_QUOTE);
+  // The same quoted code (loose-normalized): equal or one containing the other, and the shorter a
+  // substantial line — a short common line such as `return { ok: true };` never ties two findings.
+  const same = (a: string, b: string) => Math.min(a.length, b.length) >= 24 && (a === b || a.includes(b) || b.includes(a));
+  const mine = verifiedQuotes.filter((q) => q.length >= MIN_QUOTE).map(loose);
   for (const p of ctx.priorFindings ?? []) {
     if (!p || p.file !== f.file) continue;
     if (jaccard(title, tokens(p.title)) >= 0.6) return p;
     if (mine.length && p.evidence) {
-      const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE);
-      if (mine.some((q) => theirs.some((t) => t === q || t.includes(q) || q.includes(t)))) return p;
+      const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
+      if (mine.some((q) => theirs.some((t) => same(q, t)))) return p;
     }
   }
   return undefined;

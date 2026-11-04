@@ -216,6 +216,11 @@ describe("finding gate: R3 evidence verification", () => {
     assert.equal(one(mk({ evidence: "the PR removed `await saveOrder({ userId: user.id, items: cart.items });`" })).action, "keep");
   });
 
+  it("keeps a spread (`...rows`) intact while splitting on a reviewer's elision", () => {
+    assert.ok(extractEvidenceQuotes("`out.push(...rows);`").includes("out.push(...rows)"));
+    assert.ok(extractEvidenceQuotes("`await saveOrder({ userId: user.id, ... })`").includes("await saveOrder({ userId: user.id"));
+  });
+
   it("extracts locator, backtick, quoted and fenced quotes", () => {
     assert.deepEqual(extractEvidenceQuotes("a.ts:3 `const x = f(a);` | b.ts:9-10 return y ? z : [];"), ["const x = f(a)", "return y ? z : []"]);
     assert.ok(extractEvidenceQuotes("```ts\nconst a = b(c);\n```").includes("const a = b(c)"));
@@ -351,6 +356,40 @@ describe("finding gate: D dedupe against prior findings", () => {
     assert.equal(findPriorDuplicate(mk({ file: "src/orders/other.ts" }), { priorFindings: prior }), undefined);
     assert.equal(findPriorDuplicate(mk({ title: "Unverified users can still save drafts" }), { priorFindings: prior }), undefined);
     assert.equal(one(mk(), ctx({ priorFindings: prior }), { ...ON, dedupePrior: false }).action, "keep");
+  });
+});
+
+// Recall guards: wording that describes the CODE must never read as the reviewer hedging, retracting,
+// or nitpicking.
+describe("finding gate: recall guards", () => {
+  it("keeps code-voice phrasing that resembles an admission or a retraction", () => {
+    for (const rootCause of [
+      "The validator didn't check the length, so an empty cart reaches saveOrder.",
+      "When the cache did not find the key, the handler saves a zero total.",
+      "The retry loop keeps re-reading the cart on every attempt and saves twice.",
+      "The duplicate detector reports a false positive for carts with one item, so the order is rejected.",
+      "The sync path is safe, but the retry path saves the order a second time.",
+      "This path is safe for cash orders but card orders skip the stock check.",
+    ]) {
+      const d = one(mk({ rootCause }));
+      assert.equal(d.action, "keep", `${rootCause} -> ${d.reasons.join("; ")}`);
+    }
+  });
+
+  it("keeps a defect whose title happens to use a style word", () => {
+    const d = one(mk({ title: "Naming collision routes orders to the wrong handler", rootCause: "Two exports named submitOrder: the import resolves to the legacy one." }));
+    assert.equal(d.action, "keep");
+  });
+
+  it("verifies a quote that re-spaces punctuation or swaps quote style", () => {
+    assert.equal(one(mk({ evidence: "`await saveOrder( { userId: user.id, total, items: cart.items } )`" })).action, "keep");
+    assert.equal(one(mk({ evidence: "`if (!user.verified) throw new Error('unverified user');`" })).action, "keep");
+  });
+
+  it("does not tie two findings together by a short common line", () => {
+    const prior = [{ file: "src/orders/submit.ts", title: "Something else entirely", evidence: "`return { ok: true, total };`" }];
+    const f = mk({ title: "Total is returned before the save settles", evidence: "`await saveOrder({ userId: user.id, total, items: cart.items });` then `return { ok: true, total };`" });
+    assert.equal(one(f, ctx({ priorFindings: prior })).action, "keep");
   });
 });
 

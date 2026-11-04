@@ -283,6 +283,9 @@ export type LiveGateResult = {
 export type FindingGateExtras = {
   /** The bot's earlier findings on this PR (other heads, or an earlier review of this head). */
   priorFindings?: PriorFinding[];
+  /** More files at the reviewed head (path → content) the leg read beyond the snapshot — the local
+   * loop's file_read reads. The snapshot's own copy wins for a path in both. */
+  headFiles?: ReadonlyMap<string, string>;
 };
 
 const stringList = (v: unknown, max: number, cut: number) =>
@@ -294,6 +297,9 @@ export function findingGateContext(snapshot: SamplePr, submitted: Record<string,
   const headFiles = new Map<string, string>();
   for (const f of [...(snapshot.files ?? []), ...(snapshot.referenceFiles ?? [])]) {
     if (f?.path && typeof f.content === "string" && !headFiles.has(f.path)) headFiles.set(f.path, f.content);
+  }
+  for (const [path, content] of extras?.headFiles ?? []) {
+    if (path && typeof content === "string" && !headFiles.has(path)) headFiles.set(path, content);
   }
   return {
     headFiles,

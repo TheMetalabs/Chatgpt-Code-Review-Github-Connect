@@ -433,6 +433,30 @@ describe("gateLiveSubmission: finding gate", () => {
     assert.deepEqual({ kept: gate.gateStats?.kept, notes: gate.gateStats?.notes, dropped: gate.gateStats?.dropped }, { kept: 1, notes: 1, dropped: 1 });
   });
 
+  it("verifies a quote from a file the leg read at head beyond the snapshot (extras.headFiles)", () => {
+    const helper = row({
+      ...FINDING_412,
+      severity: "P2",
+      title: "Capture amount is scaled by 1000 in the cents helper",
+      rootCause: "toCents multiplies by 1000.",
+      evidence: "src/payment/money.ts:2 `return Math.round(amount * 1000);`",
+    });
+    const reads = new Map([["src/payment/money.ts", "export function toCents(amount: number) {\n  return Math.round(amount * 1000);\n}\n"]]);
+    const without = submit([helper]);
+    assert.ok(without.ok);
+    if (!without.ok) return;
+    assert.equal(without.findings.length, 0, "unverified without the read");
+    const withReads = submit([helper], DEFAULT_SETTINGS, { headFiles: reads });
+    assert.ok(withReads.ok);
+    if (!withReads.ok) return;
+    assert.deepEqual(withReads.findings.map((f) => f.title), ["Capture amount is scaled by 1000 in the cents helper"]);
+    // The snapshot's own copy of a path wins over a read of the same path.
+    const shadow = submit([real], DEFAULT_SETTINGS, { headFiles: new Map([["src/payment/webhook.ts", "// nothing here\n"]]) });
+    assert.ok(shadow.ok);
+    if (!shadow.ok) return;
+    assert.deepEqual(shadow.findings.map((f) => f.title), [FINDING_412.title]);
+  });
+
   it("a note never makes REQUEST_CHANGES, even when the reviewer called it P1", () => {
     const gate = submit([style]);
     assert.ok(gate.ok);

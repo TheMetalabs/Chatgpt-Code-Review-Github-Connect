@@ -34,6 +34,7 @@ import {
   gateLiveSubmission,
   isBotMention,
   schemaMergeProviderGates,
+  type FindingGateExtras,
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
@@ -90,6 +91,11 @@ const localQueued = new Map<string, { arm: (reset: boolean) => void; clear: () =
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
 const localSamples = new Map<string, SamplePr>();
+// In-memory only: files the local multi-turn loop read at the reviewed head beyond the snapshot
+// (its file_read tool, via makeHeadReader), path → content. The finding gate verifies the local leg's
+// quotes against these too: a quote from a helper the loop read is real head code, not a fabrication.
+// Kept until the job is terminal (the merge gates the local leg after the leg itself has finished).
+const localHeadReads = new Map<string, Map<string, string>>();
 // In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
 // the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
 // (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
@@ -273,6 +279,8 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
     localSamples.delete(job.id);
     localSinglePrompts.delete(job.id);
   }
+  // No merge follows a terminal edge: an in-flight leg's later reads are not kept either.
+  localHeadReads.delete(job.id);
   if (!stop) return;
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
@@ -1038,6 +1046,8 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
   if (!job || job.origin !== "github" || job.installationId == null || !job.headSha) return undefined;
   const { owner, repo, headSha, installationId } = job;
   const cache = new Map<string, string | null>();
+  const reads = new Map<string, string>();
+  localHeadReads.set(job.id, reads);
   let tokenPromise: Promise<string> | null = null;
   let fetched = 0;
   return async (path: string): Promise<string | null> => {
@@ -1048,6 +1058,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
       tokenPromise ??= installationToken(installationId);
       const content = await getFile(await tokenPromise, owner, repo, path, headSha);
       cache.set(path, content);
+      if (typeof content === "string" && localHeadReads.get(job.id) === reads) reads.set(path, content);
       return content;
     } catch {
       cache.set(path, null); // a failed fetch is cached as absent so one bad path is not retried
@@ -1413,16 +1424,21 @@ export async function submitHarborChat(
   // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
   const configuredCanonicalProvider = providers.find(isChatProvider);
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(configuredCanonicalProvider && provider !== configuredCanonicalProvider && isChatProvider(provider));
+  // The local leg's quotes also verify against the files its loop read at this head.
+  const legGateExtras = (leg: ChatLeg): FindingGateExtras | undefined => {
+    const reads = leg.provider === "local" ? localHeadReads.get(job.id) : undefined;
+    return reads?.size ? { headFiles: reads } : undefined;
+  };
   const preserveSchemaRejectedEvidence = (leg: ChatLeg) =>
     !job.localVerifyStartedAt && !job.localFallbackAt && isAuxiliaryChat(leg.provider);
   const first = payloads.map((leg) => ({
     leg,
-    ...gateLeg(leg, sample, heldLocal && leg.provider === "local", preserveSchemaRejectedEvidence(leg)),
+    ...gateLeg(leg, sample, heldLocal && leg.provider === "local", preserveSchemaRejectedEvidence(leg), legGateExtras(leg)),
   }));
   const posts = first.some((g) => g.gate.ok);
   for (const g of first) {
     const { leg, gate, verdict, unusable, cause, coverageCut: cutReply } = !g.gate.ok && posts
-      ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg)) }
+      ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg), legGateExtras(g.leg)) }
       : g;
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
     if (unusable && leg.provider === "local") localUnusable = unusable;
@@ -1726,6 +1742,7 @@ function gateLeg(
   sample: SamplePr,
   rejectedEvidence: boolean,
   preserveSchemaRejectedEvidence = false,
+  extras?: FindingGateExtras,
 ): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause; coverageCut?: string } {
   const parsed = parseChatSubmission(leg.raw);
   // A reply cut off after its verdict with no finding (extract-chat-json recoverTruncatedReviewJson).
@@ -1741,7 +1758,7 @@ function gateLeg(
     // reply cut in investigated_safe, assumptions, a later field, or a half-written key stays incomplete.
     const cutText = leg.originalText?.trim() || leg.raw;
     if (parsed.merge_recommendation !== "REQUEST_CHANGES" && Array.isArray(parsed.findings) && truncatedReviewField(cutText) === "coverage") {
-      const gate = gateLiveSubmission(parsed, sample, state.settings);
+      const gate = gateLiveSubmission(parsed, sample, state.settings, extras);
       if (gate.ok && !gate.rawReview && !gate.findings.length && !gate.malformed && !gate.overflow) {
         return { gate, verdict: true, coverageCut: cutText };
       }
@@ -1749,13 +1766,13 @@ function gateLeg(
     // Otherwise never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.
     const evidence = verdictEvidence(parsed, { ...leg, raw: leg.originalText?.trim() || leg.raw });
     return {
-      gate: gateLiveSubmission(evidence, sample, state.settings),
+      gate: gateLiveSubmission(evidence, sample, state.settings, extras),
       verdict: false,
       unusable: "the reply was cut off before it finished (coverage incomplete)",
       cause: "truncated",
     };
   }
-  const gate = gateLiveSubmission(parsed, sample, state.settings);
+  const gate = gateLiveSubmission(parsed, sample, state.settings, extras);
   if (gate.ok && gate.rawReview) {
     // The bridge wraps schema-rejected chat JSON in a raw_review envelope when repair is off. The
     // envelope itself is parseable, but the original reply is still a rejected reviewer verdict:
@@ -1765,7 +1782,7 @@ function gateLeg(
       const source = parseChatSubmission(original);
       if (source) {
         const evidence = verdictEvidence(source, { ...leg, raw: original });
-        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings);
+        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings, extras);
         return { gate: evidenceGate, verdict: false, unusable: "reply failed the review schema", cause: "not-a-verdict" };
       }
     }
@@ -1775,7 +1792,7 @@ function gateLeg(
   if (!unusable) return { gate, verdict: gate.ok };
   if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };
   const cause: RawCause = unusable === gateUnreadRows(gate) ? "unread-rows" : "not-a-verdict";
-  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings), verdict: false, unusable, cause };
+  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings, extras), verdict: false, unusable, cause };
 }
 
 type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };

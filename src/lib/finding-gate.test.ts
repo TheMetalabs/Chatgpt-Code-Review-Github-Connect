@@ -71,6 +71,8 @@ function ctx(extra: Partial<GateContext> = {}): GateContext {
 }
 
 const ON: GateOptions = { mode: "rules", p1ClosedPath: true, notes: true, dedupePrior: true };
+/** Evidence verified at head but only in UNCHANGED code (the pricing helper). */
+const UNCHANGED_EV = "src/pricing/total.ts:2 `return cart.items.reduce((sum, item) => sum + item.price * item.qty, 0);`";
 
 let n = 0;
 function mk(p: Partial<Finding> = {}): Finding {
@@ -125,10 +127,41 @@ describe("finding gate: mode", () => {
 });
 
 describe("finding gate: R1 speculation", () => {
-  it("drops an admitted-unverified premise (English)", () => {
-    const d = one(mk({ rootCause: "Whether the controller registers this guard is unverified; if it does not, orders save without auth." }));
+  it("drops an admitted-unverified premise (English) without a changed-line quote", () => {
+    const d = one(mk({ rootCause: "Whether the controller registers this guard is unverified; if it does not, orders save without auth.", evidence: UNCHANGED_EV }));
     assert.equal(d.action, "drop");
     assert.equal(d.reasons[0], "speculative");
+  });
+
+  it("reads a bare 'unverified' as a weak hedge when a verified quote sits on a changed line", () => {
+    // The quote ties the claim to code this PR changed: kept (C2 may demote the hedged P1 headline).
+    const d = one(mk({ rootCause: "Whether the controller registers this guard is unverified; if it does not, orders save without auth." }));
+    assert.notEqual(d.action, "drop", JSON.stringify(d.reasons));
+    for (const title of ["Request body is passed unverified to saveOrder", "Order saved while the account email is still unverified", "Webhook payload accepted unverified"]) {
+      const k = one(mk({ title }));
+      assert.equal(k.action, "keep", `${title} -> ${k.reasons.join("; ")}`);
+      assert.equal(k.finding.severity, "P1", title);
+    }
+    // Without a changed-line quote the same wording is still speculation (R1 as before).
+    assert.equal(one(mk({ title: "Request body is passed unverified to saveOrder", evidence: UNCHANGED_EV })).reasons[0], "speculative");
+  });
+
+  it("still drops a headline that admits the subject is unverified, whatever the quotes", () => {
+    for (const title of ["Spec expects the audit row but the service implementation is unverified", "Order save relies on the unverified helper in the store"]) {
+      const d = one(mk({ title }));
+      assert.equal(d.action, "drop", title);
+      assert.equal(d.reasons[0], "speculative", title);
+    }
+  });
+
+  it("keeps a security capability stated with 'could' at P1 when a changed-line quote proves it", () => {
+    const d = one(mk({ title: "Attackers could bypass the verified-user check", failureScenario: "An unverified account submits an order by retrying.", rootCause: "The check runs after saveOrder." }));
+    assert.equal(d.action, "keep", JSON.stringify(d.reasons));
+    assert.equal(d.finding.severity, "P1");
+    // Without a changed-line quote "could" is still a hedge.
+    assert.equal(one(mk({ title: "Attackers could bypass the verified-user check", evidence: UNCHANGED_EV })).reasons[0], "speculative");
+    // A non-security "could" headline is still only a possibility.
+    assert.equal(one(mk({ title: "Rolled-back save could leave the order row behind" })).reasons[0], "speculative");
   });
 
   it("drops 'not in the reviewed group' / 'not present in the snapshot'", () => {
@@ -202,13 +235,13 @@ describe("finding gate: R1 speculation (integration tuning)", () => {
   });
 
   it("keeps an apostrophe-heavy claim intact (no false quote pairing)", () => {
-    const d = one(mk({ rootCause: "The store's retry doesn't check the user's state; whether it re-validates is unverified." }));
+    const d = one(mk({ rootCause: "The store's retry doesn't check the user's state; whether it re-validates is unverified.", evidence: UNCHANGED_EV }));
     assert.equal(d.reasons[0], "speculative");
   });
 
   it("reads attributive 'an unverified <data>' as the code's data, but 'the unverified helper' as an admission", () => {
     assert.equal(one(mk({ failureScenario: "The order is dropped over an unverified read of the stock table, not a real shortage." })).action, "keep");
-    assert.equal(one(mk({ rootCause: "The failure depends on the unverified helper that persists the order." })).reasons[0], "speculative");
+    assert.equal(one(mk({ rootCause: "The failure depends on the unverified helper that persists the order.", evidence: UNCHANGED_EV })).reasons[0], "speculative");
   });
 });
 
@@ -505,7 +538,7 @@ describe("finding gate: recall guards", () => {
 describe("finding gate: reporting", () => {
   it("summarizes kept / notes / dropped per reason for the ops comment", () => {
     const r = gateFindings(
-      [mk(), mk({ title: "Ref assigned during render" }), mk({ rootCause: "unverified premise" }), mk({ recommendedFix: "none" })],
+      [mk(), mk({ title: "Ref assigned during render" }), mk({ rootCause: "unverified premise", evidence: UNCHANGED_EV }), mk({ recommendedFix: "none" })],
       ctx(),
       ON,
     );

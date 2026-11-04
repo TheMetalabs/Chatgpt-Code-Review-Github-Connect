@@ -13,9 +13,11 @@
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
  *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path. A note-category
  *   finding (C1) that fails R3 is routed to notes, not dropped: a note asserts no defect to prove.
- * - R1 speculation: an admitted-unverified premise always drops; a modal hedge in the TITLE (the
- *   headline claim is only a possibility) always drops; a hedge elsewhere in the claim drops only
- *   without a verified quote on a changed line.
+ * - R1 speculation: an admitted-unverified premise drops ("I could not verify", "not in the snapshot");
+ *   a bare "unverified" in the claim drops only without a verified quote on a changed line, unless the
+ *   TITLE admits it ("the wiring is unverified"); a modal hedge in the TITLE (the headline claim is only
+ *   a possibility) always drops, except "could" stating a security capability ("attackers could
+ *   bypass …"); a hedge elsewhere in the claim drops only without a verified quote on a changed line.
  * - Rules are general (English + Korean phrasing) and never special-case repository names or texts.
  *
  * WHY: a finding only reached GitHub if every field was filled in. Findings that admit they rest on an
@@ -397,6 +399,24 @@ function attributiveOnCode(text: string, at: number, m: string): boolean {
   return Boolean(next) && !new RegExp(`^${REVIEW_OBJECT}$`, "i").test(next![1]);
 }
 
+/** A security noun at most two words (none of them a review object) before `at`, optionally followed by
+ * a copula: "payload accepted unverified", "email still unverified" — the code's data, not the reviewer. */
+const securityNounBefore = (text: string, at: number) =>
+  new RegExp(`${SECURITY_NOUN}\\s+(?:(?!${REVIEW_OBJECT}\\b)[\\w-]+\\s+){0,2}(?:is\\s+|are\\s+|remains?\\s+|stays?\\s+|was\\s+|were\\s+)?$`, "i").test(text.slice(Math.max(0, at - 50), at));
+
+/** The headline itself admits the reviewer did not verify the subject: "the controller wiring is
+ * unverified", "relies on the unverified helper". Such a finding is speculation whatever its quotes. */
+function titleAdmitsUnverified(title: string): boolean {
+  const t = stripQuoted(title);
+  return new RegExp(`\\b${REVIEW_OBJECT}(?:\\s+[\\w-]+)?\\s+(?:is|are|remains?|stays?|was|were)\\s+(?:still\\s+|currently\\s+)?unverified\\b|\\bunverified\\s+${REVIEW_OBJECT}\\b`, "i").test(t) &&
+    ![...t.matchAll(/\bunverified\b/gi)].every((m) => securityNounBefore(t, m.index ?? 0));
+}
+
+/** A security failure stated as a capability ("Attackers could bypass the role check"): "could" there
+ * says what the defect allows, not that the defect is only possible. */
+const SECURITY_CUE = /\b(?:attackers?|malicious|bypass\w*|unauthori[sz]ed|forg(?:e|es|ed|ing|ery)|spoof\w*|inject\w*|escalat\w*|impersonat\w*|exfiltrat\w*|hijack\w*|takeover|steal\w*|another (?:user|tenant|account)'?s?)\b|공격자|우회|권한\s*상승|위조|탈취/i;
+const securityCapability = (text: string) => SECURITY_CUE.test(text);
+
 const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: number, match: string) => boolean }[] = [
   // Reviewer voice only: "the validator didn't check the length" describes the code and is a real claim.
   {
@@ -413,7 +433,7 @@ const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: num
     re: /\bunverified\b/gi,
     label: "unverified",
     guard: (text, at, m) =>
-      new RegExp(`${SECURITY_NOUN}\\s+(?:is\\s+|are\\s+|remains?\\s+|stays?\\s+|was\\s+|were\\s+)?$`, "i").test(text.slice(Math.max(0, at - 30), at)) ||
+      securityNounBefore(text, at) ||
       new RegExp(`^[\\s-]+${SECURITY_NOUN}\\b`, "i").test(text.slice(at + m.length, at + m.length + 30)) ||
       attributiveOnCode(text, at, m),
   },
@@ -470,14 +490,19 @@ const WEAK_HEDGES: { re: RegExp; label: string }[] = [
 function modalHedge(text: string): string | undefined {
   for (const h of WEAK_HEDGES) {
     if (h.label === "assumes" || h.label === "if X does not") continue;
+    if (h.label === "could" && securityCapability(text)) continue;
     h.re.lastIndex = 0;
     if (h.re.test(text)) return h.label;
   }
   return undefined;
 }
 
-function strongHedge(text: string): string | undefined {
+/** `provenOnChanged`: the claim has a verified quote on a changed line. Then "unverified" (without the
+ * reviewer saying they could not verify) is only a weak hedge: the quote already ties the claim to code
+ * this PR changed (a concrete finding is never dropped for one word). */
+function strongHedge(text: string, provenOnChanged = false): string | undefined {
   for (const h of STRONG_HEDGES) {
+    if (provenOnChanged && h.label === "unverified") continue;
     for (const m of text.matchAll(h.re)) {
       if (h.guard?.(text, m.index ?? 0, m[0])) continue;
       return h.label;
@@ -793,7 +818,8 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (ownReply) return drop("contradicted_by_own_reply", ownReply);
 
   const claim = claimText(f);
-  const strong = strongHedge(claim);
+  if (titleAdmitsUnverified(f.title)) return drop("speculative", "title: unverified");
+  const strong = strongHedge(claim, ev.onChanged);
   if (strong) return drop("speculative", strong);
   // The headline itself is a possibility ("X may allow Y"): no quote can prove a claim that does not
   // assert a defect, so it is speculation whatever the evidence (precision control B).
@@ -826,7 +852,9 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   }
 
   if (opts.p1ClosedPath && RANK[f.severity] <= RANK.P1) {
-    const headHedge = weakHedge(stripQuoted([f.title, f.rootCause].join("\n")));
+    const head = stripQuoted([f.title, f.rootCause].join("\n"));
+    // "could" in a security capability ("attackers could bypass …") is the defect, not a hedge.
+    const headHedge = weakHedge(securityCapability(head) ? head.replace(/\bcould\b(?!\s+not\b|n't)/gi, "can") : head);
     const missing = [
       ev.onChanged ? "" : "no verified quote on a changed line",
       norm(f.failureScenario) ? "" : "no failure scenario",

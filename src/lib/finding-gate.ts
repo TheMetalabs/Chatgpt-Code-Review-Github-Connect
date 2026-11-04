@@ -704,9 +704,16 @@ function noteCategory(f: Finding): GateNoteCategory | undefined {
 
 // ── D dedupe against the bot's earlier findings ───────────────────────────────────────────────────
 
-/** The prior finding this one repeats: same file and a near-identical title (token Jaccard ≥ 0.6) or
- * the same verified evidence quote. Every prior counts: one on an older head (re-posting a finding on
+/** The prior finding this one repeats: same file and a near-identical title (token Jaccard ≥ 0.6), the
+ * same verified evidence quote (a substantial one), or — at the same posted line — any verified quote
+ * shared with a title on the same subject (two or more shared title words). Every prior counts: one on an older head (re-posting a finding on
  * every push is noise) and one already posted on this head (a second review of the same head). */
+function sharedCount(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const t of a) if (b.has(t)) n += 1;
+  return n;
+}
+
 export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFindings">, verifiedQuotes: string[] = []): PriorFinding | undefined {
   const title = tokens(f.title);
   // The same quoted code (loose-normalized): equal or one containing the other, and the shorter a
@@ -719,6 +726,12 @@ export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFind
     if (mine.length && p.evidence) {
       const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
       if (mine.some((q) => theirs.some((t) => same(q, t)))) return p;
+      // The same anchor and subject: posted on the same line of the same file, quoting the same code,
+      // and the titles share at least two content words. A short line (`id: string;`) ties two
+      // findings only together with the line it was posted on; a different claim about the same line
+      // (few shared title words) is new.
+      const contains = (a: string, b: string) => a === b || a.includes(b) || b.includes(a);
+      if (p.line && p.line === f.line && sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
     }
   }
   return undefined;

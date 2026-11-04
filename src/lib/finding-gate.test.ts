@@ -408,6 +408,17 @@ describe("finding gate: D dedupe against prior findings", () => {
     assert.match(d.reasons[1], /this head/);
   });
 
+  it("drops a reworded repeat posted on the same line with the same short quote, but not on another line", () => {
+    const f = mk({ severity: "P2", line: 5, title: "Total computed before the user check", evidence: "src/orders/submit.ts:5 `readTotal(cart)`" });
+    const prior = (line: number) => [{ file: "src/orders/submit.ts", line, title: "Total is computed ahead of user validation", evidence: "src/orders/submit.ts:5 (`readTotal(cart)`)", commitId: "0000000bbbbbbb" }];
+    const d = one(f, ctx({ priorFindings: prior(5) }));
+    assert.equal(d.action, "drop");
+    assert.equal(d.reasons[0], "already_reported");
+    assert.equal(one(f, ctx({ priorFindings: prior(6) })).action, "keep");
+    const otherClaim = [{ ...prior(5)[0], title: "Discount rules ignored for gift cards" }];
+    assert.equal(one(f, ctx({ priorFindings: otherClaim })).action, "keep", "a different claim about the same line is new");
+  });
+
   it("keeps a different file or a different claim, and everything when dedupe is off", () => {
     const prior = [{ file: "src/orders/submit.ts", title: "Order total saved before the stock check" }];
     assert.equal(findPriorDuplicate(mk({ file: "src/orders/other.ts" }), { priorFindings: prior }), undefined);

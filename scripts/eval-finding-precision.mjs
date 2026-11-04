@@ -79,7 +79,7 @@ function priorBefore(c) {
   const at = Date.parse(c.createdAt ?? '');
   return (ctx.priorFindings ?? [])
     .filter((p) => p && !own.has(String(p.id ?? '')) && !(Number.isFinite(at) && Date.parse(p.createdAt ?? '') >= at))
-    .map((p) => ({file: String(p.file ?? ''), title: String(p.title ?? ''), evidence: p.evidence ? String(p.evidence) : undefined, commitId: p.commitId ? String(p.commitId) : undefined}));
+    .map((p) => ({file: String(p.file ?? ''), title: String(p.title ?? ''), evidence: p.evidence ? String(p.evidence) : undefined, commitId: p.commitId ? String(p.commitId) : undefined, line: Number(p.line) || undefined}));
 }
 
 function fromCaseFile(c, meta = {}) {

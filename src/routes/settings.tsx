@@ -45,8 +45,18 @@ import {
   type ChatgptReasoning,
   type GrokReasoning,
 } from "@/lib/reasoning";
+import { GATE_MODES, type GateMode } from "@/lib/finding-gate";
 
 export const Route = createFileRoute("/settings")({ component: Settings });
+
+const GATE_MODE_LABEL: Record<GateMode, string> = {
+  off: "off — post every finding on changed code (이전 동작)",
+  rules: "rules — deterministic precision gate (기본)",
+  refute: "refute — rules + model refute pass when wired",
+};
+
+/** The finding-precision fields the section edits (types.ts BotSettings, validated by settings-rules). */
+type FindingPrecision = Pick<BotSettings, "findingGate" | "findingP1ClosedPath" | "findingNotes" | "findingDedupePrior" | "postLatestHeadOnly">;
 
 function hydrateDraft(saved: BotSettings): BotSettings {
   return {
@@ -147,6 +157,11 @@ export function Settings() {
     saved.reviewOrder.join(","),
     saved.chatgptReasoning,
     saved.grokReasoning,
+    saved.findingGate,
+    saved.findingP1ClosedPath,
+    saved.findingNotes,
+    saved.findingDedupePrior,
+    saved.postLatestHeadOnly,
     savedFixKey,
   ]);
 
@@ -477,6 +492,7 @@ export function Settings() {
             Signs Inbox ping only. Live GitHub HMAC uses the GitHub App webhook secret below. Masked if already saved.
           </p>
         </Field>
+        <FindingPrecisionSection value={draft} onChange={patch} />
         <FixAgentSection fix={draft.fixAgent} onChange={patchFix} />
         <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-bg/95 p-3 backdrop-blur">
           <Button type="submit" disabled={busy || !dirty}>
@@ -510,6 +526,12 @@ policy:
   precision_over_recall: ${draft.precisionOverRecall}
   publish_min_severity: ${draft.publishMinSeverity}
   request_changes_min: ${draft.requestChangesMin}
+finding_precision:
+  gate: ${draft.findingGate}
+  p1_closed_path: ${draft.findingP1ClosedPath}
+  notes: ${draft.findingNotes}
+  dedupe_prior: ${draft.findingDedupePrior}
+  post_latest_head_only: ${draft.postLatestHeadOnly}
 github:
   skip_forks: ${draft.skipForks}
   skip_drafts: ${draft.skipDrafts}
@@ -889,6 +911,86 @@ function GitHubApp({ github }: { github: GithubReady }) {
       {saved ? <p className="mt-3 text-[12px] text-ok">Saved. Secrets stay masked on this page.</p> : null}
       {probe ? <p className={`mt-3 text-[12px] ${error ? "text-danger" : "text-ok"}`}>{probe}</p> : null}
       {error ? <p className="mt-3 text-[12px] text-danger">{error}</p> : null}
+    </section>
+  );
+}
+
+/** Finding precision (finding-gate.ts). Every switch here is read from the live settings when a
+ * reviewer reply is gated, so a saved change applies to the next review — no restart. */
+function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision; onChange: (p: Partial<FindingPrecision>) => void }) {
+  const on = value.findingGate !== "off";
+  return (
+    <section aria-label="Finding precision" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">
+      <div>
+        <h2 className="text-sm font-medium">Finding precision</h2>
+        <p className="mt-2 text-[12px] leading-relaxed text-fg-muted">
+          Checks each reviewer finding before it is posted. A finding that admits an unverified premise, retracts
+          itself, claims a file this PR changes was not changed, is contradicted by the same reply, quotes code that
+          is not at the reviewed head, or repeats one Ashlar already posted on this PR is dropped (the ops comment
+          counts each reason). 게시 전에 각 파인딩을 검증합니다 — 추측·자기 철회·diff와 모순·인용 코드 불일치·중복 파인딩은 게시하지 않습니다.
+        </p>
+      </div>
+      <Field label="finding_precision.gate">
+        <select
+          value={value.findingGate}
+          onChange={(e) => onChange({ findingGate: e.target.value as GateMode })}
+          className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+        >
+          {GATE_MODES.map((m) => (
+            <option key={m} value={m}>
+              {GATE_MODE_LABEL[m]}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="finding_precision.p1_closed_path">
+          <Toggle
+            label="P1 needs a closed path (P1은 재현 경로 필수)"
+            checked={value.findingP1ClosedPath}
+            onChange={(v) => onChange({ findingP1ClosedPath: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            A P0/P1 without a verified quote on a changed line, a failure scenario, or with a hedged claim is posted as P2.
+          </p>
+        </Field>
+        <Field label="finding_precision.notes">
+          <Toggle
+            label="docs / i18n / style → notes (본문 메모로)"
+            checked={value.findingNotes}
+            onChange={(v) => onChange({ findingNotes: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Docs, hard-coded text / i18n, style or lint, log wording and test-coverage advice go under “Notes (not
+            findings)”: not counted, never inline, never REQUEST_CHANGES.
+          </p>
+        </Field>
+        <Field label="finding_precision.dedupe_prior">
+          <Toggle
+            label="skip findings already posted (중복 게시 안 함)"
+            checked={value.findingDedupePrior}
+            onChange={(v) => onChange({ findingDedupePrior: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Same file and a near-identical title or the same quoted code as an earlier Ashlar finding on this PR.
+          </p>
+        </Field>
+        <Field label="finding_precision.post_latest_head_only">
+          <Toggle
+            label="post for the latest head only (최신 HEAD만 게시)"
+            checked={value.postLatestHeadOnly}
+            onChange={(v) => onChange({ postLatestHeadOnly: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            A review of a head the PR has already moved past is not posted.
+          </p>
+        </Field>
+      </div>
+      <p className="text-[12px] text-fg-subtle">
+        {on
+          ? `Gate ON (${value.findingGate}). Turn it off to post every finding on changed code as before.`
+          : "Gate OFF: every finding on changed code is posted (recall-first, the pre-2026-11 behaviour). The P1, notes and dedupe switches apply only while the gate is on."}
+      </p>
     </section>
   );
 }

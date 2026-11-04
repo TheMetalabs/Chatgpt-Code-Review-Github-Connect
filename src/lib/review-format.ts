@@ -77,7 +77,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures" | "coverageCutProviders" | "coverageCutReview">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures" | "coverageCutProviders" | "coverageCutReview" | "notes">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {
@@ -95,7 +95,27 @@ type SummaryParts = {
   coverageCut: ReviewProvider[];
   /** Their replies verbatim, rendered like the raw block (markers neutralized, clean sentinel reworded). */
   coverageCutText: string;
+  /** The finding gate's notes block (notesBlock), "" when there are none. */
+  notes: string;
 };
+
+export const NOTES_HEADING = "Notes (not findings)";
+const MAX_NOTES_RENDERED = 12;
+
+/** Findings the finding gate routed to notes (Job.notes: docs / i18n / style / log wording / test
+ * advice). Rendered as a collapsed list with no severity badge: they are not findings, so they are
+ * never counted in the ashlar-findings marker, never inline, and never REQUEST_CHANGES. Model text is
+ * rendered like a salvaged reply (rawBodyText): it can neither forge a marker nor read as clean. */
+export function notesBlock(notes: Finding[] | undefined): string {
+  const rows = (notes ?? []).slice(0, MAX_NOTES_RENDERED).map((f) => {
+    const category = (f.dropReason ?? "").startsWith("note:") ? `${f.dropReason!.slice("note:".length)} · ` : "";
+    const detail = rawBodyText([f.failureScenario, f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""].map((s) => s.trim()).filter(Boolean).join(" — "));
+    return `- ${rawBodyText(category)}\`${rawBodyText(f.file)}:${f.line}\` — ${rawBodyText(f.title)}${detail ? `\n  ${detail}` : ""}`;
+  });
+  if (!rows.length) return "";
+  const more = (notes?.length ?? 0) > rows.length ? `\n- …and ${(notes?.length ?? 0) - rows.length} more` : "";
+  return `\n<details>\n<summary>${NOTES_HEADING} — ${notes!.length}</summary>\n\nDocs, wording, style and test-coverage remarks. Not defects: not counted, not blocking.\n\n${rows.join("\n")}${more}\n\n</details>\n`;
+}
 
 export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const outcome = postedOutcome(job, findings.length);
@@ -111,6 +131,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     rawWhy: rawCauseText(job.rawCauses, job.rawTruncated),
     coverageCut: (job.coverageCutProviders ?? []).filter((p) => Object.hasOwn(PROVIDER_LABEL, p)),
     coverageCutText: rawBodyText((job.coverageCutReview ?? "").trim()),
+    notes: notesBlock(job.notes),
   };
   switch (outcome) {
     case "findings":
@@ -214,7 +235,7 @@ function rawBlock(p: SummaryParts): string {
 function rawOnlyBody(p: SummaryParts): string {
   const skipNote = p.skipped.length ? `\n${p.skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
   return `${REVIEW_SUMMARY_MARK}
-${p.noteLine}${rawBlock(p)}${skipNote}${coverageCutBlock(p)}
+${p.noteLine}${rawBlock(p)}${skipNote}${coverageCutBlock(p)}${p.notes}
 **Reviewed commit:** \`${p.sha}\`
 ${findingsMarker(p.outcome, [], [], p.coverageCut.length > 0)}`;
 }
@@ -250,7 +271,7 @@ function cleanBody(job: SummaryJob, p: SummaryParts): string {
   const clearedCount = cov.filter((c) => c.status === "cleared").length;
   const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
   const cut = p.coverageCut.length > 0;
-  return `${first}\n\nReviewed commit: \`${p.sha}\`\n${p.noteLine}${coverageCutBlock(p)}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"}${cut ? ` incomplete=${p.coverageCut.join(",")}` : ""} -->\n${findingsMarker(p.outcome, [], [], cut)}`;
+  return `${first}\n\nReviewed commit: \`${p.sha}\`\n${p.noteLine}${coverageCutBlock(p)}${p.notes}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"}${cut ? ` incomplete=${p.coverageCut.join(",")}` : ""} -->\n${findingsMarker(p.outcome, [], [], cut)}`;
 }
 
 function unanchoredBlock(unanchored: Finding[]): string {
@@ -306,7 +327,7 @@ Here are some automated review suggestions for this pull request.
 
 ${reviewersLine(job)}
 ${p.noteLine}${p.skipped.length ? p.skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock(unanchored)}${rawBlock(p)}${coverageCutBlock(p)}
+${unanchoredBlock(unanchored)}${p.notes}${rawBlock(p)}${coverageCutBlock(p)}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 

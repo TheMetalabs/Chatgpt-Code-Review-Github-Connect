@@ -82,7 +82,8 @@
 ## 5. 비목표 / 주의
 
 - 프롬프트 **의미**·제출·수렴·스키마 병합은 변경하지 않는다(#61/#62 경계 유지, `BOUNDARY.md`).
-- 정밀도는 리콜을 희생하지 않는 선에서만 올린다 — 오탐 감소가 목표지 파인딩 억제가 아니다.
+- ~~정밀도는 리콜을 희생하지 않는 선에서만 올린다~~ → 2026-11-04 변경: Settings "Finding precision"(기본 켜짐)에서
+  근거가 증명되지 않은 파인딩은 게시하지 않는다(§8). `findingGate=off` 이면 이전 계약(변경 코드 파인딩은 버리지 않음).
 - 단일 레포·소표본이므로, 적용 후 같은 수렴-루프 계측(context/policy/파인딩·오탐)으로 재평가한다.
 
 ## 6. 다음 단계
@@ -115,3 +116,24 @@
   커밋 경로 2개 인용, P0/P1은 닫힌 실패 경로만, 문서·i18n·스타일·로그 문구·테스트 조언은 파인딩 아님, 자기 결론이
   "안전"인 파인딩 삭제, diff 관련 주장은 diff로 확인. 로컬 루프의 "미검증 의존성을 evidence에 적고 보고하라"
   지시는 삭제.
+
+## 8. 2026-11 판정 게이트·게시 규칙·회귀 평가 (오탐 감소 작업 B–E)
+
+Settings "Finding precision"(`findingGate`, `findingP1ClosedPath`, `findingNotes`, `findingDedupePrior`,
+`postLatestHeadOnly`; 모두 Settings 화면에서 조작, `settings-rules.ts` 검증)으로 켜고 끈다.
+
+- **판정 게이트(`src/lib/finding-gate.ts`, 결정적):** 모든 리뷰어 레그가 `poster.gateLiveSubmission` 에서 통과.
+  이전 파인딩 반복·자기 철회·diff가 반박하는 주장·같은 응답의 coverage/investigated_safe가 반박·미검증 전제 인정·
+  제목 자체가 가능성("may/might/could")·HEAD에 없는 인용은 버린다. 문서/i18n/스타일/로그 문구/테스트 조언은
+  "Notes (not findings)" 로(집계·인라인·REQUEST_CHANGES 없음), 닫힌 경로 없는 P0/P1은 P2로. 텍스트는 바꾸지 않는다.
+- **게시:** 게시 직전 HEAD 재확인(이동했으면 게시 안 함), push 가 옛 HEAD 리뷰를 취소, 같은 HEAD 재리뷰가 새 파인딩
+  없으면 게시 안 함, 이전 파인딩만 남으면 clean(total=0) 리뷰 대신 건너뜀. `/review-loop` 단계는 이전 파인딩과
+  대조하지 않는다(루프는 고쳐지지 않은 파인딩을 새 HEAD에서 다시 봐야 한다).
+- **회귀 평가(E):** `npm run eval:precision [fixture]` — 같은 케이스를 게이트 off(=기존 게시)와 기본 Settings로 돌려
+  label 세트별 valid 유지/손실, 오탐 유지/제거, 제거율, 케이스별 action·사유를 출력. 커밋된 픽스처는 합성
+  (`tests/review/fixtures/finding-precision/synthetic.json`, 테스트가 오탐 제거율 ≥80%·valid 손실 0 을 고정).
+  비공개 레포 데이터셋은 레포 밖에서 경로/`ASHLAR_EVAL_FIXTURES` 로만 읽고 결과·본문을 커밋하지 않는다.
+- **남은 갭(모델 refute 패스 또는 입력 컨텍스트로):** 문서화된 의도 설계(아웃박스 재시도용 throw, forward-only
+  마이그레이션)가 다른 모듈 문서에만 적힌 경우, 단일 트랜잭션 안의 가짜 경쟁, 사실 오류(코드가 이미 처리하는데
+  "처리 안 함"), "risking/without verifying" 식의 범위 밖 추측. `findingGate=refute` 는 아직 `rules` 와 같다.
+

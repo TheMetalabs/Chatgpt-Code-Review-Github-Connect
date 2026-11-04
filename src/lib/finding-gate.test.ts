@@ -356,6 +356,17 @@ describe("finding gate: R4 diff-contradicted claims", () => {
     assert.equal(d.reasons[0], "contradicted_by_diff");
   });
 
+  it("reads 'needs update' as a doc claim only when the doc is the finding's subject", () => {
+    // The doc is cited as the source of an expectation: a code claim, not a docs-not-updated claim.
+    const cited = one(mk({ title: "Order total must be updated after a discount", rootCause: "As src/orders/CLAUDE.md states, totals are final at save time, but saveOrder stores the pre-discount total." }));
+    assert.notEqual(cited.reasons[0], "contradicted_by_diff", JSON.stringify(cited.reasons));
+    // The doc is the subject (named in the title before the phrase, or after "update"): contradicted.
+    for (const title of ["src/orders/CLAUDE.md needs an update for the verified-user rule", "CLAUDE.md 갱신 필요 — 새 throw 규칙", "Update CLAUDE.md for the verified-user rule"]) {
+      const d = one(mk({ severity: "P2", title, rootCause: "The module CLAUDE.md should be updated to describe the new throw." }));
+      assert.equal(d.reasons[0], "contradicted_by_diff", title);
+    }
+  });
+
   it("never judges a stale call site claim inside a changed code file", () => {
     for (const rootCause of [
       "The retry call site in src/orders/submit.ts was not updated to pass the total.",

@@ -622,6 +622,26 @@ function fileAbsentClaim(text: string, token: string): boolean {
   ].some((re) => re.test(text));
 }
 
+/** The doc `hit` is the finding's subject: the finding sits on a doc, or its TITLE names the doc right
+ * before a "needs update / not updated / 누락" phrase ("CLAUDE.md needs an update", "platform/CLAUDE.md
+ * 갱신 필요") or after "update" ("Update CLAUDE.md for …"). A doc cited as the source of an expectation
+ * ("as CLAUDE.md states, the total must be updated") is not the subject. */
+function docIsSubject(f: Finding, hit: string): boolean {
+  if (isDocPath(f.file)) return true;
+  const title = String(f.title ?? "").replace(/`/g, "");
+  const phrase = [...NEEDS_UPDATE_DOC, ...NOT_CHANGED_ANY, /\b(?:missing|outdated|stale)\b|누락/i];
+  for (const token of pathTokens(title)) {
+    if (basename(token) !== basename(hit)) continue;
+    const re = new RegExp(`(?:^|[^\\w./-])${escapeRe(token)}(?![\\w/])`, "gi");
+    for (const m of title.matchAll(re)) {
+      const after = title.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 50);
+      if (phrase.some((p) => p.test(after))) return true;
+      if (/\b(?:update|document in|add (?:it |this )?to)\s+(?:the\s+)?(?:module\s+)?$/i.test(title.slice(Math.max(0, (m.index ?? 0) - 30), (m.index ?? 0) + 1))) return true;
+    }
+  }
+  return false;
+}
+
 function diffContradiction(f: Finding, idx: GateIndex): string | undefined {
   const text = stripQuoted([f.title, f.failureScenario, f.rootCause].join("\n"));
   const notChanged = NOT_CHANGED_ANY.some((re) => re.test(text));
@@ -635,10 +655,11 @@ function diffContradiction(f: Finding, idx: GateIndex): string | undefined {
       ? resolvePath(token, changed)
       : changed.filter((p) => basename(p) === token && (isAncestorDir(dirname(p), f.file) || p === f.file));
     for (const hit of hits) {
-      // A doc: any "not updated" / "needs update" wording. Code: only a claim that the FILE itself is
+      // A doc: any "not updated" wording, or "needs update" when the doc is the finding's subject.
+      // Code: only a claim that the FILE itself is
       // absent from the PR ("X is not in the diff", "the PR does not touch X") — a stale call site
       // inside a changed code file is a real claim this rule never judges.
-      if (isDocPath(hit) ? notChanged || needsDoc : fileAbsentClaim(text, token)) return hit;
+      if (isDocPath(hit) ? notChanged || (needsDoc && docIsSubject(f, hit)) : fileAbsentClaim(text, token)) return hit;
     }
   }
   // The finding sits ON a changed doc and says that doc was not updated.

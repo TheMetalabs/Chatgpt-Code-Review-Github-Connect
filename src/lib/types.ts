@@ -218,8 +218,15 @@ export interface Job {
   coverageDeterministic?: { path: string; inDiff: boolean; inContext: boolean; reason?: string }[];
   /** Review-coverage: findings dropped by the precision gate. */
   droppedCount?: number;
-  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. */
+  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. With Settings
+   * postLatestHeadOnly on, a moved head means the review was NOT posted (status skipped). */
   headMovedTo?: string;
+  /** Ops note when the bot's prior findings could not be listed (duplicate checks then fail open). */
+  priorFindingsNote?: string;
+  /** Findings the finding gate dropped as repeats of the bot's prior findings (GateResult reasons;
+   * set by the gate wiring). With nothing left to post, the poster skips instead of posting a clean
+   * (total=0) review, which the loop would read as CONVERGED. */
+  priorDuplicates?: number;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
 }
@@ -358,6 +365,22 @@ export interface SamplePr {
   /** Unchanged modules that changed files import from, fetched at head so cross-file helper
    * definitions can be attached (chat) or served by the loop's cache (local). Not review targets. */
   referenceFiles?: SnapshotFile[];
+  /** The bot's own earlier findings on this PR (inline finding comments + unanchored body findings),
+   * listed at validation time for the finding gate (GateContext.priorFindings) and the same-head
+   * repost check. Absent: not listed (setting off, or the listing failed — fail open). */
+  priorFindings?: PriorFinding[];
+  /** Commits the bot already posted a review summary on. */
+  priorReviewedHeads?: string[];
+}
+
+/** One finding the bot posted earlier on the PR, read back from GitHub (prior-findings.ts). */
+export interface PriorFinding {
+  file: string;
+  title: string;
+  evidence?: string;
+  /** The commit the finding was posted on. */
+  commitId?: string;
+  line?: number;
 }
 
 export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";

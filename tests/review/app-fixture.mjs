@@ -61,6 +61,8 @@ export async function appFixture(options={}, githubOptions={}) {
     getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
     // Prior finding threads for the review prompt (aicc #455): none unless a test supplies rows.
     listReviewComments:async()=>githubOptions.listReviewComments?githubOptions.listReviewComments():[],
+    // The bot's earlier review summaries (prior-findings dedupe, same-head repost check): none unless a test supplies rows.
+    listPullReviews:async()=>githubOptions.listPullReviews?githubOptions.listPullReviews():[],
     // Loop-runtime GitHub calls a test opts into (the runtime loads github.server lazily).
     ...(githubOptions.api||{}),
   }],

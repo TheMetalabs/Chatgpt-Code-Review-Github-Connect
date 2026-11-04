@@ -8,7 +8,7 @@
 // "do not repeat" line. Missing peers are simply not used — the loop never waits. Duplicate findings
 // are acceptable (they collapse in the schema-merge or get fixed in code); no cross-check drops
 // anyone's finding.
-import { buildChatParts, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
+import { buildChatParts, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { extractChatJsonParts } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
@@ -17,9 +17,22 @@ import { gateLiveSubmission } from "./poster.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
 
-// Rough char→token ratio for this transport's prompts (English + code + diff markers). Only used to
-// route auto mode; the real budget lives in max_tokens.
-const CHARS_PER_TOKEN = 3.5;
+// Rough char→token ratio for this transport's prompts (English + code + diff markers), shared with the
+// prompt builder's local budget (chat-prompt.ts). Routes auto mode and drives the loop's context cap.
+const CHARS_PER_TOKEN = LOCAL_CHARS_PER_TOKEN;
+
+// Share of the loop's context cap a group's FIRST request may take. The rest is room for the tool
+// reads the loop exists for (one 400-line file_read is ~4-5K tokens): a first request at the cap
+// would be forced final before it read anything.
+export const LOCAL_TOOL_HEADROOM_SHARE = 0.25;
+
+/** Tokens a group's first request (system + user message) may take: the loop's context cap (or the
+ * single-turn cap when that is smaller or the loop cap is off) less the tool-read headroom. */
+export function localFirstTurnBudgetTokens(settings: Pick<BotSettings, "localReviewSingleTurnMaxTokens">, ctxCapTokens: number): number {
+  const caps = [ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
+  const cap = caps.length ? Math.min(...caps) : 0;
+  return cap > 0 ? Math.floor(cap * (1 - LOCAL_TOOL_HEADROOM_SHARE)) : 0;
+}
 
 // Which local path to run. "auto" keeps a small PR on the faster, higher-recall single-turn pass and
 // routes a large one to the grouped loop — where the whole diff would not fit one completion window
@@ -193,8 +206,15 @@ const SYSTEM = [
   "You are Ashlar, an automated code reviewer called through an API. When you are done, reply with the raw review JSON object only — no markdown fences, no prose. Ignore any mention of a browser mode in the instructions below; use the API output rule.",
   "You have tools: file_read reads ANY file at the PR head — not only the changed files, but also an unchanged module that defines an imported helper, entity, or enum. file_read_diff shows other changed files' diffs; code_search scans what you have read. Use them to CONFIRM every suspected defect before reporting; do not guess about code you have not read.",
   "When a finding depends on how an imported symbol behaves — e.g. whether an expiry/boundary is inclusive, what unit a value carries, or what a helper returns — resolve its import path and file_read its definition before you report OR dismiss the finding. Do not assume a convention; verify it against the definition.",
-  "If a file genuinely cannot be fetched (file_read returns NOT_IN_SNAPSHOT), that is not itself a defect: report the suspected defect anyway and name the unverified dependency in evidence so a downstream agent confirms it.",
+  // 2026-11: grouped-loop findings that said "unverified" / "not in the reviewed group" were false
+  // positives; the code they guessed about was one file_read away. Unproven is not reportable.
+  "If a file genuinely cannot be fetched (file_read returns NOT_IN_SNAPSHOT), its absence is not a defect, and a defect that depends on it is unproven: do not report it — list it in assumptions.",
+  "The other changed files of this PR are part of the same change and readable with file_read and file_read_diff: never report something as unverified or as \"not in the reviewed group\" — read it, or leave it out.",
 ].join("\n");
+
+const LOOP_TOOL_RULE =
+  "Do not search the web, use DeepSearch, browse URLs, fetch GitHub/npm/CVE/docs, or load skills. You DO have local tools — file_read, file_read_diff, code_search — use them to read the changed files and the helpers they call before reporting. The attachments are a starting point, not the only source. If context is still missing, list it in assumptions.";
+const LOOP_DONE_LINE = "When finished, call task_done and return the final review JSON object only.";
 
 const FORCE_FINAL_MSG =
   "Tool access has ended. Using only what you have read, return the final review JSON object now (raw JSON only).";
@@ -220,13 +240,22 @@ async function reviewGroup(
 ): Promise<GroupReview> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
+  const others = sample.changedPaths.filter((p) => !groupSet.has(p));
+  const groupBlock = `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files of this PR (the same change; read them with file_read_diff or file_read before any claim about them): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`;
+  // The first request (system + this user message) must leave the loop room to read files: the
+  // context sections are fitted to localFirstTurnBudgetTokens, counting everything the loop adds.
+  const firstTurnChars = Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * CHARS_PER_TOKEN);
+  const overheadChars = SYSTEM.length + (LOOP_TOOL_RULE.length - REVIEW_OFFLINE_RULE.length) + groupBlock.length + LOOP_DONE_LINE.length + 4;
+  // The PR description comes from sub.body (the whole snapshot body, bounded in buildChatParts); changed
+  // docs and call sites are read across the whole PR, so a group sees the doc a sibling group's file edits.
   const built = buildChatParts({
     sample: sub,
     extra: deps.extra ?? "",
-    untrustedBody: sample.body ?? "",
     contextMaxChars: Math.min(settings.promptContextMaxChars, t.groupContextMaxChars),
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
+    prChangedPaths: sample.changedPaths,
+    ...(firstTurnChars > 0 ? { localBudget: { maxChars: firstTurnChars, overheadChars, shrinkContext: true, toolReads: true } } : {}),
   });
   const attachments = built.files;
   // buildChatParts embeds REVIEW_OFFLINE_RULE, which forbids tool use ("do not call tools, open extra
@@ -234,18 +263,9 @@ async function reviewGroup(
   // loop, whose whole point is to read files/helpers with tools. Swap that one line for a tool-
   // permitting rule that still bans web/DeepSearch/URL/skills, so a model obeying the user message
   // uses the tools instead of reviewing only the initial attachment.
-  const instructions = built.prompt.replace(
-    REVIEW_OFFLINE_RULE,
-    "Do not search the web, use DeepSearch, browse URLs, fetch GitHub/npm/CVE/docs, or load skills. You DO have local tools — file_read, file_read_diff, code_search — use them to read the changed files and the helpers they call before reporting. The attachments are a starting point, not the only source. If context is still missing, list it in assumptions.",
-  );
-  const others = sample.changedPaths.filter((p) => !groupSet.has(p));
+  const instructions = built.prompt.replace(REVIEW_OFFLINE_RULE, LOOP_TOOL_RULE);
   const attachText = attachments.map((f) => `<<<ATTACH:${f.name}>>>\n${f.body}\n<<<END_ATTACH>>>`).join("\n\n");
-  const userParts = [
-    instructions,
-    attachText,
-    `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files (read with file_read_diff if a cross-file contract matters): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`,
-    "When finished, call task_done and return the final review JSON object only.",
-  ];
+  const userParts = [instructions, attachText, groupBlock, LOOP_DONE_LINE];
 
   // Tool backends: changed-file content comes from the head snapshot already fetched; other paths
   // fall back to readFileAtHead when the host provides it. No new PR fetch here.
@@ -255,6 +275,7 @@ async function reviewGroup(
     ...sample.files.map((f) => [f.path, f.content] as const),
     ...(sample.referenceFiles ?? []).map((f) => [f.path, f.content] as const),
   ]);
+  // (A changed policy doc is in `files` at HEAD too; its BASE text, the policy, is basePolicyFiles.)
   const patches = patchesByPath(sample.diff);
   async function readAtHead(path: string): Promise<string | null> {
     if (cache.has(path)) return cache.get(path) as string;
@@ -265,7 +286,7 @@ async function reviewGroup(
   async function runTool(name: string, a: Record<string, unknown>): Promise<string> {
     if (name === "file_read") {
       const text = await readAtHead(String(a.file_path || ""));
-      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} could not be fetched (check the repo-relative path, or it may exceed the size/fetch limit). Cite it as an unverified dependency in evidence; its absence is not itself a defect.`;
+      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} could not be fetched (check the repo-relative path, or it may exceed the size/fetch limit). Its absence is not itself a defect, and a defect that depends on it is unproven: list it in assumptions, not findings.`;
       const lines = text.split("\n");
       const s = Math.max(1, Number(a.start_line) || 1);
       const e = Math.min(lines.length, Number(a.end_line) || lines.length, s + 399);
@@ -468,8 +489,12 @@ function groupReviewValid(raw: string, groupPaths: string[], sample: SamplePr, s
   // Validate against THIS group's subset (a finding in another group's file must not count here) and
   // with publishMinSeverity forced to P2 (a group that found only lower-severity issues still did
   // review them — the publish threshold governs posting, not whether the group was reviewed).
+  // The finding gate (finding-gate.ts) is off here: whether a group was reviewed is a shape question,
+  // and its precision decisions are made once, on the merged leg, against the full snapshot (harbor
+  // gateLeg). Gating here would mark a group whose findings the gate drops as failed and post its reply
+  // verbatim instead.
   const subset = subsetSample(sample, new Set(groupPaths));
-  const gate = gateLiveSubmission(parseChatSubmission(raw), subset, { ...settings, publishMinSeverity: "P2" });
+  const gate = gateLiveSubmission(parseChatSubmission(raw), subset, { ...settings, publishMinSeverity: "P2", findingGate: "off" });
   return gate.ok === true && (gate.findings.length > 0 || gate.investigatedSafe.length > 0);
 }
 
@@ -558,6 +583,12 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
   if (sorted.length === 0 && (failedFiles.length > 0 || droppedPaths.length > 0)) {
     finalSafe = [];
   }
+  // The paths no group reviewed, as a structured field the gate carries through (poster
+  // LiveGateResult.unreviewed): when the finding gate leaves nothing to post (the successful groups'
+  // findings all dropped or moved to notes), the partial run must not read as a clean pass
+  // (local-fallback incompleteVerdict). The forced-empty investigated_safe above only covers a merge
+  // with no finding at all, before the gate.
+  const unreviewed = [...new Set([...failedFiles, ...droppedPaths])];
   return JSON.stringify({
     merge_recommendation: sorted.length ? merge : "COMMENT",
     highest_risk: highest,
@@ -565,6 +596,7 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
     assumptions: finalAssumptions,
     findings: sorted,
     coverage: finalCoverage,
+    ...(unreviewed.length ? { unreviewed_paths: unreviewed } : {}),
   });
 }
 

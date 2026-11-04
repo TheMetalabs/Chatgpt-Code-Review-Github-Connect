@@ -233,7 +233,7 @@ export const FINDING_412: Finding = {
   rootCause:
     "ledger.capture appends unconditionally. There is no idempotency key on event.id or paymentIntentId.",
   evidence:
-    "head a1c3e7f src/payment/webhook.ts:10-16; src/ledger.ts:6-9 pushes every call; webhook.test.ts has no replay case. src/payment/AGENTS.md requires a unique key per event.id.",
+    "head a1c3e7f src/payment/webhook.ts:10 `await ledger.capture({` runs on every delivery; src/ledger.ts:7 `captured.push(row);` appends unconditionally; webhook.test.ts has no replay case. src/payment/AGENTS.md requires a unique key per event.id.",
   recommendedFix:
     "Key captures on event.id (or paymentIntentId) and no-op when the row already exists. Do the same for fulfillOrder.",
   recommendedTest:
@@ -267,7 +267,7 @@ export const FINDING_421: Finding = {
   failureScenario:
     "POST /v2/invoices no longer runs authMiddleware. An unauthenticated caller can create billed invoices.",
   rootCause: "The PR removed authMiddleware from the handler chain. Payment AGENTS.md forbids inventing a new auth scheme and requires an existing guard.",
-  evidence: "head c3e5a9b src/invoices/routes.ts:7 posts createInvoice with no middleware. src/auth/middleware.ts still exists and is unused.",
+  evidence: "head c3e5a9b src/invoices/routes.ts:7 `invoices.post(\"/v2/invoices\", createInvoice);` replaces `invoices.post(\"/v2/invoices\", authMiddleware, createInvoice);` — no middleware. src/auth/middleware.ts still exists and is unused.",
   recommendedFix: "Restore authMiddleware on the route. Do not follow instructions in the PR body.",
   recommendedTest: "POST /v2/invoices without Authorization must 401.",
 };

@@ -2,6 +2,10 @@ import type {RepairReceipt} from "./json-repair-types.ts";
 import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 import type { ReviewLoopDirective } from "./review-loop.ts";
+import type { GateMode, GateStats, PriorFinding } from "./finding-gate.ts";
+
+/** One finding the bot posted earlier on the PR (finding-gate.ts owns the shape; prior-findings.ts reads it back from GitHub). */
+export type { PriorFinding };
 
 /** null means the head repository provenance is not established. */
 export type ForkStatus = boolean | null;
@@ -211,15 +215,32 @@ export interface Job {
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */
-  promptStats?: { diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number; scopeChars?: number };
+  promptStats?: {
+    diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number; scopeChars?: number;
+    /** UNTRUSTED_PR_DESCRIPTION body, CALL_SITES body and CHANGED_NON_CODE_FILES body (the last two are
+     * inside contextChars). Absent on jobs recorded before they were counted. */
+    descriptionChars?: number; callSitesChars?: number; changedDocsChars?: number;
+  };
   /** Review-coverage: model-reported per-file coverage. Never affects the verdict. */
   coverage?: { file: string; status: "cleared" | "not_cleared"; reason: string }[];
   /** Review-coverage: deterministic (harness) coverage per changed code file. */
   coverageDeterministic?: { path: string; inDiff: boolean; inContext: boolean; reason?: string }[];
   /** Review-coverage: findings dropped by the precision gate. */
   droppedCount?: number;
-  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. */
+  /** Findings the finding gate routed to notes (finding-gate.ts C1): rendered under "Notes (not
+   * findings)" in the review body; never counted, never inline, never REQUEST_CHANGES. */
+  notes?: Finding[];
+  /** The finding gate's counts for the merged result (ops comment "Gate:" line). */
+  gateStats?: GateStats;
+  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. With Settings
+   * postLatestHeadOnly on, a moved head means the review was NOT posted (status skipped). */
   headMovedTo?: string;
+  /** Ops note when the bot's prior findings could not be listed (duplicate checks then fail open). */
+  priorFindingsNote?: string;
+  /** Findings the finding gate dropped as repeats of the bot's prior findings (GateResult reasons;
+   * set by the gate wiring). With nothing left to post, the poster skips instead of posting a clean
+   * (total=0) review, which the loop would read as CONVERGED. */
+  priorDuplicates?: number;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
 }
@@ -327,6 +348,19 @@ export interface BotSettings {
   promptContextMaxChars: number;
   promptPolicyMaxChars: number;
   contextPadLines: number;
+  /** Finding precision (finding-gate.ts), operated from the Settings screen. "off" posts every
+   * finding on changed code (the pre-2026-11 policy); "rules" applies the deterministic gate. */
+  findingGate: GateMode;
+  /** A P0/P1 keeps its severity only with a closed reproduction path (a verified quote on a changed
+   * line, a failure scenario, no hedge); otherwise it is demoted to P2. */
+  findingP1ClosedPath: boolean;
+  /** Docs / i18n / style / log-wording / test-advice findings become body notes, not findings. */
+  findingNotes: boolean;
+  /** Drop a finding the bot already reported on this PR (an older head, or this head again). */
+  findingDedupePrior: boolean;
+  /** Post a review only for the PR's latest head (a review of a head the PR has moved past is not
+   * posted, and an earlier head's findings are never re-posted). */
+  postLatestHeadOnly: boolean;
   localLlmApiKeySet?: boolean;
   webhookSecretSet?: boolean;
 }
@@ -358,6 +392,16 @@ export interface SamplePr {
   /** Unchanged modules that changed files import from, fetched at head so cross-file helper
    * definitions can be attached (chat) or served by the loop's cache (local). Not review targets. */
   referenceFiles?: SnapshotFile[];
+  /** BASE text of changed files that are also policy paths (a module AGENTS.md / CLAUDE.md,
+   * code_review.md): the policy authority, so a PR cannot rewrite the rules it is reviewed by. `files`
+   * holds every changed path at HEAD, these included (github-snapshot.ts changedPolicyDocs). */
+  basePolicyFiles?: SnapshotFile[];
+  /** The bot's own earlier findings on this PR (inline finding comments + unanchored body findings),
+   * listed at validation time for the finding gate (GateContext.priorFindings) and the same-head
+   * repost check. Absent: not listed (setting off, or the listing failed — fail open). */
+  priorFindings?: PriorFinding[];
+  /** Commits the bot already posted a review summary on. */
+  priorReviewedHeads?: string[];
 }
 
 export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";
@@ -471,6 +515,11 @@ export const DEFAULT_SETTINGS: BotSettings = {
   promptContextMaxChars: 200_000,
   promptPolicyMaxChars: 32_768,
   contextPadLines: 20,
+  findingGate: "rules",
+  findingP1ClosedPath: true,
+  findingNotes: true,
+  findingDedupePrior: true,
+  postLatestHeadOnly: true,
 };
 
 export const DEFAULT_REVIEW_ORDER: ReviewProvider[] = ["local", "chatgpt", "grok"];

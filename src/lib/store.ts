@@ -266,6 +266,11 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       chatgptReasoning: next.chatgptReasoning,
       grokReasoning: next.grokReasoning,
       fixAgent: next.fixAgent,
+      findingGate: next.findingGate,
+      findingP1ClosedPath: next.findingP1ClosedPath,
+      findingNotes: next.findingNotes,
+      findingDedupePrior: next.findingDedupePrior,
+      postLatestHeadOnly: next.postLatestHeadOnly,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;

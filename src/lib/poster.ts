@@ -2,6 +2,7 @@ import type { BotSettings, Finding, Job, MergeRec, PostedComment, PostedReview, 
 import { SAMPLE_PRS } from "./samples.ts";
 import { inlineFindingComment, reviewSummaryBody } from "./review-format.ts";
 import { commentableRightLines, resolveLineFromSnippet, rightSideLines, snapToCommentableLine, type RightLine } from "./review-diff.ts";
+import { gateFindings, mergeGateStats, summarizeGate, type GateContext, type GateResult, type GateStats, type PriorFinding } from "./finding-gate.ts";
 
 export const SEVERITY_RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2 };
 
@@ -71,12 +72,25 @@ export function mergeEvent(findings: Finding[], settings: BotSettings): MergeRec
 /**
  * Split findings into inline comments vs `unanchored` (surfaced in the review body).
  *
- * A finding on the PR's changed code is NEVER dropped — the model reviewed that code, so a found
- * issue must reach the review and let the fixing agent judge it (recall over precision, owner
- * policy 2026-09-18). It is shown inline only when high-confidence AND anchorable (not a hedge
- * under `precisionOverRecall`, its line maps to a commentable diff line, under the inline cap); a
- * hedge, an un-anchorable line (e.g. a line past the end of the file), or cap overflow is surfaced
- * in the review body (`unanchored`) instead of being discarded.
+ * Precision contract (amends the 2026-09-18 "recall over precision" owner policy, 2026-11-04):
+ * findings reach this partition only after the finding gate (finding-gate.ts, applied by
+ * gateLiveSubmission per the Settings "Finding precision" section). With `findingGate` = "rules" a
+ * finding on changed code CAN be dropped: when it repeats one the bot already reported on
+ * this PR (`findingDedupePrior`; prior findings are listed for every review except a /review-loop
+ * step, which must see an unresolved finding again), retracts itself, claims a file this PR changes was not changed, is
+ * contradicted by the same reply's own coverage / investigated_safe, rests on an admitted-unverified
+ * premise (or hedges without a verified quote on a changed line), or quotes no code that exists at
+ * the reviewed head. Docs / i18n / style / log-wording / test-advice findings become notes
+ * (`findingNotes`: rendered in the body, never counted, never inline, never REQUEST_CHANGES), and a
+ * P0/P1 without a closed reproduction path is demoted to P2 (`findingP1ClosedPath`). Every gate drop
+ * is recorded with its reason (LiveGateResult.dropped, "gate:<reason> ...") and counted in the ops
+ * comment; the gate never rewrites a finding's text. With `findingGate` = "off" the old policy holds:
+ * a finding on changed code is never dropped.
+ *
+ * What this partition does with a finding that passed the gate is unchanged: it is shown inline only
+ * when high-confidence AND anchorable (not a hedge under `precisionOverRecall`, its line maps to a
+ * commentable diff line, under the inline cap); a hedge, an un-anchorable line (e.g. a line past the
+ * end of the file), or cap overflow is surfaced in the review body (`unanchored`) instead.
  *
  * Excluded (not surfaced): a finding whose file is NOT one the PR changed — a PR review only speaks
  * to the PR's own changed code, and surfacing an off-scope / hallucinated file would let noise block
@@ -97,7 +111,8 @@ export function partitionFindings(
   for (const f of ranked) {
     if (!inChangedPaths(sample, f.file)) continue;
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[settings.publishMinSeverity]) continue;
-    // A hedge stays out of the inline comments but is still surfaced in the body — never dropped.
+    // A hedge that passed the finding gate stays out of the inline comments but is still surfaced in
+    // the body: the gate, not this partition, decides drops.
     const inlineWorthy = !(settings.precisionOverRecall && isHedge(f));
     const anchored = inlineWorthy && inline.length < cap ? anchorInline(f, sample, commentable, rightLines) : null;
     if (anchored) inline.push(anchored);
@@ -199,7 +214,9 @@ export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], 
   };
 }
 
-function asFinding(row: unknown, i: number): Finding | null {
+/** One reviewer JSON finding row as a Finding (snake_case or camelCase keys), or null when a required
+ * field is missing. Exported for the offline precision eval (scripts/eval-finding-precision.mjs). */
+export function asFinding(row: unknown, i: number): Finding | null {
   if (!row || typeof row !== "object") return null;
   const f = row as Record<string, unknown>;
   const title = String(f.title ?? "").trim();
@@ -254,7 +271,75 @@ export type LiveGateResult = {
   // Verbatim reply preserved when it was not parseable review JSON and local repair was off.
   // Surfaced in the review body so the fixing agent can interpret it (never dropped).
   rawReview?: string;
+  /** Findings the finding gate routed to notes (docs / i18n / style / log wording / test advice):
+   * rendered under "Notes (not findings)" in the review body, never counted in the ashlar-findings
+   * marker, never inline, never REQUEST_CHANGES. */
+  notes?: Finding[];
+  /** The finding gate's counts for this result (ops comment "Gate:" line). Absent when the gate is off. */
+  gateStats?: GateStats;
+  /** Changed paths the leg never reviewed: a grouped local run's failed groups and paths with no usable
+   * diff (local-review-loop mergeGroupResults `unreviewed_paths`). Such a result with no finding left
+   * after the gate is not a complete verdict (local-fallback incompleteVerdict), never a clean pass. */
+  unreviewed?: string[];
 };
+
+/** Optional inputs to the finding gate that the snapshot does not carry. */
+export type FindingGateExtras = {
+  /** The bot's earlier findings on this PR (other heads, or an earlier review of this head). */
+  priorFindings?: PriorFinding[];
+  /** More files at the reviewed head (path → content) the leg read beyond the snapshot — the local
+   * loop's file_read reads. The snapshot's own copy wins for a path in both. */
+  headFiles?: ReadonlyMap<string, string>;
+};
+
+const stringList = (v: unknown, max: number, cut: number) =>
+  Array.isArray(v) ? (v as unknown[]).map((x) => String(x ?? "").slice(0, cut)).filter((x) => x.trim()).slice(0, max) : [];
+
+/** The finding gate's view of one reply: the head snapshot (changed + reference files), the diff, the
+ * PR body, and the reply's own assumptions / investigated_safe / coverage. */
+export function findingGateContext(snapshot: SamplePr, submitted: Record<string, unknown> | null, extras?: FindingGateExtras): GateContext {
+  const headFiles = new Map<string, string>();
+  for (const f of [...(snapshot.files ?? []), ...(snapshot.referenceFiles ?? [])]) {
+    if (f?.path && typeof f.content === "string" && !headFiles.has(f.path)) headFiles.set(f.path, f.content);
+  }
+  for (const [path, content] of extras?.headFiles ?? []) {
+    if (path && typeof content === "string" && !headFiles.has(path)) headFiles.set(path, content);
+  }
+  return {
+    headFiles,
+    changedPaths: snapshot.changedPaths ?? [],
+    diff: snapshot.diff ?? "",
+    prBody: snapshot.body,
+    assumptions: stringList(submitted?.assumptions, 40, 600),
+    investigatedSafe: stringList(submitted?.investigated_safe, 40, 600),
+    coverage: parseCoverage(submitted?.coverage).map((c) => ({ path: c.file, reason: c.reason, status: c.status })),
+    priorFindings: extras?.priorFindings ?? snapshot.priorFindings,
+    headSha: snapshot.headSha,
+  };
+}
+
+/** Apply the finding gate the live settings select (Settings: "Finding precision"). A settings object
+ * without `findingGate` (a hand-built one) gates nothing. */
+export function applyFindingGate(
+  findings: Finding[],
+  snapshot: SamplePr,
+  settings: BotSettings,
+  submitted: Record<string, unknown> | null,
+  extras?: FindingGateExtras,
+): GateResult {
+  return gateFindings(findings, findingGateContext(snapshot, submitted, extras), {
+    mode: settings.findingGate ?? "off",
+    p1ClosedPath: settings.findingP1ClosedPath !== false,
+    notes: settings.findingNotes !== false,
+    dedupePrior: settings.findingDedupePrior !== false,
+  });
+}
+
+/** Mark a gated note with its category (Finding.dropReason "note:<category>"): metadata only, the
+ * finding's text is never changed. */
+function asNote(f: Finding, reason: string | undefined): Finding {
+  return { ...f, dropReason: reason && reason.startsWith("note:") ? reason : "note" };
+}
 
 /** Lenient parse of the optional `coverage` array. Never fails the review. */
 function parseCoverage(raw: unknown): ModelCoverage[] {
@@ -277,6 +362,7 @@ export function gateLiveSubmission(
   submitted: Record<string, unknown> | null,
   snapshot: SamplePr,
   settings: BotSettings,
+  extras?: FindingGateExtras,
 ): LiveGateResult | { ok: false; reason: string } {
   if (!submitted) return { ok: false, reason: "submit_findings missing or invalid JSON" };
   const raw = Array.isArray(submitted.findings) ? submitted.findings : [];
@@ -293,8 +379,15 @@ export function gateLiveSubmission(
     }
     parsed.push(f);
   });
-  const { inline, unanchored } = partitionFindings(parsed, settings, snapshot);
+  // The finding gate runs on every parsed finding before the publish partition: it drops, demotes or
+  // routes to notes (finding-gate.ts), never rewrites. Mode "off" is the identity.
+  const gated = applyFindingGate(parsed, snapshot, settings, submitted, extras);
+  const gateOn = (settings.findingGate ?? "off") !== "off";
+  const { inline, unanchored } = partitionFindings(gated.kept, settings, snapshot);
   const findings = [...inline, ...unanchored];
+  const noteReason = new Map(gated.decisions.filter((d) => d.action === "note").map((d) => [d.finding.id, d.reasons[0]]));
+  const notes = gated.notes.filter((f) => inChangedPaths(snapshot, f.file)).map((f) => asNote(f, noteReason.get(f.id)));
+  for (const d of gated.dropped) dropped.push(`gate:${d.reasons[0]} ${d.finding.file}:${d.finding.line} (${d.finding.title})`);
   // A salvaged reply carries its verbatim text here (parse failed + local repair off). It is a
   // real review to surface, not an Instant-tier skip, so it bypasses the empty-findings guard.
   const rawReview = typeof submitted.raw_review === "string" ? submitted.raw_review.trim().slice(0, 60_000) : "";
@@ -307,10 +400,12 @@ export function gateLiveSubmission(
       return { ok: false, reason: "empty findings without investigated_safe — Instant-tier skip, not a review" };
     }
   }
-  const keptIds = new Set(findings.map((f) => f.id));
+  const keptIds = new Set([...findings, ...notes].map((f) => f.id));
+  const gatedIds = new Set(gated.dropped.map((d) => d.finding.id));
   for (const f of parsed) {
-    if (!keptIds.has(f.id)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
+    if (!keptIds.has(f.id) && !gatedIds.has(f.id)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
   }
+  const unreviewed = stringList(submitted.unreviewed_paths, 200, 400);
   const claimed = submitted.merge_recommendation;
   if (claimed === "APPROVE" && findings.length > 0) {
     dropped.push("APPROVE coerced — remaining findings cannot approve");
@@ -332,6 +427,9 @@ export function gateLiveSubmission(
     malformed,
     overflow,
     rawReview: rawReview || undefined,
+    notes: notes.length ? notes : undefined,
+    gateStats: gateOn ? summarizeGate(gated) : undefined,
+    ...(unreviewed.length ? { unreviewed } : {}),
   };
 }
 
@@ -461,6 +559,8 @@ export function finalizeFp(
     investigatedSafe?: string[];
     assumptions?: string[];
     dropped?: string[];
+    notes?: Finding[];
+    gateStats?: GateStats;
   },
   settings: BotSettings,
 ): LiveGateResult {
@@ -474,7 +574,22 @@ export function finalizeFp(
     investigatedSafe: pending.investigatedSafe ?? [],
     assumptions: pending.assumptions ?? [],
     dropped: pending.dropped ?? [],
+    ...(pending.notes?.length ? { notes: pending.notes } : {}),
+    ...(pending.gateStats ? { gateStats: pending.gateStats } : {}),
   };
+}
+
+/** Notes from several reviewers, one per file + title (the same note from two reviewers shows once). */
+function mergeNotes(rows: ProviderGate[]): Finding[] {
+  const seen = new Set<string>();
+  const out: Finding[] = [];
+  for (const f of rows.flatMap((r) => r.gate.notes ?? [])) {
+    const key = `${f.file}|${titleKey(f.title)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
+  }
+  return out;
 }
 
 export function applyPeerReview(
@@ -577,6 +692,8 @@ export function schemaMergeProviderGates(
       investigatedSafe: [...new Set(rows.flatMap((r) => r.gate.investigatedSafe))].slice(0, 8),
       assumptions: [SCHEMA_MERGE_NOTE, ...rows.flatMap((r) => r.gate.assumptions)].filter(Boolean).slice(0, 12),
       dropped: rows.flatMap((r) => r.gate.dropped).slice(0, 8),
+      notes: mergeNotes(rows),
+      gateStats: mergeGateStats(rows.map((r) => r.gate.gateStats)),
     },
     settings,
   );

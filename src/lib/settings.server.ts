@@ -24,6 +24,7 @@ import {
 } from "./types.ts";
 import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
+import { normalizeGateMode } from "./finding-gate.ts";
 
 function envStr(key: string): string | undefined {
   const v = process.env[key];
@@ -138,8 +139,26 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   }
   const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
   if (contextPad !== undefined) o.contextPadLines = contextPad;
+  // Finding precision: env SEEDS these only until the operator saves Settings — a saved value wins at
+  // load (diskFindingPrecisionWins). The Settings screen is their source of truth.
+  const findingGate = envStr("ASHLAR_FINDING_GATE");
+  if (findingGate) o.findingGate = findingGate;
+  for (const [key, env] of FINDING_PRECISION_FLAGS) {
+    const v = envFlag(env);
+    if (v !== undefined) o[key] = v;
+  }
   return o;
 }
+
+/** Finding-precision booleans and the env var that seeds each (before the first save) and mirrors it. */
+const FINDING_PRECISION_FLAGS = [
+  ["findingP1ClosedPath", "ASHLAR_FINDING_P1_CLOSED_PATH"],
+  ["findingNotes", "ASHLAR_FINDING_NOTES"],
+  ["findingDedupePrior", "ASHLAR_FINDING_DEDUPE_PRIOR"],
+  ["postLatestHeadOnly", "ASHLAR_POST_LATEST_HEAD_ONLY"],
+] as const satisfies readonly (readonly [keyof BotSettings, string])[];
+
+const FINDING_PRECISION_FIELDS = ["findingGate", ...FINDING_PRECISION_FLAGS.map(([key]) => key)] as const;
 
 export function botSettingsToEnv(s: BotSettings): Record<string, string> {
   return {
@@ -176,6 +195,11 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
     ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
     ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
+    ASHLAR_FINDING_GATE: s.findingGate,
+    ASHLAR_FINDING_P1_CLOSED_PATH: String(s.findingP1ClosedPath),
+    ASHLAR_FINDING_NOTES: String(s.findingNotes),
+    ASHLAR_FINDING_DEDUPE_PRIOR: String(s.findingDedupePrior),
+    ASHLAR_POST_LATEST_HEAD_ONLY: String(s.postLatestHeadOnly),
     // fixAgent is deliberately NOT mirrored (no field of it): the settings JSON is its only
     // durable store, and a saved fixAgent wins over env at load (diskFixAgentWins). An env
     // ASHLAR_FIX_* var only seeds a field that was never saved; no env var can switch the loop on.
@@ -277,6 +301,12 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     promptContextMaxChars: intField(p, "promptContextMaxChars"),
     promptPolicyMaxChars: intField(p, "promptPolicyMaxChars"),
     contextPadLines: intField(p, "contextPadLines"),
+    // A stored "refute" (an earlier build's toggle that behaved exactly like "rules") reads as "rules".
+    findingGate: normalizeGateMode(p.findingGate, DEFAULT_SETTINGS.findingGate),
+    findingP1ClosedPath: bool(p.findingP1ClosedPath, DEFAULT_SETTINGS.findingP1ClosedPath),
+    findingNotes: bool(p.findingNotes, DEFAULT_SETTINGS.findingNotes),
+    findingDedupePrior: bool(p.findingDedupePrior, DEFAULT_SETTINGS.findingDedupePrior),
+    postLatestHeadOnly: bool(p.postLatestHeadOnly, DEFAULT_SETTINGS.postLatestHeadOnly),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;
@@ -353,10 +383,19 @@ export function diskFixAgentWins(disk: Record<string, unknown>, merged: Record<s
   return { ...merged, fixAgent: { ...seeded, ...(saved as Record<string, unknown>) } };
 }
 
+/** A saved finding-precision value wins over its env seed: the Settings screen operates the gate. */
+export function diskFindingPrecisionWins(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...merged };
+  for (const key of FINDING_PRECISION_FIELDS) {
+    if (disk[key] !== undefined) out[key] = disk[key];
+  }
+  return out;
+}
+
 export function loadBotSettings(): BotSettings {
   loadDotenvFile();
   const disk = readDiskSettings();
-  return sanitizeBotSettings(diskFixAgentWins(disk, diskReviewerFlagsWin(disk, overlayEnv(disk))));
+  return sanitizeBotSettings(diskFindingPrecisionWins(disk, diskFixAgentWins(disk, diskReviewerFlagsWin(disk, overlayEnv(disk)))));
 }
 
 /**

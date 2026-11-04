@@ -15,8 +15,9 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listPullReviews, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { collectPriorFindings, dedupePriorOn, postLatestHeadOnlyOn, sameHeadRepost, sameSha, type PriorFindingsResult } from "./prior-findings";
+import { bridgePromptText, buildChatParts, buildLocalChatPrompt, chatPromptText, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, splitChatAttachments, type PromptSections } from "./chat-prompt";
 import { truncatedReviewField } from "./extract-chat-json";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
@@ -26,12 +27,14 @@ import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.s
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
+import { gateStatsLine } from "./finding-gate";
 import {
   buildReview,
   partitionPublishable,
   gateLiveSubmission,
   isBotMention,
   schemaMergeProviderGates,
+  type FindingGateExtras,
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
@@ -40,7 +43,7 @@ import { auxiliaryFailed, outcomeNote, reviewOutcome, salvagedReview, skippedNot
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { AuxiliaryProviderFailure, BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { AuxiliaryProviderFailure, BotSettings, Finding, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -88,6 +91,15 @@ const localQueued = new Map<string, { arm: (reset: boolean) => void; clear: () =
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
 const localSamples = new Map<string, SamplePr>();
+// In-memory only: files the local multi-turn loop read at the reviewed head beyond the snapshot
+// (its file_read tool, via makeHeadReader), path → content. The finding gate verifies the local leg's
+// quotes against these too: a quote from a helper the loop read is real head code, not a fabrication.
+// Kept until the job is terminal (the merge gates the local leg after the leg itself has finished).
+const localHeadReads = new Map<string, Map<string, string>>();
+// In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
+// the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
+// (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
+const localSinglePrompts = new Map<string, { chatPrompt: string; build: (budgetTokens: number, shrinkContext: boolean) => string }>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -263,7 +275,12 @@ function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
  * still in state never aborts local generation. */
 function releaseJob(job: Job, edge: "terminal" | "removed") {
   const stop = edge === "removed" || job.status === "cancelled";
-  if (edge === "removed" || !localInFlight.has(job.id)) localSamples.delete(job.id);
+  if (edge === "removed" || !localInFlight.has(job.id)) {
+    localSamples.delete(job.id);
+    localSinglePrompts.delete(job.id);
+  }
+  // No merge follows a terminal edge: an in-flight leg's later reads are not kept either.
+  localHeadReads.delete(job.id);
   if (!stop) return;
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
@@ -288,7 +305,7 @@ export function hasLocalLegState(jobId: string): boolean {
 
 /** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
 export function orphanedLocalState(): string[] {
-  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
+  const ids = new Set([...localSamples.keys(), ...localSinglePrompts.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
   return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
 }
 
@@ -365,7 +382,7 @@ export function publicSettings(s: BotSettings) {
 // WHY: record attachment sizes + deterministic coverage on the job at the single
 // prompt-assembly point, measured by attachment name so it stays correct as later
 // PRs change the snapshot/policy attachments. Never affects the verdict.
-function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
+function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr, sections?: PromptSections) {
   const parts = splitChatAttachments(prompt);
   const body = (name: string) => parts.files.find((f) => f.name === name)?.body ?? "";
   const diffBody = body("ashlar-diff.patch");
@@ -384,7 +401,11 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     contextChars: contextBody.length,
     policyChars: policyBody.length,
     // The PR body's scope section the review carried (chat-prompt.ts PR_SCOPE_RULE), 0 when none.
-    scopeChars: /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
+    scopeChars: sections?.scopeChars ?? /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
+    // The context sections the 2026-11 precision work added (chat-prompt.ts), counted as built.
+    descriptionChars: sections?.descriptionChars ?? 0,
+    callSitesChars: sections?.callSitesChars ?? 0,
+    changedDocsChars: sections?.changedDocsChars ?? 0,
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };
@@ -854,7 +875,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
   }
   const live1 = current();
   if (!live1 || live1.status === "cancelled") return;
-  const prompt = buildChatPrompt({
+  const promptOpts = {
     sample,
     extra,
     untrustedBody,
@@ -862,8 +883,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
     contextMaxChars: state.settings.promptContextMaxChars,
     contextPadLines: state.settings.contextPadLines,
     policyMaxChars: state.settings.promptPolicyMaxChars,
-  });
-  recordReviewCoverage(jobId, prompt, sample);
+  };
+  const chatParts = buildChatParts(promptOpts);
+  const prompt = chatPromptText(chatParts);
+  recordReviewCoverage(jobId, prompt, sample, chatParts.sections);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
   // Pinned once here like reviewProviders: a later settings change never alters a review in flight.
@@ -907,6 +930,11 @@ async function playGithub(jobId: string, untrustedBody: string) {
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
     localSamples.set(jobId, sample);
+    localSinglePrompts.set(jobId, {
+      chatPrompt: prompt,
+      build: (budgetTokens, shrinkContext) =>
+        buildLocalChatPrompt({ ...promptOpts, localBudget: { maxChars: Math.floor(budgetTokens * LOCAL_CHARS_PER_TOKEN), shrinkContext } }),
+    });
     // verify-clean: no local generation now; submitHarborChat starts it only after a clean chat result.
     if (!verifier) void kickLocalRace(jobId, prompt);
   }
@@ -1018,6 +1046,8 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
   if (!job || job.origin !== "github" || job.installationId == null || !job.headSha) return undefined;
   const { owner, repo, headSha, installationId } = job;
   const cache = new Map<string, string | null>();
+  const reads = new Map<string, string>();
+  localHeadReads.set(job.id, reads);
   let tokenPromise: Promise<string> | null = null;
   let fetched = 0;
   return async (path: string): Promise<string | null> => {
@@ -1028,6 +1058,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
       tokenPromise ??= installationToken(installationId);
       const content = await getFile(await tokenPromise, owner, repo, path, headSha);
       cache.set(path, content);
+      if (typeof content === "string" && localHeadReads.get(job.id) === reads) reads.set(path, content);
       return content;
     } catch {
       cache.set(path, null); // a failed fetch is cached as absent so one bad path is not retried
@@ -1049,7 +1080,14 @@ async function generateLocalLeg(
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
-  const mode = chooseLocalReviewMode(state.settings.localReviewMode, prompt.length, state.settings.localReviewSingleTurnMaxTokens);
+  // The single-turn prompt is the chat review fitted to the local budget (the chat prompt itself when it
+  // already fits); auto mode routes by that fitted size, measured as the local model reads it.
+  const configured = state.settings.localReviewMode;
+  const singleMax = state.settings.localReviewSingleTurnMaxTokens;
+  const local = localSinglePrompts.get(jobId);
+  const ownPrompt = local && local.chatPrompt.trim() === prompt.trim() ? local : undefined;
+  const fitted = ownPrompt ? ownPrompt.build(singleMax, false) : bridgePromptText(prompt);
+  const mode = chooseLocalReviewMode(configured, fitted.length, singleMax);
   if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
@@ -1087,7 +1125,11 @@ async function generateLocalLeg(
   if (mode === "multiturn") {
     return { ok: false, error: "local skipped: no snapshot for multiturn and prompt too large for single-turn" };
   }
-  return runLocalLlm(prompt, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
+  // A forced single-turn also cuts the code context to the budget (auto only gets here when it fits).
+  const single = ownPrompt && configured === "single" && Math.ceil(fitted.length / LOCAL_CHARS_PER_TOKEN) > singleMax
+    ? ownPrompt.build(singleMax, true)
+    : fitted;
+  return runLocalLlm(single, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
 }
 
 /** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
@@ -1204,6 +1246,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);
+    localSinglePrompts.delete(jobId);
     localActivity.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);
@@ -1345,6 +1388,24 @@ export async function submitHarborChat(
   }
   // Snapshot succeeded: token is defined for the rest of this validation.
   if (!token) return revert("missing installation token");
+  // The bot's own earlier findings on this PR (D: no re-posting), listed at gate time so the finding
+  // gate (GateContext.priorFindings) and the poster's same-head check see every review posted up to
+  // now. Fail open: a listing failure drops the duplicate checks, never the review. A loop-driven
+  // review (/review-loop) is exempt: the loop's fix rounds read each head's own findings marker, so a
+  // finding the last fix did not resolve must post again on the new head rather than vanish as a repeat.
+  if ((dedupePriorOn(state.settings) || postLatestHeadOnlyOn(state.settings)) && job.thread?.loop?.kind !== "start") {
+    const prior = await loadPriorFindings(token, job);
+    if ("error" in prior) {
+      const note = `Prior findings could not be listed (${prior.error.slice(0, 80)}) — no duplicate check`;
+      transitionJob(jobId, (j) => ({ ...j, priorFindingsNote: note }));
+    } else {
+      sample = { ...sample, priorFindings: prior.findings, priorReviewedHeads: prior.reviewedHeads };
+      transitionJob(jobId, (j) => (j.priorFindingsNote ? { ...j, priorFindingsNote: undefined } : j));
+    }
+    const cur = state.jobs.find((j) => j.id === jobId);
+    if (!cur || cur.status === "cancelled") return { ok: false, error: "cancelled" };
+    if (!ownsValidatorGeneration(cur, validatorGeneration)) return { ok: false, error: "stale validator" };
+  }
 
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
@@ -1363,16 +1424,21 @@ export async function submitHarborChat(
   // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
   const configuredCanonicalProvider = providers.find(isChatProvider);
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(configuredCanonicalProvider && provider !== configuredCanonicalProvider && isChatProvider(provider));
+  // The local leg's quotes also verify against the files its loop read at this head.
+  const legGateExtras = (leg: ChatLeg): FindingGateExtras | undefined => {
+    const reads = leg.provider === "local" ? localHeadReads.get(job.id) : undefined;
+    return reads?.size ? { headFiles: reads } : undefined;
+  };
   const preserveSchemaRejectedEvidence = (leg: ChatLeg) =>
     !job.localVerifyStartedAt && !job.localFallbackAt && isAuxiliaryChat(leg.provider);
   const first = payloads.map((leg) => ({
     leg,
-    ...gateLeg(leg, sample, heldLocal && leg.provider === "local", preserveSchemaRejectedEvidence(leg)),
+    ...gateLeg(leg, sample, heldLocal && leg.provider === "local", preserveSchemaRejectedEvidence(leg), legGateExtras(leg)),
   }));
   const posts = first.some((g) => g.gate.ok);
   for (const g of first) {
     const { leg, gate, verdict, unusable, cause, coverageCut: cutReply } = !g.gate.ok && posts
-      ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg)) }
+      ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg), legGateExtras(g.leg)) }
       : g;
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
     if (unusable && leg.provider === "local") localUnusable = unusable;
@@ -1642,6 +1708,13 @@ export async function submitHarborChat(
       auxiliaryProviderFailures: auxiliaryFailures,
       coverage: [...coverageByFile.values()],
       droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
+      // Gate notes render in the body only (never counted, inline, or REQUEST_CHANGES); the gate's
+      // counts go to the ops comment.
+      notes: merged.notes?.length ? merged.notes : undefined,
+      gateStats: merged.gateStats,
+      // Findings the gate dropped as repeats of the bot's prior findings: with nothing left to post,
+      // finishJob skips instead of posting a clean (total=0) review the loop would read as CONVERGED.
+      priorDuplicates: merged.gateStats?.reasons?.already_reported || undefined,
       plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}${cutLegs.length ? `; no finding in the complete verdict of ${cutLegs.join(" + ")}, reply posted as coverage evidence` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,
@@ -1669,6 +1742,7 @@ function gateLeg(
   sample: SamplePr,
   rejectedEvidence: boolean,
   preserveSchemaRejectedEvidence = false,
+  extras?: FindingGateExtras,
 ): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause; coverageCut?: string } {
   const parsed = parseChatSubmission(leg.raw);
   // A reply cut off after its verdict with no finding (extract-chat-json recoverTruncatedReviewJson).
@@ -1684,7 +1758,7 @@ function gateLeg(
     // reply cut in investigated_safe, assumptions, a later field, or a half-written key stays incomplete.
     const cutText = leg.originalText?.trim() || leg.raw;
     if (parsed.merge_recommendation !== "REQUEST_CHANGES" && Array.isArray(parsed.findings) && truncatedReviewField(cutText) === "coverage") {
-      const gate = gateLiveSubmission(parsed, sample, state.settings);
+      const gate = gateLiveSubmission(parsed, sample, state.settings, extras);
       if (gate.ok && !gate.rawReview && !gate.findings.length && !gate.malformed && !gate.overflow) {
         return { gate, verdict: true, coverageCut: cutText };
       }
@@ -1692,13 +1766,13 @@ function gateLeg(
     // Otherwise never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.
     const evidence = verdictEvidence(parsed, { ...leg, raw: leg.originalText?.trim() || leg.raw });
     return {
-      gate: gateLiveSubmission(evidence, sample, state.settings),
+      gate: gateLiveSubmission(evidence, sample, state.settings, extras),
       verdict: false,
       unusable: "the reply was cut off before it finished (coverage incomplete)",
       cause: "truncated",
     };
   }
-  const gate = gateLiveSubmission(parsed, sample, state.settings);
+  const gate = gateLiveSubmission(parsed, sample, state.settings, extras);
   if (gate.ok && gate.rawReview) {
     // The bridge wraps schema-rejected chat JSON in a raw_review envelope when repair is off. The
     // envelope itself is parseable, but the original reply is still a rejected reviewer verdict:
@@ -1708,7 +1782,7 @@ function gateLeg(
       const source = parseChatSubmission(original);
       if (source) {
         const evidence = verdictEvidence(source, { ...leg, raw: original });
-        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings);
+        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings, extras);
         return { gate: evidenceGate, verdict: false, unusable: "reply failed the review schema", cause: "not-a-verdict" };
       }
     }
@@ -1718,7 +1792,7 @@ function gateLeg(
   if (!unusable) return { gate, verdict: gate.ok };
   if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };
   const cause: RawCause = unusable === gateUnreadRows(gate) ? "unread-rows" : "not-a-verdict";
-  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings), verdict: false, unusable, cause };
+  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings, extras), verdict: false, unusable, cause };
 }
 
 type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };
@@ -1792,6 +1866,39 @@ function finishResult(jobId: string): { ok: true } | { ok: false; error: string 
   return { ok: true };
 }
 
+/** The bot's own earlier findings and reviewed heads on the job's PR (prior-findings.ts), or why
+ * they could not be listed. Never throws. */
+async function loadPriorFindings(token: string, job: Pick<Job, "owner" | "repo" | "pr">): Promise<PriorFindingsResult | { error: string }> {
+  try {
+    const [comments, reviews] = await Promise.all([
+      listReviewComments(token, job.owner, job.repo, job.pr),
+      listPullReviews(token, job.owner, job.repo, job.pr),
+    ]);
+    return collectPriorFindings({ comments, reviews, botLogin: ashlarBotLogin() });
+  } catch (e) {
+    return { error: formatGithubError(e) };
+  }
+}
+
+/**
+ * D4 — nothing new to post: the review would only repeat what the bot already posted. Either the
+ * finding gate dropped every finding as a repeat of a prior one (Job.priorDuplicates) — posting the
+ * empty remainder would read as a clean pass (total=0, the loop's CONVERGED) although those findings
+ * still stand — or the bot already reviewed this exact head and every finding repeats one it posted
+ * there (Settings findingDedupePrior). A verbatim salvaged reply always posts (it is evidence, not a
+ * structured finding), and a loop-driven review keeps its same-head verdict (the loop needs one).
+ * Returns the commit of the review that already says it, or undefined to post.
+ */
+function noNewFindingsSince(job: Job, findings: Finding[], sample: SamplePr | undefined, settings: BotSettings): string | undefined {
+  if (job.rawReview) return undefined;
+  const heads = sample?.priorReviewedHeads ?? [];
+  if (!findings.length && (job.priorDuplicates ?? 0) > 0) {
+    return heads[0] ?? sample?.priorFindings?.find((f) => f.commitId)?.commitId ?? "an earlier head";
+  }
+  if (!dedupePriorOn(settings) || job.thread?.loop?.kind === "start" || !sample?.priorFindings) return undefined;
+  return sameHeadRepost(findings, { findings: sample.priorFindings, reviewedHeads: heads }, job.headSha) ? job.headSha : undefined;
+}
+
 async function finishJob(jobId: string, sample: SamplePr | undefined, token?: string) {
   const after = state.jobs.find((j) => j.id === jobId);
   if (!after || after.status === "cancelled" || after.status === "posted") return;
@@ -1799,6 +1906,22 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const policy = state.settings;
   const { inline, unanchored } = partitionPublishable(after, policy, sample);
   const review = buildReview(after, inline, unanchored, policy);
+
+  const since = review && token && after.origin === "github" ? noNewFindingsSince(after, [...inline, ...unanchored], sample, policy) : undefined;
+  if (since) {
+    const at = since.length >= 7 ? since.slice(0, 7) : since;
+    transitionJob(jobId, (j) => ({
+      ...j,
+      status: "skipped",
+      skipReason: `poster: no new findings since the review on ${at}`,
+      mergeRecommendation: undefined,
+      postedReviewId: undefined,
+      updatedAt: Date.now(),
+    }));
+    if (token) void reactQuiet(token, after, "+1");
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", `No new findings since the review on ${at} — review not posted.`].filter(Boolean));
+    return;
+  }
 
   if (!review) {
     transitionJob(jobId, (j) => ({
@@ -1810,7 +1933,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       updatedAt: Date.now(),
     }));
     if (token) void reactQuiet(token, after, "+1");
-    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted."].filter(Boolean));
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted.", after.gateStats ? gateStatsLine(after.gateStats) : ""].filter(Boolean));
     return;
   }
 
@@ -1820,9 +1943,44 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   let githubError: string | undefined;
   let postedToGithub = false;
   let inlineDropped = false;
+  // Settings postLatestHeadOnly, read live: the head is checked immediately before posting, so a
+  // review of a head the PR has moved past is never posted (a job can wait hours in the local queue).
+  const latestHeadOnly = postLatestHeadOnlyOn(policy);
+  let headCheckNote: string | undefined;
   if (token && after.origin === "github") {
     const still = state.jobs.find((j) => j.id === jobId);
     if (!still || still.status === "cancelled" || still.status === "posted") return;
+    if (latestHeadOnly) {
+      let liveHead: string | undefined;
+      try {
+        liveHead = (await fetchPullHead(token, after.owner, after.repo, after.pr)).headSha;
+      } catch (e) {
+        // Fail open: an unreadable head posts on the reviewed head, as before this check existed.
+        headCheckNote = `HEAD check before posting failed (${formatGithubError(e).slice(0, 80)}) — posted on the reviewed head`;
+      }
+      const cur = state.jobs.find((j) => j.id === jobId);
+      if (!cur || cur.status === "cancelled" || cur.status === "posted") return;
+      if (liveHead && !sameSha(liveHead, after.headSha)) {
+        const old = after.headSha.slice(0, 7);
+        const moved = liveHead.slice(0, 7);
+        // Skipped, never posted: no findings marker reaches GitHub, so the loop cannot read this as
+        // clean (CONVERGED) and no fix round starts on a stale head.
+        transitionJob(jobId, (j) => ({
+          ...j,
+          status: "skipped",
+          skipReason: `stale head: reviewed ${old}, HEAD moved to ${moved} — review not posted`,
+          headMovedTo: liveHead,
+          mergeRecommendation: undefined,
+          postedReviewId: undefined,
+          updatedAt: Date.now(),
+        }));
+        void upsertOpsComment(token, jobId, "skipped", [
+          after.localVerifyNote ?? "",
+          `Reviewed ${old}, but HEAD moved to ${moved} — review not posted (request /review again).`,
+        ].filter(Boolean));
+        return;
+      }
+    }
     try {
       const posted = await createPullReview(token, {
         owner: review.owner,
@@ -1877,7 +2035,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;
-  if (token && after.origin === "github") {
+  // With postLatestHeadOnly off the review posts whatever the head; the move is only noted after.
+  if (token && after.origin === "github" && !latestHeadOnly) {
     try {
       const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
       if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
@@ -1891,6 +2050,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
+  if (headCheckNote) notes.push(headCheckNote);
+  if (postedJob.priorFindingsNote) notes.push(postedJob.priorFindingsNote);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
   // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
   // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
@@ -2193,7 +2354,7 @@ export function ingestGitHubWebhook(opts: {
   deliveryId: string;
   event: string;
   payload: unknown;
-}): HarborFireResult & { pong?: boolean; ignored?: string; cancelled?: string[] } {
+}): HarborFireResult & { pong?: boolean; ignored?: string; cancelled?: string[]; superseding?: string[] } {
   const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings, { botLogin: ashlarBotLogin() });
   const t0 = performance.now();
 
@@ -2292,7 +2453,14 @@ export function ingestGitHubWebhook(opts: {
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }
 
+  // A redelivered push (a delivery id already accepted) is a duplicate: it supersedes nothing again.
+  const redelivered = acceptedDeliveryIds(state.events).includes(opts.deliveryId);
   applyLoopControl(parsed, opts.deliveryId);
+  // D — a pushed head supersedes reviews of the old head. The push itself never starts an LLM review
+  // (the explicit-request rule in ingress stays); it only ends work whose result could not be posted.
+  const superseding = parsed.trigger === "pull_request.synchronize" && !redelivered
+    ? supersedeStaleHeadJobs(parsed.target, { eventAt: parsed.eventAt, installationId: parsed.installationId })
+    : [];
 
   const ingressMs = Math.max(8, performance.now() - t0);
   const decision = decideIngress({
@@ -2305,7 +2473,7 @@ export function ingestGitHubWebhook(opts: {
     knownDeliveries: acceptedDeliveryIds(state.events),
     thread: parsed.thread,
   });
-  return enqueueFromDecision(decision, {
+  const result = enqueueFromDecision(decision, {
     deliveryId: opts.deliveryId,
     trigger: parsed.trigger,
     sample: parsed.target,
@@ -2318,6 +2486,56 @@ export function ingestGitHubWebhook(opts: {
     hmac: "ok",
     untrustedBody: parsed.untrustedBody,
   });
+  return superseding.length ? { ...result, superseding } : result;
+}
+
+/**
+ * Settings postLatestHeadOnly: a push (pull_request.synchronize) cancels the PR's live review jobs
+ * pinned to another head — their review could only be skipped at the pre-post head check, so they
+ * would hold a reviewer and the local queue for nothing. A job still resolving its head (headSha "",
+ * a comment trigger) resolves the pushed head and is kept, as is one already posting (its own pre-post
+ * head check decides). Cancellation goes through transitionJob, which aborts a local leg and writes
+ * the terminal ops comment ("Cancelled: superseded … No review posted.").
+ *
+ * A push event can arrive late or out of order (GitHub retries, a redelivery): an older head's push
+ * must never cancel the review of the current head. So only a job created before the push
+ * (pull_request.updated_at) is a candidate, and the candidates are cancelled only after the live PR
+ * head is confirmed to BE the pushed sha (fetchPullHead). Fail-open: no installation, a head read that
+ * fails, or a live head other than the pushed one cancels nothing — the pre-post head check still
+ * keeps a stale review from posting. Returns the candidate job ids (cancelled asynchronously).
+ */
+function supersedeStaleHeadJobs(
+  target: { owner: string; repo: string; pr: number; headSha: string },
+  push: { eventAt?: string; installationId?: number },
+): string[] {
+  if (!postLatestHeadOnlyOn(state.settings) || !target.headSha || push.installationId === undefined) return [];
+  const pushedAt = push.eventAt ? Date.parse(push.eventAt) : NaN;
+  const short = target.headSha.slice(0, 7);
+  const isStale = (j: Job) => j.owner === target.owner && j.repo === target.repo && j.pr === target.pr &&
+    isLive(j.status) && j.status !== "posting" && Boolean(j.headSha) && !sameSha(j.headSha, target.headSha) &&
+    (!Number.isFinite(pushedAt) || j.createdAt < pushedAt);
+  const candidates = state.jobs.filter(isStale).map((j) => j.id);
+  if (!candidates.length) return [];
+  const installationId = push.installationId;
+  void (async () => {
+    let liveHead: string;
+    try {
+      liveHead = (await fetchPullHead(await installationToken(installationId), target.owner, target.repo, target.pr)).headSha;
+    } catch (e) {
+      console.warn(`[harbor] push ${target.owner}/${target.repo}#${target.pr} → ${short}: live head unreadable, nothing superseded (${formatGithubError(e)})`);
+      return;
+    }
+    if (!sameSha(liveHead, target.headSha)) return; // an older (late or redelivered) push: the PR moved on
+    for (const id of candidates) {
+      const cur = state.jobs.find((j) => j.id === id);
+      if (!cur || !isStale(cur)) continue;
+      cancelLocalJsonRepairs("superseded", id);
+      transitionJob(id, (c) => (isStale(c)
+        ? { ...c, status: "cancelled", skipReason: `superseded: HEAD moved to ${short} (push) — request /review again`, headMovedTo: target.headSha, updatedAt: Date.now() }
+        : c));
+    }
+  })();
+  return candidates;
 }
 
 // Boot, once per process: hand off the fix rounds a restart cut — sessions left at FIXING with

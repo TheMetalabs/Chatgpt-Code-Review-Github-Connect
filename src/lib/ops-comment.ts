@@ -1,4 +1,5 @@
 import { describeEnabledReviewers, PROVIDER_LABEL, type AuxiliaryProviderFailure, type Job, type LocalReviewRole, type ReviewProvider, type Trigger } from "./types.ts";
+import { gateStatsLine } from "./finding-gate.ts";
 
 export type OpsPhase = "running" | "blocked" | "posted" | "skipped" | "failed";
 
@@ -65,12 +66,14 @@ const MAX_NOTES = 8;
 // WHY: cc_merge.py COVERAGE_RE parses this line from the posted comment to gate merges; a cut
 // line hid files from the gate (#77 job 989: ~7 of 42). Keep the literal format byte-identical.
 const COVERAGE_MODEL_PREFIX = "Coverage (model): not_cleared = ";
+// The gate line lists every drop reason (bounded by the fixed reason set), so it is never cut.
+const GATE_PREFIX = "Gate: ";
 
 // WHY: make the "review posted" comment show what the reviewer actually saw —
 // reviewed sha (+ whether HEAD moved), prompt sizes, deterministic + model
 // coverage, and precision-dropped count. Pure/read-only; never affects the verdict.
 export function reviewPostedNotes(
-  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount">,
+  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount"> & Partial<Pick<Job, "gateStats">>,
   returnedFindings: number,
   unanchoredInBody = 0,
 ): string[] {
@@ -80,7 +83,10 @@ export function reviewPostedNotes(
   notes.push(`Reviewed ${sha}${moved}`);
   const ps = job.promptStats;
   if (ps) {
-    notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars, policy ${ps.policyChars} chars`);
+    // The call-site and changed-docs sections ride inside the context attachment; the description is in the prompt.
+    const inContext = [ps.callSitesChars ? `call sites ${ps.callSitesChars}` : "", ps.changedDocsChars ? `changed docs ${ps.changedDocsChars}` : ""].filter(Boolean);
+    const description = ps.descriptionChars ? `, PR description ${ps.descriptionChars} chars` : "";
+    notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars${inContext.length ? ` (${inContext.join(", ")})` : ""}, policy ${ps.policyChars} chars${description}`);
   }
   const det = job.coverageDeterministic ?? [];
   if (det.length) {
@@ -96,5 +102,7 @@ export function reviewPostedNotes(
   if (typeof job.droppedCount === "number") {
     notes.push(`Findings: ${returnedFindings} returned${unanchoredInBody ? ` (${unanchoredInBody} in body — no inline anchor)` : ""}, ${job.droppedCount} dropped by precision policy`);
   }
-  return notes.map((n) => (n.startsWith(COVERAGE_MODEL_PREFIX) ? n : n.slice(0, NOTE_MAX_CHARS))).slice(0, MAX_NOTES);
+  // The finding gate's per-reason counts (finding-gate.ts): what it kept, routed to notes, and dropped.
+  if (job.gateStats) notes.push(gateStatsLine(job.gateStats));
+  return notes.map((n) => (n.startsWith(COVERAGE_MODEL_PREFIX) || n.startsWith(GATE_PREFIX) ? n : n.slice(0, NOTE_MAX_CHARS))).slice(0, MAX_NOTES);
 }

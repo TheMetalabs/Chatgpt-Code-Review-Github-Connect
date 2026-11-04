@@ -2,9 +2,9 @@ import { createPrivateKey } from "node:crypto";
 import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
-import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { changedPolicyDocs, isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
-import { isReviewLineError } from "./review-diff";
+import { isReviewLineError, SNAPSHOT_DIFF_SEP, snapshotDiffBlock } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import {
   GithubTransportError,
@@ -603,8 +603,19 @@ export async function fetchPullSnapshot(
   const policyPaths = policyPathsFor(changedPaths);
   const toFetch = [...new Set([...changedPaths, ...policyPaths])];
   const files: SnapshotFile[] = [];
+  // A changed policy doc (the PR edits a module AGENTS.md/CLAUDE.md) is read twice: its BASE text stays
+  // the policy authority (basePolicyFiles — a PR cannot rewrite the rules it is reviewed by), and its
+  // HEAD text is the changed file like any other, so the reviewer sees what the PR documents (a finding
+  // "X is not documented" while the PR documents X was a measured false positive) and a fix edits the
+  // PR's text, never its base.
+  const changedPolicy = new Set(changedPolicyDocs(changedPaths, policyPaths));
+  const basePolicyFiles: SnapshotFile[] = [];
   for (const path of toFetch) {
-    const ref = snapshotFileRef(path, policyPaths, target.baseSha, target.headSha);
+    if (changedPolicy.has(path)) {
+      const base = await getFile(token, target.owner, target.repo, path, target.baseSha);
+      if (base != null && !isSandboxPolicyFile(base)) basePolicyFiles.push({ path, content: base, language: langFor(path) });
+    }
+    const ref = changedPolicy.has(path) ? target.headSha : snapshotFileRef(path, policyPaths, target.baseSha, target.headSha);
     const content = await getFile(token, target.owner, target.repo, path, ref);
     if (content == null) continue;
     if (isSandboxPolicyFile(content)) continue;
@@ -625,9 +636,9 @@ export async function fetchPullSnapshot(
   );
   const diffBlocks = rows
     .filter((f) => f.filename && changedPaths.includes(f.filename))
-    .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: `--- ${f.filename}\n${f.patch ?? ""}` }));
+    .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: snapshotDiffBlock(f.filename as string, f.patch ?? "") }));
   const budgeted = applyBudget(diffBlocks, opts?.diffMaxChars ?? DEFAULT_SETTINGS.promptDiffMaxChars);
-  const diff = budgeted.kept.map((b) => b.patch).join("\n\n");
+  const diff = budgeted.kept.map((b) => b.patch).join(SNAPSHOT_DIFF_SEP);
   const diffDroppedPaths = budgeted.dropped.map((b) => b.path);
   let body = "";
   try {
@@ -654,6 +665,7 @@ export async function fetchPullSnapshot(
     changedPaths,
     diffDroppedPaths,
     referenceFiles,
+    ...(basePolicyFiles.length ? { basePolicyFiles } : {}),
   };
 }
 

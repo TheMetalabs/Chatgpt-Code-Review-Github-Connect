@@ -104,7 +104,11 @@ export function decideIngress(opts: {
   const skip = reviewSkipReason({ ...opts, deferUnknownFork: true });
   if (skip) return { ok: true, skip };
   // Each explicit request is new work, even at a previously posted/skipped head.
-  // Only redelivery of the same event is suppressed above.
+  // Only redelivery of the same event is suppressed above. Posting is decided later: a review
+  // that only repeats the bot's findings on the same head is not posted again, and a review whose
+  // head moved before posting is skipped (harbor finishJob, Settings findingDedupePrior /
+  // postLatestHeadOnly). A push (synchronize) never queues a review here; harbor only cancels the
+  // live jobs pinned to the old head.
 
   return {
     ok: true,

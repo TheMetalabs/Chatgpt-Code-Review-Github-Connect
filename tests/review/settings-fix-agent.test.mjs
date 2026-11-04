@@ -105,6 +105,11 @@ const TOP_LEVEL = {
   promptContextMaxChars: {bad: ['10', null, -1, 0.5], good: 0},
   promptPolicyMaxChars: {bad: ['10', null, -1, 0.5], good: 999},
   contextPadLines: {bad: ['10', null, -1, 0.5], good: 12},
+  findingGate: {bad: ['strict', 'Rules', '', 1, true, null], good: 'off'},
+  findingP1ClosedPath: {bad: ['true', 1, null], good: false},
+  findingNotes: {bad: ['false', 0, null], good: false},
+  findingDedupePrior: {bad: ['yes', 1, null], good: false},
+  postLatestHeadOnly: {bad: ['true', 0, null], good: false},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {

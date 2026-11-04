@@ -32,9 +32,15 @@ export async function appFixture(options={}, githubOptions={}) {
  server.requestTimeout=0;server.timeout=0;
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  const origin=`http://127.0.0.1:${server.address().port}`;
- const settings={...types.DEFAULT_SETTINGS,reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ // findingGate 'off' by default: these suites pin pipeline mechanics (merge, lifecycle, verify-clean,
+ // raw evidence) with placeholder findings whose evidence quotes no fixture code, which the precision
+ // gate (finding-gate.ts, default 'rules') would rightly drop. A test of the gate itself passes
+ // {findingGate:'rules'} (finding-gate-wiring.test.mjs).
+ const settings={...types.DEFAULT_SETTINGS,findingGate:'off',reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ // The diff is in the shape fetchPullSnapshot builds: compact `--- path` + patch blocks, no git headers.
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
-  changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],diff:'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n'};
+  changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],
+  diff:'--- a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;'};
  const clock={now:Date.now()};class Clock extends Date{static now(){return clock.now;}}
  const context=vm.createContext({console,Buffer,URL,Request,Response,Headers,TextEncoder,TextDecoder,crypto:globalThis.crypto,AbortController,AbortSignal,performance,setTimeout,clearTimeout,Date:Clock,
    process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token',ASHLAR_HISTORY_TOKEN:'fixture-history-token-32-characters-long'}}});
@@ -48,7 +54,7 @@ export async function appFixture(options={}, githubOptions={}) {
     githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=>githubOptions.installationToken?.() ?? 'fixture-not-a-real-token',
     githubWebhookSecret:()=> 'fixture-webhook-secret',
     fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');await githubOptions.beforeHead?.();if(githubOptions.headError)throw githubOptions.headError;return {...sample,draft:false,fork:false,...githubOptions.pull};},
-    fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},
+    fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...githubOptions.snapshot,...target};},
     reactOnDelivery:async(_token,job,content)=>{githubCalls.reactions.push({jobId:job.id,thread:job.thread,content});githubCalls.timeline.push('reaction:'+content);},
     formatGithubError:error=>String(error),
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
@@ -61,6 +67,8 @@ export async function appFixture(options={}, githubOptions={}) {
     getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
     // Prior finding threads for the review prompt (aicc #455): none unless a test supplies rows.
     listReviewComments:async()=>githubOptions.listReviewComments?githubOptions.listReviewComments():[],
+    // The bot's earlier review summaries (prior-findings dedupe, same-head repost check): none unless a test supplies rows.
+    listPullReviews:async()=>githubOptions.listPullReviews?githubOptions.listPullReviews():[],
     // Loop-runtime GitHub calls a test opts into (the runtime loads github.server lazily).
     ...(githubOptions.api||{}),
   }],

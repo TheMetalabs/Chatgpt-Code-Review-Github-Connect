@@ -1,5 +1,111 @@
 /** Right-side line numbers GitHub will accept as pull-review comments. */
 
+/**
+ * One changed file's block of the PR diff exactly as a live snapshot carries it (github.server
+ * fetchPullSnapshot): a `--- <path>` line, then the GitHub patch (hunks only — no `diff --git` or
+ * `+++` header). Blocks are joined with SNAPSHOT_DIFF_SEP. Every diff reader must accept this compact
+ * shape as well as `git diff` output (diffFileBlocks).
+ */
+export function snapshotDiffBlock(path: string, patch: string): string {
+  return `--- ${path}\n${patch}`;
+}
+export const SNAPSHOT_DIFF_SEP = "\n\n";
+
+/** One file of a unified diff: its path (the new side; the old path for a deletion) and its hunk lines
+ * from its first `@@` header on (hunk headers included, file header lines excluded). */
+export type DiffFileBlock = { path: string; lines: string[] };
+
+const HUNK_RE = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
+
+/**
+ * Split a unified diff into its files. Accepts both shapes a SamplePr.diff can have:
+ *   - `git diff` output: `diff --git a/x b/x`, `--- a/x` / `+++ b/x` (or /dev/null), then hunks;
+ *   - the live snapshot's compact shape (snapshotDiffBlock): `--- x` then hunks, no `+++` line. The
+ *     path is taken verbatim (a real path may begin with `a/`).
+ * A `--- ` line inside a hunk can be a removed line (`-- x` in SQL/Lua): it is read as a file header
+ * only when followed by a `+++ ` line (git), or when followed by a hunk header (or nothing: a file
+ * with no patch) while the current hunk's line counts are used up or a blank line precedes it (the
+ * separator between snapshot blocks; a hunk line is never empty).
+ */
+export function diffFileBlocks(diff: string): DiffFileBlock[] {
+  const lines = String(diff ?? "").replace(/\r\n/g, "\n").split("\n");
+  const out: DiffFileBlock[] = [];
+  let headerOpen = false; // between a file header and the file's first hunk
+  let gitHeader = false; // ...and that header began with `diff --git`
+  let oldLeft = 0;
+  let newLeft = 0;
+  const current = (): DiffFileBlock | undefined => out[out.length - 1];
+  const start = (path: string, git = false) => {
+    out.push({ path, lines: [] });
+    headerOpen = true;
+    gitHeader = git;
+    oldLeft = 0;
+    newLeft = 0;
+  };
+  const clean = (p: string) => p.replace(/\t.*$/, "").trim();
+  const strip = (p: string, prefix: "a/" | "b/") => (p.startsWith(prefix) ? p.slice(2) : p);
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
+    const next = lines[i + 1] ?? "";
+    const git = /^diff --git a\/(.+?) b\/(.+)$/.exec(raw);
+    if (git) {
+      start(clean(git[2]), true);
+      continue;
+    }
+    const cur = current();
+    if (raw.startsWith("--- ")) {
+      const oldPath = clean(raw.slice(4));
+      if (next.startsWith("+++ ")) {
+        // git header pair: the new path names the file; a deletion (+++ /dev/null) keeps the old one.
+        const newPath = clean(next.slice(4));
+        const path = newPath === "/dev/null" ? strip(oldPath, "a/") : strip(newPath, "b/");
+        if (cur && gitHeader && headerOpen) cur.path = path;
+        else start(path);
+        i += 1;
+        continue;
+      }
+      if (gitHeader && headerOpen) continue; // `diff --git` already named the file
+      const boundary = i === 0 || lines[i - 1] === "" || (oldLeft <= 0 && newLeft <= 0);
+      if (oldPath && oldPath !== "/dev/null" && boundary && (HUNK_RE.test(next) || next === "")) {
+        start(oldPath);
+        continue;
+      }
+    }
+    if (raw.startsWith("+++ ") && headerOpen && cur) {
+      const p = clean(raw.slice(4));
+      if (p !== "/dev/null") cur.path = strip(p, "b/");
+      continue;
+    }
+    const hunk = HUNK_RE.exec(raw);
+    if (hunk) {
+      if (!cur) continue;
+      headerOpen = false;
+      gitHeader = false;
+      oldLeft = hunk[1] === undefined ? 1 : Number(hunk[1]);
+      newLeft = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      cur.lines.push(raw);
+      continue;
+    }
+    if (!cur || headerOpen) continue; // git extended headers (index, mode, rename) and stray text
+    const marker = raw[0];
+    if (marker === " ") {
+      oldLeft -= 1;
+      newLeft -= 1;
+    } else if (marker === "-") oldLeft -= 1;
+    else if (marker === "+") newLeft -= 1;
+    else if (marker !== "\\") continue;
+    cur.lines.push(raw);
+  }
+  return out;
+}
+
+/** A diff in the live snapshot's compact shape (snapshotDiffBlock per file), whatever shape it came in. */
+export function toSnapshotDiff(diff: string): string {
+  return diffFileBlocks(diff)
+    .map((b) => snapshotDiffBlock(b.path, b.lines.join("\n")))
+    .join(SNAPSHOT_DIFF_SEP);
+}
+
 /** One RIGHT-side (added or context) diff line: its new-file line number and content (marker stripped). */
 export type RightLine = { line: number; content: string };
 

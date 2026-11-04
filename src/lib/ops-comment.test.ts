@@ -71,10 +71,36 @@ describe("reviewPostedNotes", () => {
     assert.ok(notes.length <= 8);
   });
 
+  it("counts the PR description, call-site and changed-docs sections in the Prompt line", () => {
+    const notes = reviewPostedNotes(
+      {
+        headSha: "abcdef012345",
+        promptStats: { diffChars: 1000, contextChars: 9000, policyChars: 300, diffFilesFull: 3, diffFilesTotal: 3, descriptionChars: 1200, callSitesChars: 800, changedDocsChars: 2500 },
+      },
+      0,
+    );
+    const line = notes.find((n) => n.startsWith("Prompt: ")) ?? "";
+    assert.equal(line, "Prompt: diff 1000 chars (3/3 files full), context 9000 chars (call sites 800, changed docs 2500), policy 300 chars, PR description 1200 chars");
+    // A job recorded before these were counted (or a PR with none of them) keeps the old line.
+    const old = reviewPostedNotes({ headSha: "abcdef012345", promptStats: { diffChars: 1, contextChars: 2, policyChars: 3, diffFilesFull: 1, diffFilesTotal: 1, descriptionChars: 0 } }, 0);
+    assert.ok(old.includes("Prompt: diff 1 chars (1/1 files full), context 2 chars, policy 3 chars"));
+  });
+
   it("notes when HEAD moved and stays minimal without stats", () => {
     const moved = reviewPostedNotes({ headSha: "abcdef012345", headMovedTo: "999888777666" }, 0);
     assert.match(moved[0], /Reviewed abcdef0 \(HEAD moved to 9998887\)/);
     assert.deepEqual(reviewPostedNotes({ headSha: "abcdef012345" }, 0), ["Reviewed abcdef0"]);
+  });
+
+  it("reports the finding gate's counts per reason, uncut", () => {
+    const reasons = { already_reported: 1, self_retracted: 2, contradicted_by_diff: 3, contradicted_by_own_reply: 4, speculative: 5, evidence_unverified: 6, evidence_unavailable: 7, "note:docs": 2 };
+    const notes = reviewPostedNotes({ headSha: "abcdef012345", droppedCount: 28, gateStats: { kept: 3, notes: 2, dropped: 28, demoted: 1, reasons } }, 3);
+    const gate = notes.find((n) => n.startsWith("Gate: "));
+    assert.equal(
+      gate,
+      "Gate: kept 3, notes 2, dropped 28 (already reported 1, self-retracted 2, contradicted by diff 3, contradicted by own reply 4, speculative 5, unverified 6, evidence unavailable 7); 1 demoted to P2 (no closed path)",
+    );
+    assert.equal(reviewPostedNotes({ headSha: "abcdef012345" }, 0).some((n) => n.startsWith("Gate: ")), false, "no gate line when the gate is off");
   });
 
   it("reports an auxiliary reviewer failure while retaining the canonical provider", () => {

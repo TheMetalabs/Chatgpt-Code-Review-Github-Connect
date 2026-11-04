@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   extractEvidenceQuotes,
+  findingPrecisionNote,
   GATE_MODES,
   normalizeGateMode,
   findPriorDuplicate,
@@ -647,5 +648,18 @@ describe("finding gate: reporting", () => {
     const f = mk({ rootCause: "unverified, so this path is safe", recommendedFix: "none" });
     assert.equal(one(f, ctx({ priorFindings: [{ file: f.file, title: f.title }] })).reasons[0], "already_reported");
     assert.equal(one(f).reasons[0], "self_retracted");
+  });
+});
+
+describe("finding gate: Settings copy", () => {
+  it("says the same-head repost skip and latest-head-only still apply with the gate off", () => {
+    const off = findingPrecisionNote({ findingGate: "off", findingDedupePrior: true, postLatestHeadOnly: true });
+    assert.match(off, /^Gate OFF/);
+    assert.match(off, /only repeats findings already posted on this head is still not posted/);
+    assert.match(off, /head the PR has moved past is still not posted/);
+    assert.doesNotMatch(off, /dedupe switches apply only while the gate is on/);
+    const bare = findingPrecisionNote({ findingGate: "off", findingDedupePrior: false, postLatestHeadOnly: false });
+    assert.doesNotMatch(bare, /Even with the gate off/);
+    assert.match(findingPrecisionNote({ findingGate: "rules" }), /^Gate ON \(rules\)/);
   });
 });

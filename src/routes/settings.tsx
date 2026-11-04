@@ -45,7 +45,7 @@ import {
   type ChatgptReasoning,
   type GrokReasoning,
 } from "@/lib/reasoning";
-import { GATE_MODES, type GateMode } from "@/lib/finding-gate";
+import { findingPrecisionNote, GATE_MODES, type GateMode } from "@/lib/finding-gate";
 
 export const Route = createFileRoute("/settings")({ component: Settings });
 
@@ -917,7 +917,6 @@ function GitHubApp({ github }: { github: GithubReady }) {
 /** Finding precision (finding-gate.ts). Every switch here is read from the live settings when a
  * reviewer reply is gated, so a saved change applies to the next review — no restart. */
 function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision; onChange: (p: Partial<FindingPrecision>) => void }) {
-  const on = value.findingGate !== "off";
   return (
     <section aria-label="Finding precision" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">
       <div>
@@ -971,7 +970,9 @@ function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision;
             onChange={(v) => onChange({ findingDedupePrior: v })}
           />
           <p className="mt-2 text-[12px] text-fg-subtle">
-            Same file and a near-identical title or the same quoted code as an earlier Ashlar finding on this PR.
+            Gate on: a finding repeating an earlier Ashlar finding on this PR (same file, and a near-identical title,
+            or a similar title on the same line or quoting the same code) is dropped. Gate on or off: a review that
+            only repeats findings already posted on this head is not posted.
           </p>
         </Field>
         <Field label="finding_precision.post_latest_head_only">
@@ -986,9 +987,7 @@ function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision;
         </Field>
       </div>
       <p className="text-[12px] text-fg-subtle">
-        {on
-          ? `Gate ON (${value.findingGate}). Turn it off to post every finding on changed code as before.`
-          : "Gate OFF: every finding on changed code is posted (recall-first, the pre-2026-11 behaviour). The P1, notes and dedupe switches apply only while the gate is on."}
+        {findingPrecisionNote(value)}
       </p>
     </section>
   );

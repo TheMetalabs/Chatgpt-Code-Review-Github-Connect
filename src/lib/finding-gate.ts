@@ -945,6 +945,22 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   return { finding: f, action: "keep", reasons, severityBefore: before };
 }
 
+// ── Settings copy ─────────────────────────────────────────────────────────────────────────────────
+
+/** The Settings line under "Finding precision": what the gate mode changes and what it does not. The
+ * P1 closed-path, notes and per-finding dedupe rules run only with the gate on; the same-head repost
+ * skip ("skip findings already posted") and "latest head only" are not gate rules and apply either way. */
+export function findingPrecisionNote(s: { findingGate: GateMode; findingDedupePrior?: boolean; postLatestHeadOnly?: boolean }): string {
+  const independent = [
+    s.findingDedupePrior !== false ? "a review that only repeats findings already posted on this head is still not posted" : "",
+    s.postLatestHeadOnly !== false ? "a review of a head the PR has moved past is still not posted" : "",
+  ].filter(Boolean);
+  const tail = independent.length ? ` Even with the gate off, ${independent.join(", and ")}.` : "";
+  return s.findingGate !== "off"
+    ? `Gate ON (${s.findingGate}). Turn it off to post every finding on changed code as before.`
+    : `Gate OFF: every finding on changed code is posted (recall-first, the pre-2026-11 behaviour). The P1 closed-path and notes switches, and dropping single findings already posted, apply only while the gate is on.${tail}`;
+}
+
 // ── reporting ─────────────────────────────────────────────────────────────────────────────────────
 
 /** Gate counts for the ops comment. `reasons` counts primary drop reasons and note categories. */

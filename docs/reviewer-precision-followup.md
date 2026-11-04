@@ -135,5 +135,7 @@ Settings "Finding precision"(`findingGate`, `findingP1ClosedPath`, `findingNotes
   비공개 레포 데이터셋은 레포 밖에서 경로/`ASHLAR_EVAL_FIXTURES` 로만 읽고 결과·본문을 커밋하지 않는다.
 - **남은 갭(모델 refute 패스 또는 입력 컨텍스트로):** 문서화된 의도 설계(아웃박스 재시도용 throw, forward-only
   마이그레이션)가 다른 모듈 문서에만 적힌 경우, 단일 트랜잭션 안의 가짜 경쟁, 사실 오류(코드가 이미 처리하는데
-  "처리 안 함"), "risking/without verifying" 식의 범위 밖 추측. `findingGate=refute` 는 아직 `rules` 와 같다.
+  "처리 안 함"), "risking/without verifying" 식의 범위 밖 추측. 모델 refute 패스는 이 PR 범위 밖이다:
+  `findingGate` 는 `off | rules` 두 값뿐이고, 이전 빌드가 저장한 `refute`(동작이 `rules` 와 같던 토글)는 로드·저장 때
+  `rules` 로 정규화된다(`normalizeGateMode`).
 

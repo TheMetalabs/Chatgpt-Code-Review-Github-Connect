@@ -24,7 +24,7 @@ import {
 } from "./types.ts";
 import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
-import { GATE_MODES, type GateMode } from "./finding-gate.ts";
+import { normalizeGateMode } from "./finding-gate.ts";
 
 function envStr(key: string): string | undefined {
   const v = process.env[key];
@@ -301,7 +301,8 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     promptContextMaxChars: intField(p, "promptContextMaxChars"),
     promptPolicyMaxChars: intField(p, "promptPolicyMaxChars"),
     contextPadLines: intField(p, "contextPadLines"),
-    findingGate: GATE_MODES.includes(p.findingGate as GateMode) ? (p.findingGate as GateMode) : DEFAULT_SETTINGS.findingGate,
+    // A stored "refute" (an earlier build's toggle that behaved exactly like "rules") reads as "rules".
+    findingGate: normalizeGateMode(p.findingGate, DEFAULT_SETTINGS.findingGate),
     findingP1ClosedPath: bool(p.findingP1ClosedPath, DEFAULT_SETTINGS.findingP1ClosedPath),
     findingNotes: bool(p.findingNotes, DEFAULT_SETTINGS.findingNotes),
     findingDedupePrior: bool(p.findingDedupePrior, DEFAULT_SETTINGS.findingDedupePrior),

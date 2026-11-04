@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   extractEvidenceQuotes,
+  GATE_MODES,
+  normalizeGateMode,
   findPriorDuplicate,
   gateFindings,
   gateStatsLine,
@@ -106,9 +108,13 @@ describe("finding gate: mode", () => {
     assert.ok(r.decisions.every((d) => d.action === "keep" && d.reasons.length === 0));
   });
 
-  it("refute applies the same deterministic rules as rules", () => {
-    const f = mk({ rootCause: "The caller is not in the reviewed group, so the guard is unverified." });
-    assert.equal(one(f, ctx(), { ...ON, mode: "refute" }).action, "drop");
+  it("has exactly two modes, and a stored legacy \"refute\" reads as rules", () => {
+    assert.deepEqual([...GATE_MODES], ["off", "rules"]);
+    assert.equal(normalizeGateMode("refute"), "rules");
+    assert.equal(normalizeGateMode("off"), "off");
+    assert.equal(normalizeGateMode("rules"), "rules");
+    assert.equal(normalizeGateMode("strict"), "rules");
+    assert.equal(normalizeGateMode(undefined, "off"), "off");
   });
 
   it("keeps a concrete finding whose quote sits on a changed line, at P1", () => {

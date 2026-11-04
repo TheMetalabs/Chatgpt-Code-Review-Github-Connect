@@ -389,7 +389,9 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   promptContextMaxChars: int("promptContextMaxChars"),
   promptPolicyMaxChars: int("promptPolicyMaxChars"),
   contextPadLines: int("contextPadLines"),
-  findingGate: oneOf("finding_precision.gate", GATE_MODES),
+  // "refute" is the legacy value of an earlier build (it behaved like "rules"): an older Settings tab
+  // may still send it, and sanitizeBotSettings saves it as "rules" (normalizeGateMode).
+  findingGate: (v) => (v === "refute" ? null : oneOf("finding_precision.gate", GATE_MODES)(v)),
   findingP1ClosedPath: bool("finding_precision.p1_closed_path"),
   findingNotes: bool("finding_precision.notes"),
   findingDedupePrior: bool("finding_precision.dedupe_prior"),

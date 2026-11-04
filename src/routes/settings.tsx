@@ -52,7 +52,6 @@ export const Route = createFileRoute("/settings")({ component: Settings });
 const GATE_MODE_LABEL: Record<GateMode, string> = {
   off: "off — post every finding on changed code (이전 동작)",
   rules: "rules — deterministic precision gate (기본)",
-  refute: "refute — rules + model refute pass when wired",
 };
 
 /** The finding-precision fields the section edits (types.ts BotSettings, validated by settings-rules). */

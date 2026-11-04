@@ -74,8 +74,8 @@ export function mergeEvent(findings: Finding[], settings: BotSettings): MergeRec
  *
  * Precision contract (amends the 2026-09-18 "recall over precision" owner policy, 2026-11-04):
  * findings reach this partition only after the finding gate (finding-gate.ts, applied by
- * gateLiveSubmission per the Settings "Finding precision" section). With `findingGate` = "rules" or
- * "refute" a finding on changed code CAN be dropped: when it repeats one the bot already reported on
+ * gateLiveSubmission per the Settings "Finding precision" section). With `findingGate` = "rules" a
+ * finding on changed code CAN be dropped: when it repeats one the bot already reported on
  * this PR (`findingDedupePrior`; prior findings are listed for every review except a /review-loop
  * step, which must see an unresolved finding again), retracts itself, claims a file this PR changes was not changed, is
  * contradicted by the same reply's own coverage / investigated_safe, rests on an admitted-unverified

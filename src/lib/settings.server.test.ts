@@ -187,10 +187,14 @@ describe("sanitizeBotSettings", () => {
       ["off", false, false, false, false],
     );
     // the single validator: a save with a wrong-typed value is rejected, never coerced
-    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, findingGate: "strict" }) ?? "", /finding_precision\.gate must be one of: off, rules, refute/);
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, findingGate: "strict" }) ?? "", /finding_precision\.gate must be one of: off, rules$/);
     assert.match(settingsProblem({ ...DEFAULT_SETTINGS, findingNotes: "true" }) ?? "", /finding_precision\.notes must be true or false/);
     assert.match(settingsProblem({ ...DEFAULT_SETTINGS, postLatestHeadOnly: 1 }) ?? "", /finding_precision\.post_latest_head_only must be true or false/);
+    // "refute" was a mode of an earlier build that behaved exactly like "rules": a stored one (or one an
+    // older Settings tab still sends) is accepted and normalized to "rules", never offered as a mode.
     assert.equal(settingsProblem({ ...DEFAULT_SETTINGS, findingGate: "refute", findingDedupePrior: false }), null);
+    assert.equal(sanitizeBotSettings({ findingGate: "refute" }).findingGate, "rules");
+    assert.equal(sanitizeBotSettings({ ...DEFAULT_SETTINGS, findingGate: "refute" }).findingGate, "rules");
     // env round-trip: mirrored on save, seeds a never-saved value, and loses to a saved one
     const env = botSettingsToEnv(saved);
     assert.equal(env.ASHLAR_FINDING_GATE, "off");

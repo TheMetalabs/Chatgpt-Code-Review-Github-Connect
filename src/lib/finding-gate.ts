@@ -7,8 +7,9 @@
  *   (severity lowered, text unchanged), routed to notes (rendered under "Notes (not findings)" in the
  *   review body: not counted, never inline, never REQUEST_CHANGES), or dropped. Every decision records
  *   its reasons; the first reason is the primary one.
- * - mode "off" is the identity (everything kept, no notes). "refute" applies the same deterministic
- *   rules as "rules" (the model refute pass is a separate later stage).
+ * - mode "off" is the identity (everything kept, no notes); "rules" applies the deterministic rules.
+ *   (A model refute pass is not part of this gate; the "refute" value an earlier build stored is read
+ *   as "rules" — normalizeGateMode.)
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
  *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path.
  * - R1 speculation: an admitted-unverified premise always drops; a modal hedge in the TITLE (the
@@ -24,8 +25,15 @@
  */
 import type { Finding, Severity } from "./types.ts";
 
-export type GateMode = "off" | "rules" | "refute";
-export const GATE_MODES: readonly GateMode[] = ["off", "rules", "refute"];
+export type GateMode = "off" | "rules";
+export const GATE_MODES: readonly GateMode[] = ["off", "rules"];
+
+/** A stored gate mode as a GateMode: "refute" (an earlier build's toggle, which behaved exactly like
+ * "rules") reads as "rules"; anything else unknown is `fallback`. */
+export function normalizeGateMode(v: unknown, fallback: GateMode = "rules"): GateMode {
+  if (v === "refute") return "rules";
+  return GATE_MODES.includes(v as GateMode) ? (v as GateMode) : fallback;
+}
 
 /** One of the bot's earlier findings on this PR (another head, or an earlier review of this head). */
 export interface PriorFinding {

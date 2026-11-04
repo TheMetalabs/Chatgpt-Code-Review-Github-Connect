@@ -344,8 +344,7 @@ export interface BotSettings {
   promptPolicyMaxChars: number;
   contextPadLines: number;
   /** Finding precision (finding-gate.ts), operated from the Settings screen. "off" posts every
-   * finding on changed code (the pre-2026-11 policy); "rules" applies the deterministic gate;
-   * "refute" applies the same rules (a model refute pass, when wired, runs after them). */
+   * finding on changed code (the pre-2026-11 policy); "rules" applies the deterministic gate. */
   findingGate: GateMode;
   /** A P0/P1 keeps its severity only with a closed reproduction path (a verified quote on a changed
    * line, a failure scenario, no hedge); otherwise it is demoted to P2. */

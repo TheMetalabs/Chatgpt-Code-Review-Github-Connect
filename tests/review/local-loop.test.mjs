@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { runLocalReviewLoop, groupChangedFiles, chooseLocalReviewMode } from "../../src/lib/local-review-loop.server.ts";
 import { samplingRequestFields } from "../../src/lib/local-llm.server.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
+import { gateLiveSubmission } from "../../src/lib/poster.ts";
+import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
+import { incompleteVerdict } from "../../src/lib/local-fallback.ts";
 
 const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k" };
 
@@ -423,6 +426,39 @@ test("D2: partial group failure adds not_cleared coverage and forces empty inves
     assert.ok(notCleared, "coverage must have a not_cleared entry for the failed group's file");
     assert.equal(notCleared.file, "src/b.ts");
     assert.ok(merged.assumptions.some(a => /Local review incomplete/.test(a)), "assumptions must note the failure");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("D2b: a partial run whose surviving group reports only a remark the gate notes is never a clean verdict", async () => {
+  // Group 1 (src/a.ts) reports only an i18n remark, which the finding gate routes to notes; group 2
+  // (src/b.ts) throws. Nothing is left to post, but half the change was never reviewed: the merged
+  // result names the unreviewed path and the gated leg is not a complete verdict (so not "clean").
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    let call = 0;
+    const remark = F({ severity: "P2", file: "src/a.ts", line: 2, title: "Hard-coded English text in the error message", failure_scenario: "Korean users read an English message.", root_cause: "The string is not localized.", evidence: "src/a.ts:2 `changed();`", recommended_fix: "Move it to the i18n catalog." });
+    const request = async (_b, _k, path) => {
+      if (path === "models") return { data: [] };
+      call += 1;
+      if (call === 2) throw new Error("group 2 failed");
+      return assistant(JSON.stringify({ merge_recommendation: "COMMENT", findings: [remark], investigated_safe: [], coverage: [] }));
+    };
+    const sample = sampleWith(["src/a.ts", "src/b.ts"]);
+    const out = await runLocalReviewLoop(sample, settings, { request });
+    assert.equal(out.ok, true);
+    assert.deepEqual(JSON.parse(out.raw).unreviewed_paths, ["src/b.ts"]);
+    const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample, { ...settings, findingGate: "rules" });
+    assert.ok(gate.ok, gate.reason);
+    assert.equal(gate.findings.length, 0, "the remark is not a finding");
+    assert.deepEqual(gate.notes?.map((n) => n.dropReason), ["note:i18n"]);
+    assert.deepEqual(gate.unreviewed, ["src/b.ts"]);
+    assert.match(incompleteVerdict(gate, out) ?? "", /1 changed path\(s\) were not reviewed \(src\/b\.ts\) and no finding is left to post/);
+    // A partial run that keeps a finding is still a verdict (its findings post, never "clean").
+    const kept = gateLiveSubmission(parseChatSubmission(out.raw), sample, { ...settings, findingGate: "off" });
+    assert.ok(kept.ok);
+    assert.equal(incompleteVerdict(kept, out), undefined);
   } finally {
     delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
   }

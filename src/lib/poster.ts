@@ -277,6 +277,10 @@ export type LiveGateResult = {
   notes?: Finding[];
   /** The finding gate's counts for this result (ops comment "Gate:" line). Absent when the gate is off. */
   gateStats?: GateStats;
+  /** Changed paths the leg never reviewed: a grouped local run's failed groups and paths with no usable
+   * diff (local-review-loop mergeGroupResults `unreviewed_paths`). Such a result with no finding left
+   * after the gate is not a complete verdict (local-fallback incompleteVerdict), never a clean pass. */
+  unreviewed?: string[];
 };
 
 /** Optional inputs to the finding gate that the snapshot does not carry. */
@@ -401,6 +405,7 @@ export function gateLiveSubmission(
   for (const f of parsed) {
     if (!keptIds.has(f.id) && !gatedIds.has(f.id)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
   }
+  const unreviewed = stringList(submitted.unreviewed_paths, 200, 400);
   const claimed = submitted.merge_recommendation;
   if (claimed === "APPROVE" && findings.length > 0) {
     dropped.push("APPROVE coerced — remaining findings cannot approve");
@@ -424,6 +429,7 @@ export function gateLiveSubmission(
     rawReview: rawReview || undefined,
     notes: notes.length ? notes : undefined,
     gateStats: gateOn ? summarizeGate(gated) : undefined,
+    ...(unreviewed.length ? { unreviewed } : {}),
   };
 }
 

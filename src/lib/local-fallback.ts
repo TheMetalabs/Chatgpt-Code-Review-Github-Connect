@@ -256,9 +256,11 @@ export function canReleaseHeldLocal(
  * chat leg's verdict is the JSON its client submitted; the page capture around it (rendered labels,
  * reasoning summaries, page text) is archived as originalText, never judged here. Every row it
  * reported must have been inspected, too: a finding past the gate's row cap (`overflow`) was set
- * aside unread. A reply the gate rejected is no verdict at all. */
+ * aside unread. Nor may part of the change have gone unreviewed (`unreviewed`: a grouped local run's
+ * failed group) while nothing is left to post: that is a partial run, not a clean one. A reply the
+ * gate rejected is no verdict at all. */
 export function incompleteVerdict(
-  gate: { ok: true; malformed?: number; overflow?: number; rawReview?: string; truncated?: boolean; findings?: readonly unknown[] } | { ok: false; reason: string },
+  gate: { ok: true; malformed?: number; overflow?: number; rawReview?: string; truncated?: boolean; findings?: readonly unknown[]; unreviewed?: readonly string[] } | { ok: false; reason: string },
   leg: { unparsedText?: string; residualReplies?: string },
 ): string | undefined {
   if (!gate.ok) return gate.reason;
@@ -269,6 +271,10 @@ export function incompleteVerdict(
   if (gate.rawReview) return undefined; // already salvaged verbatim
   if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
   if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
+  // A partial run (a grouped local review whose group failed, or a path with no usable diff) with no
+  // finding left after the gate: the groups that ran found nothing postable, the others never ran. Not
+  // a clean result (/review-loop would read it as converged). One that keeps a finding is a verdict.
+  if (gate.unreviewed?.length && !gate.findings?.length) return `${gate.unreviewed.length} changed path(s) were not reviewed (${gate.unreviewed.slice(0, 3).join(", ")}${gate.unreviewed.length > 3 ? ", …" : ""}) and no finding is left to post`;
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
   return gateUnreadRows(gate);
 }

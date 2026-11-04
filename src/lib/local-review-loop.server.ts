@@ -583,6 +583,12 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
   if (sorted.length === 0 && (failedFiles.length > 0 || droppedPaths.length > 0)) {
     finalSafe = [];
   }
+  // The paths no group reviewed, as a structured field the gate carries through (poster
+  // LiveGateResult.unreviewed): when the finding gate leaves nothing to post (the successful groups'
+  // findings all dropped or moved to notes), the partial run must not read as a clean pass
+  // (local-fallback incompleteVerdict). The forced-empty investigated_safe above only covers a merge
+  // with no finding at all, before the gate.
+  const unreviewed = [...new Set([...failedFiles, ...droppedPaths])];
   return JSON.stringify({
     merge_recommendation: sorted.length ? merge : "COMMENT",
     highest_risk: highest,
@@ -590,6 +596,7 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
     assumptions: finalAssumptions,
     findings: sorted,
     coverage: finalCoverage,
+    ...(unreviewed.length ? { unreviewed_paths: unreviewed } : {}),
   });
 }
 

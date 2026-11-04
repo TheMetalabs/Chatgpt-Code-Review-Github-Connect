@@ -195,6 +195,21 @@
       "expect": { "action": "drop", "reason": "speculative" }
     },
     {
+      "id": "speculation-title-hedge",
+      "pattern": "speculation",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "services/billing/refund.ts", "line": 4,
+        "title": "Refund may run twice when the payment call times out",
+        "failure_scenario": "A slow payment provider times out and the client retries the refund.",
+        "root_cause": "refundInvoice calls payments.refund without an idempotency key.",
+        "evidence": "services/billing/refund.ts:4 `await payments.refund(invoice.paymentId, amount);`",
+        "recommended_fix": "Pass an idempotency key.",
+        "recommended_test": "Retry a timed-out refund."
+      },
+      "expect": { "action": "drop", "reason": "speculative" }
+    },
+    {
       "id": "design-intent-outbox-retry",
       "pattern": "design-intent",
       "label": "fp",
@@ -449,6 +464,21 @@
         "recommended_test": "Refund an unknown id."
       },
       "expect": { "action": "keep", "severity": "P2" }
+    },
+    {
+      "id": "valid-single-quoted-evidence",
+      "pattern": "valid",
+      "label": "valid",
+      "finding": {
+        "severity": "P1", "file": "web/src/feed/loader.ts", "line": 7,
+        "title": "A failed page is read as the last page and loading stops",
+        "failure_scenario": "The API fails on page 2; loadAll stops over an unverified empty page and returns a partial feed as if complete.",
+        "root_cause": "loadAll cannot tell 'there are no more rows' from 'the page could not be confirmed', because fetchPage returns [] for both.",
+        "evidence": "web/src/feed/page.ts:3 'return res.ok ? res.items : []' ; loader.ts:7 'if (rows.length === 0) break;'",
+        "recommended_fix": "Throw from fetchPage when the response is not ok.",
+        "recommended_test": "A failing page 2 rejects loadAll."
+      },
+      "expect": { "action": "keep", "severity": "P1" }
     }
   ]
 }

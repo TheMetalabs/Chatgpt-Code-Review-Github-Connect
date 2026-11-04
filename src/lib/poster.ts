@@ -214,7 +214,9 @@ export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], 
   };
 }
 
-function asFinding(row: unknown, i: number): Finding | null {
+/** One reviewer JSON finding row as a Finding (snake_case or camelCase keys), or null when a required
+ * field is missing. Exported for the offline precision eval (scripts/eval-finding-precision.mjs). */
+export function asFinding(row: unknown, i: number): Finding | null {
   if (!row || typeof row !== "object") return null;
   const f = row as Record<string, unknown>;
   const title = String(f.title ?? "").trim();

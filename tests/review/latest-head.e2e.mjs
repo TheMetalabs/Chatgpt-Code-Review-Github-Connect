@@ -18,7 +18,6 @@ const finding = {
 };
 const other = {...finding, title: 'Answer exported as a mutable binding', evidence: 'a.ts:1 `export const answer` is re-exported by name elsewhere'};
 const reply = (...findings) => JSON.stringify({findings, merge_recommendation: findings.length ? 'REQUEST_CHANGES' : 'COMMENT', investigated_safe: ['a.ts: constant only']});
-const clean = reply();
 
 const job = (app, id) => app.harbor.getHarbor().jobs.find((j) => j.id === id);
 async function ready(app, out) {

@@ -11,6 +11,9 @@
  *   rules as "rules" (the model refute pass is a separate later stage).
  * - Rule order: dedupe → R2 self-retraction → R4 diff-contradicted → R5 own-reply contradiction →
  *   R1 speculation → R3 evidence verification → C1 notes routing → C2 P1 closed path.
+ * - R1 speculation: an admitted-unverified premise always drops; a modal hedge in the TITLE (the
+ *   headline claim is only a possibility) always drops; a hedge elsewhere in the claim drops only
+ *   without a verified quote on a changed line.
  * - Rules are general (English + Korean phrasing) and never special-case repository names or texts.
  *
  * WHY: a finding only reached GitHub if every field was filled in. Findings that admit they rest on an
@@ -103,7 +106,10 @@ function stripQuoted(s: string): string {
   return String(s ?? "")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`\n]*`/g, " ")
-    .replace(/"[^"\n]{6,}"/g, " ");
+    .replace(/"[^"\n]{6,}"/g, " ")
+    // Single-quoted code or state ('read could not be confirmed'): the opening quote is never an
+    // apostrophe (no word character before it) and the closing one is not followed by a word character.
+    .replace(/(?<![\w'])'[^'\n]{6,}'(?![\w])/g, " ");
 }
 
 function claimText(f: Finding): string {
@@ -372,6 +378,16 @@ const SECURITY_NOUN = "(?:signatures?|tokens?|jwts?|e-?mails?|addresses|address|
 const CODE_ACTOR = "(?:client|server|browser|caller|user|code|function|handler|service|app|application|system|library|verifier|middleware|module|endpoint|api|it)";
 const KO_SECURITY = "(?:토큰|서명|이메일|사용자|입력|요청|인증서|출처|세션|파일|코드)";
 
+// "an unverified read", "the unverified value": the adjective describes data the CODE handles without
+// checking (a claim about the code), unlike the reviewer's own admission ("the wiring is unverified",
+// "depends on the unverified helper"), which names what the reviewer did not read.
+const REVIEW_OBJECT = "(?:helpers?|dependenc(?:y|ies)|functions?|methods?|modules?|services?|implementations?|callers?|callees?|wiring|code|files?|paths?|behaviou?rs?|contracts?|assumptions?|premises?|claims?|parts?|logic|controllers?|handlers?|definitions?|imports?)";
+function attributiveOnCode(text: string, at: number, m: string): boolean {
+  if (!/\b(?:an?|the|this|that|these|those|any|each|every|its|their)\s+$/i.test(text.slice(Math.max(0, at - 12), at))) return false;
+  const next = /^\s+([A-Za-z][\w-]*)/.exec(text.slice(at + m.length, at + m.length + 40));
+  return Boolean(next) && !new RegExp(`^${REVIEW_OBJECT}$`, "i").test(next![1]);
+}
+
 const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: number, match: string) => boolean }[] = [
   // Reviewer voice only: "the validator didn't check the length" describes the code and is a real claim.
   {
@@ -389,7 +405,8 @@ const STRONG_HEDGES: { re: RegExp; label: string; guard?: (text: string, at: num
     label: "unverified",
     guard: (text, at, m) =>
       new RegExp(`${SECURITY_NOUN}\\s+(?:is\\s+|are\\s+|remains?\\s+|stays?\\s+|was\\s+|were\\s+)?$`, "i").test(text.slice(Math.max(0, at - 30), at)) ||
-      new RegExp(`^[\\s-]+${SECURITY_NOUN}\\b`, "i").test(text.slice(at + m.length, at + m.length + 30)),
+      new RegExp(`^[\\s-]+${SECURITY_NOUN}\\b`, "i").test(text.slice(at + m.length, at + m.length + 30)) ||
+      attributiveOnCode(text, at, m),
   },
   {
     re: /\bnot\s+(?:yet\s+)?(?:verified|confirmed)\b/gi,
@@ -435,6 +452,18 @@ const WEAK_HEDGES: { re: RegExp; label: string }[] = [
   { re: /추정/g, label: "추정" },
   { re: /아마/g, label: "아마" },
 ];
+
+/** A modal hedge (may / might / could / possibly / appears to, and the Korean equivalents). "assumes" and
+ * "if X does not" are left out: in a headline they usually describe the code ("parser assumes UTF-8") or
+ * the trigger of a real failure ("refund crashes if the invoice does not exist"). */
+function modalHedge(text: string): string | undefined {
+  for (const h of WEAK_HEDGES) {
+    if (h.label === "assumes" || h.label === "if X does not") continue;
+    h.re.lastIndex = 0;
+    if (h.re.test(text)) return h.label;
+  }
+  return undefined;
+}
 
 function strongHedge(text: string): string | undefined {
   for (const h of STRONG_HEDGES) {
@@ -634,6 +663,7 @@ const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
       /\blog(?:ging)? (?:messages?|wording|text|lines?|levels?|statements?|output)\b/i,
       /\b(?:logs?|logged|logging) (?:at|as) (?:the )?(?:info|debug|warn(?:ing)?|error|trace)\b/i,
       /\bmisleading (?:logs?|error messages?|messages?)\b/i,
+      /\blog(?:s|ged)?\s+(?:reports?|says|shows|prints|emits|records|reads)\b/i,
       /\bconsole\.(?:log|warn|error|info|debug)\b.{0,40}\b(?:left|leftover|remove|debug)\b/i,
       /로그\s*(?:문구|메시지|레벨|수준|내용|표현)/,
     ],
@@ -652,10 +682,17 @@ const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
   },
 ];
 
+// Same test-path shape as review-budget.ts (kept local: this module has type-only imports).
+const isTestPath = (p: string) => /\.spec\.|\.test\.|__tests__|\/tests?\//.test(p);
+const ADD_TEST_FIX = /\b(?:add|write|extend|cover)\b.{0,60}\b(?:tests?|test cases?|specs?|assertions?)\b|테스트(?:를|케이스를)?\s*(?:추가|작성|보강)/i;
+
 function noteCategory(f: Finding): GateNoteCategory | undefined {
   const head = stripQuoted([f.title, f.rootCause].join("\n"));
   const defect = DEFECT_CUE.test(stripQuoted([f.title, f.failureScenario].join("\n")));
   if (isDocPath(f.file) && !/\.txt$/i.test(f.file)) return "docs";
+  // A finding on a test file whose fix is more tests is coverage advice: a failure cue in its text
+  // ("throws") describes the production path the test exercises, not a defect in the change.
+  if (isTestPath(f.file) && ADD_TEST_FIX.test(f.recommendedFix) && !SENSITIVE.test(head)) return "test";
   for (const rule of CATEGORY_RULES) {
     if (!rule.re.some((re) => re.test(head))) continue;
     if (defect) continue;
@@ -734,6 +771,10 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   const claim = claimText(f);
   const strong = strongHedge(claim);
   if (strong) return drop("speculative", strong);
+  // The headline itself is a possibility ("X may allow Y"): no quote can prove a claim that does not
+  // assert a defect, so it is speculation whatever the evidence (precision control B).
+  const titleHedge = modalHedge(stripQuoted(f.title));
+  if (titleHedge) return drop("speculative", `title: ${titleHedge}`);
   const weak = weakHedge(claim);
   // A weak hedge ("may", "could", "if X does not") is speculation unless the claim is otherwise proven:
   // a verified quote on a changed line ties it to code this PR actually changed.

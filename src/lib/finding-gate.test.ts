@@ -162,6 +162,39 @@ describe("finding gate: R1 speculation", () => {
   });
 });
 
+describe("finding gate: R1 speculation (integration tuning)", () => {
+  it("drops a finding whose title is only a possibility, even with a changed-line quote", () => {
+    for (const title of ["Rolled-back save may leave the order row behind", "Retry might double the total", "재고 검사가 누락된 상태일 수 있음"]) {
+      const d = one(mk({ title }));
+      assert.equal(d.action, "drop", title);
+      assert.equal(d.reasons[0], "speculative", title);
+      assert.match(d.reasons[1], /title:/, title);
+    }
+  });
+
+  it("keeps a title whose condition is the failure trigger or the code's own assumption", () => {
+    // Not dropped by the title rule (C2 may still demote a hedged P1 headline to P2).
+    assert.notEqual(one(mk({ title: "Submit crashes if the cart does not exist" })).action, "drop");
+    assert.notEqual(one(mk({ title: "submitOrder assumes every item has a price" })).action, "drop");
+    assert.equal(one(mk({ title: "Order save could not be retried after a timeout" })).action, "keep");
+  });
+
+  it("reads single-quoted state or code as a quote, not as the reviewer's voice", () => {
+    const d = one(mk({ rootCause: "The caller cannot tell 'order was not saved' from 'save could not be confirmed', so it retries a saved order." }));
+    assert.equal(d.action, "keep", JSON.stringify(d.reasons));
+  });
+
+  it("keeps an apostrophe-heavy claim intact (no false quote pairing)", () => {
+    const d = one(mk({ rootCause: "The store's retry doesn't check the user's state; whether it re-validates is unverified." }));
+    assert.equal(d.reasons[0], "speculative");
+  });
+
+  it("reads attributive 'an unverified <data>' as the code's data, but 'the unverified helper' as an admission", () => {
+    assert.equal(one(mk({ failureScenario: "The order is dropped over an unverified read of the stock table, not a real shortage." })).action, "keep");
+    assert.equal(one(mk({ rootCause: "The failure depends on the unverified helper that persists the order." })).reasons[0], "speculative");
+  });
+});
+
 describe("finding gate: R2 self-retraction", () => {
   it("drops a finding that concludes there is no defect", () => {
     const d = one(mk({
@@ -310,6 +343,30 @@ describe("finding gate: C1 notes", () => {
       evidence: "src/orders/submit.test.ts:2 `return { advance: (ms: number) => timers.filter((t) => t.at < now + ms).forEach(run) };`",
     }), c);
     assert.notEqual(d.action, "note");
+  });
+
+  it("routes coverage advice on a test file to notes even when it names a failure path", () => {
+    const c = ctx();
+    c.headFiles.set("src/orders/submit.spec.ts", "it('saves', async () => {\n  await submitOrder(cart, user);\n});\n");
+    c.changedPaths.push("src/orders/submit.spec.ts");
+    const d = one(mk({
+      file: "src/orders/submit.spec.ts",
+      line: 2,
+      severity: "P2",
+      title: "Spec mocks the store but not the stock rules",
+      failureScenario: "If saveOrder throws for an empty cart, the spec does not exercise that path.",
+      rootCause: "The store layer is mocked entirely.",
+      evidence: "src/orders/submit.spec.ts:2 `await submitOrder(cart, user);`",
+      recommendedFix: "Add a spec case that makes saveOrder throw and asserts the error propagates.",
+    }), c);
+    assert.equal(d.action, "note", JSON.stringify(d.reasons));
+    assert.equal(d.reasons[0], "note:test");
+  });
+
+  it("routes a claim about what a log line reports to notes", () => {
+    const d = one(mk({ severity: "P2", title: "Log reports saved=0 when the lock is not acquired", rootCause: "The finally block logs the same line for a skipped run and an empty run." }));
+    assert.equal(d.action, "note", JSON.stringify(d.reasons));
+    assert.equal(d.reasons[0], "note:log");
   });
 
   it("keeps security claims that only look like log or text findings", () => {

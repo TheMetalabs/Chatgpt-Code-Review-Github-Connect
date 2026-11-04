@@ -352,6 +352,12 @@ describe("finding gate: R4 diff-contradicted claims", () => {
     assert.equal(d.reasons[0], "contradicted_by_diff");
   });
 
+  it("keeps a code defect whose 'not updated' wording is about the code, with a changed doc only cited", () => {
+    // "the total is not updated" describes the defect; src/orders/CLAUDE.md is only the cited source.
+    const d = one(mk({ title: "Order total is not updated after a discount", rootCause: "As src/orders/CLAUDE.md describes, saveOrder must store the final total, but the total is not updated after the discount is applied." }));
+    assert.notEqual(d.reasons[0], "contradicted_by_diff");
+  });
+
   it("drops a Korean 'PR diff에 … 수정이 없' claim about a changed doc", () => {
     const d = one(mk({ severity: "P2", title: "문서 누락", rootCause: "PR diff에 src/orders/CLAUDE.md 수정이 없으며 새 동작이 문서화되지 않았습니다." }));
     assert.equal(d.reasons[0], "contradicted_by_diff");
@@ -558,8 +564,16 @@ describe("finding gate: D dedupe against prior findings", () => {
     assert.equal(d.reasons[0], "already_reported");
   });
 
-  it("drops a re-review of the same head that quotes the same code under another title", () => {
+  it("does not tie a different defect in the same statement to a prior finding by the shared quote alone", () => {
+    // Two independent defects can quote one statement (an injection and a missing tenant filter on the
+    // same DELETE): shared code without a corroborating claim is not a repeat.
     const d = one(mk(), ctx({ priorFindings: [{ file: "src/orders/submit.ts", title: "Stock race on checkout", evidence: "`await saveOrder({ userId: user.id, total, items: cart.items });`", commitId: "1111111aaaaaaa" }] }));
+    assert.notEqual(d.reasons[0], "already_reported");
+  });
+
+  it("drops a re-review of the same head that quotes the same code with a corroborating claim", () => {
+    const f = mk();
+    const d = one(f, ctx({ priorFindings: [{ file: "src/orders/submit.ts", title: `${f.title} (re-review)`.replace(/^\S+\s/, ""), evidence: "`await saveOrder({ userId: user.id, total, items: cart.items });`", commitId: "1111111aaaaaaa" }] }));
     assert.equal(d.reasons[0], "already_reported");
     assert.match(d.reasons[1], /this head/);
   });
@@ -661,5 +675,19 @@ describe("finding gate: Settings copy", () => {
     const bare = findingPrecisionNote({ findingGate: "off", findingDedupePrior: false, postLatestHeadOnly: false });
     assert.doesNotMatch(bare, /Even with the gate off/);
     assert.match(findingPrecisionNote({ findingGate: "rules" }), /^Gate ON \(rules\)/);
+  });
+});
+
+describe("finding gate: executable code under a docs/ directory", () => {
+  it("keeps a P1 defect in docs/site/*.ts as a finding, not a docs note", () => {
+    const code = "export function refundTotal(items) {\n  return items.reduce((s, i) => s + i.amount * 2, 0);\n}\n";
+    const c = ctx({
+      headFiles: new Map([["docs/site/refund.ts", code]]),
+      changedPaths: ["docs/site/refund.ts"],
+      diff: "diff --git a/docs/site/refund.ts b/docs/site/refund.ts\n--- /dev/null\n+++ b/docs/site/refund.ts\n@@ -0,0 +1,3 @@\n+export function refundTotal(items) {\n+  return items.reduce((s, i) => s + i.amount * 2, 0);\n+}\n",
+    });
+    const d = one(mk({ file: "docs/site/refund.ts", line: 2, title: "Refund total doubles every item amount", failureScenario: "A refund of one 10.00 item returns 20.00.", rootCause: "refundTotal multiplies each amount by 2.", evidence: "docs/site/refund.ts:2 `return items.reduce((s, i) => s + i.amount * 2, 0);`" }), c);
+    assert.equal(d.action, "keep");
+    assert.equal(d.severityAfter ?? d.finding.severity, "P1");
   });
 });

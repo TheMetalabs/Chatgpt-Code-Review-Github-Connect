@@ -143,7 +143,9 @@ function isAncestorDir(dir: string, file: string): boolean {
 }
 
 const DOC_FILE = /\.(md|mdx|rst|adoc|txt)$/i;
-const isDocPath = (p: string) => DOC_FILE.test(p) || /(^|\/)docs?\//i.test(p);
+/** A documentation FILE (by extension). A path under docs/ is not enough: documentation sites and
+ * tooling keep executable code there, and a defect in it is a code defect. */
+const isDocPath = (p: string) => DOC_FILE.test(p);
 
 /** File-path-like tokens in free text (`a/b.ts`, `CLAUDE.md`, `a/b.ts:12`). */
 function pathTokens(text: string): string[] {
@@ -629,7 +631,7 @@ function fileAbsentClaim(text: string, token: string): boolean {
 function docIsSubject(f: Finding, hit: string): boolean {
   if (isDocPath(f.file)) return true;
   const title = String(f.title ?? "").replace(/`/g, "");
-  const phrase = [...NEEDS_UPDATE_DOC, ...NOT_CHANGED_ANY, /\b(?:missing|outdated|stale)\b|누락/i];
+  const phrase = [...NEEDS_UPDATE_DOC, ...NOT_CHANGED_ANY, /^\W{0,3}(?:(?:is|was|has)\s+)?not\s+(?:been\s+)?(?:updated|modified|changed|edited)\b/i, /\b(?:missing|outdated|stale)\b|누락/i];
   for (const token of pathTokens(title)) {
     if (basename(token) !== basename(hit)) continue;
     const re = new RegExp(`(?:^|[^\\w./-])${escapeRe(token)}(?![\\w/])`, "gi");
@@ -659,7 +661,10 @@ function diffContradiction(f: Finding, idx: GateIndex): string | undefined {
       // Code: only a claim that the FILE itself is
       // absent from the PR ("X is not in the diff", "the PR does not touch X") — a stale call site
       // inside a changed code file is a real claim this rule never judges.
-      if (isDocPath(hit) ? notChanged || (needsDoc && docIsSubject(f, hit)) : fileAbsentClaim(text, token)) return hit;
+      // The negative claim must be ABOUT the doc: the doc is the finding's subject, or the claim
+      // says the doc itself is absent from the PR. A "not updated" phrase elsewhere in the finding
+      // ("the total is not updated") with the doc only cited as a source contradicts nothing.
+      if (isDocPath(hit) ? ((notChanged || needsDoc) && docIsSubject(f, hit)) || fileAbsentClaim(text, token) : fileAbsentClaim(text, token)) return hit;
     }
   }
   // The finding sits ON a changed doc and says that doc was not updated.
@@ -832,7 +837,9 @@ export function findPriorDuplicate(f: Finding, ctx: Pick<GateContext, "priorFind
     if (j >= 0.6 && sameLine) return p;
     if (mine.length && p.evidence) {
       const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
-      if (mine.some((q) => theirs.some((t) => same(q, t)))) return p;
+      // The same substantial code AND a corroborating claim: two independent defects in one statement
+      // (an injection and a missing tenant filter on the same DELETE) are not a repeat.
+      if (sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => same(q, t)))) return p;
       // A similar title quoting the same code (any length: the title already ties the subject).
       if (j >= 0.6 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
       // The same anchor and subject: posted on the same line of the same file, quoting the same code,

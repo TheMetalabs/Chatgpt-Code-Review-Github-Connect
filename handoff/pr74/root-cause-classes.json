@@ -1,0 +1,265 @@
+{
+ "classes": [
+  {
+   "id": "K1-idempotent-emission-and-own-write-visibility",
+   "name": "Exactly-once control emission and visibility of the App's own writes are hand-rolled per emitter",
+   "mechanism": "A redelivery, a sequential re-run, or a retry after a lost response gets past the 'already posted?' check and posts a second control effect: a handoff, continuation, STOPPED/stop record, start record, FIXING marker, fix report, or a whole fix round. Three things let it through. (1) The list API has not caught up with the write yet. (2) A failed read is treated as 'absent', and each emitter picks its own read-failure policy. (3) In-process guards only cover calls that overlap in time. The opposite failure also happens. A record the App just wrote (start record, handoff, stop record, or the review harbor just posted) is invisible to sessionOf/readLoopEvents/reconstructRounds. The step then polls with 3/6/12 s backoff and turns the lag into a terminal loop-error (R3-13) or a silent NO_SESSION (R6-10), or keeps fixing past its own terminal record (R3-3). MERGE NOTE: B put R3-3 in the session-fold class. It is placed here because the part that still happens is a sequential re-run of the fix round with no per-(session, head) key, plus a just-posted handoff the fold cannot see. B put R3-13 and R6-10 in the termination class. They are placed here because the cause is polling for the App's own writes; the silent or terminal mapping is only the symptom (K6 covers that mapping).",
+   "root_cause": "There is no single idempotent-emit primitive with a typed effect key, and no read-your-writes view of the App's own records. Keys are ad-hoc strings built in six places with different granularity and casing: engine handoffKey (not lowercased), 'continue:'/'start:'/'stop:' (via lowercased prKey), stepKey, and deliveryId. Each kind re-derives three things. The 'exists?' predicate. The read-failure policy: maybeEscalate fails closed, escalateNow and ensureContinuation post anyway, startLoop and ensureStopRecord treat an error as absent. The retry: continuation, start and stop get 3 attempts; both handoff paths get 1. The postedByClient cache stores only keys, so dedup checks can see it but the session and round folds cannot. Each round's finding was one emitter missing one of these steps.",
+   "finding_ids": [
+    "R2-4",
+    "R3-3",
+    "R3-4",
+    "R3-13",
+    "R4-4",
+    "R4-8",
+    "R5-5",
+    "R5-7",
+    "R6-3",
+    "R6-5",
+    "R6-9",
+    "R6-10"
+   ],
+   "rounds_seen": [
+    2,
+    3,
+    4,
+    5,
+    6
+   ],
+   "past_fixes_were_narrow": "Yes, each round patched one emitter or one step. R2-4 added a local fallback only for escalateNow's read failure. R3-4 created ensureContinuation (single-flight plus scan) for continuations only. R4-4 added 0/2/5 s retries for continuations. R4-8 was answered by the fold, then R5-7 had to add a record scan to stopLoop. R5-5 added postedRecently for 4 kinds but not maybeEscalate, which was then reported twice in round 6 (R6-5, R6-9). R6-3 added a separate delivery-claims module. R3-13 and R6-10 answered list lag with 3/6/12 s polling loops. R3-3 was closed by the session fold, not by a per-(session, head) key.",
+   "hotspots": [
+    "src/lib/review-loop-engine.server.ts:maybeEscalateInner — createIssueComment (l.300) is outside the try and never retried. A rejection, including a lost response whose POST actually landed, escapes to runPostReviewLoop's catch (l.842). That catch posts a second handoff reclassified as loop-error, because rememberPosted never ran.",
+    "src/lib/review-loop-engine.server.ts:escalateNow — single POST with no retry and no re-scan, and the opposite read-failure policy from maybeEscalate. continueLoopOnPush (runtime l.885) adds a third call site with its own reconstructRounds.",
+    "src/lib/review-loop-runtime.server.ts:ensureContinuation / startLoop / ensureStopRecord — three near-copies of scan → postedRecently → post → rememberPosted → POST_RETRY_DELAYS_MS, each with its own key format and list-error handling",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop — no durable per-(session, head) fix-round key. The FIXING marker (l.764), the provider request and the suggestion/no-change report (l.833/l.838) re-run for every sequential review of the same head; only the concurrent-only inFlightSteps guards them. The fixingComment and renderFixReport posts carry no idempotency key.",
+    "src/lib/review-loop-runtime.server.ts:stopLoop — setPendingStop(...,false) runs as soon as the record POST succeeds (l.1046). The list still lags and sessionOf has no overlay, so a concurrent step's relevance() sees an active session and can commit past an edited or PR-body stop.",
+    "src/lib/review-loop-runtime.server.ts:sessionOf + src/lib/review-loop-engine.server.ts:readLoopEvents/reconstructRounds — just-posted start, continue, handoff and stop records, and the review harbor just posted (harbor finishJob postedJob), are not folded in. This is why the HISTORY_RETRY_DELAYS_MS polling exists for CURRENT_ROUND_MISSING (l.635) and for the start re-read (l.604).",
+    "src/lib/harbor.server.ts:applyLoopControl + src/lib/loop-control-claims.ts — delivery dedup is split across acceptedDeliveryIds, state.jobs and in-memory claims. Whether a claim is released is decided by the /failed|in flight/ regex over reason text, not by the effect's typed result."
+   ],
+   "structural_fix_direction": "Build one emitControl(runtime, ref, {kind, effectKey, body, event, readFailure}) primitive and use it for start, stop record, continuation, both handoff paths, FIXING, fix reports and the fix round itself. effectKey is a typed ControlKey {kind, prKey (lowercased), sessionSeq, head?, stopId?} built by one function. The primitive does five things. (a) It joins an in-flight call with the same key through a shared promise, never a busy sentinel. (b) It consults a per-PR write-through journal of the App's own records (effectKey, comment id from createIssueComment, LoopEvent), held in the injected runtime (K2). (c) It scans the list with the kind's own parser for effectKey equality, scoped by session id. (d) It posts with one retry-and-re-scan policy for every kind and one declared read-failure policy. (e) On success it appends the record's LoopEvent and comment id to the journal, and it returns a typed {posted|exists|failed}. readLoopEvents and reconstructRounds fold journal events together with listed history, deduped by comment id or effectKey; the journal includes the review harbor just posted, passed into runPostReviewLoop. This deletes pendingStops, the scattered postedRecently checks, and the start-read and CURRENT_ROUND_MISSING polling loops. A (sessionSeq, head) fix-round key, recorded by FIXING, makes one fix round per (session, head) hold for sequential calls too (it is also K7's ledger). Harbor maps deliveryId to ControlKey and releases a claim based on the typed result."
+  },
+  {
+   "id": "K2-per-pr-control-plane",
+   "name": "No per-PR serialized control plane: fire-and-forget handlers, busy sentinels and module-level state",
+   "mechanism": "Several things run on the same PR concurrently, each fired and forgotten by harbor: the start-record post (at admission), the stop handler, the push continuation, loop steps, and escalations. Five module-level guards with different keys each return an 'in flight' sentinel: inFlightSteps (per head, not lowercased), inFlightEscalate (per head, held across reads), continuing (per head+session), inFlightStop (per stop) and loopControlClaims (per delivery). The sentinels are STEP_IN_FLIGHT, ESCALATE_IN_FLIGHT, HANDOFF_IN_FLIGHT and 'stop already in flight', and every caller must map them. Those mappings were wrong: a blind fix (R1-8) and a dropped terminal handoff (R2-6, R3-8). Operations under different keys are not ordered at all: start record vs stop (R6-1), two steps on the same head (R1-6), stop vs afterCommit. Control deliveries reuse the review delivery kind, so routing a stop depends on ingress skip rules (R5-9). Tests share the module-level state (R3-15, R6-11). MERGE NOTE: B put R3-15 and R6-11 in the contracts class. They are here because both are about the lifecycle of module-level state, which the injected runtime instance removes. Both analysts put R5-9 in contracts. It is here because the fix is to make control a first-class delivery handled by this plane.",
+   "root_cause": "Loop control is not a first-class, serialized channel. The design says one loop per PR with concurrency 1, yet ordering and exclusion are rebuilt ad hoc from flags. startInFlight is inferred from live harbor jobs whose thread.loop.kind is 'start', which github-payload also assigns to the App's own continuation. Other flags are pendingStops and ESCALATE_IN_FLIGHT. 'Busy' became an outcome value instead of waiting behind the work in flight. All the state lives in module-level Sets/Maps/WeakMaps (plus a module-level productionGh) instead of one injected runtime instance. Control-only deliveries ride on the 'review' ParsedDelivery kind.",
+   "finding_ids": [
+    "R1-6",
+    "R1-8",
+    "R2-6",
+    "R3-8",
+    "R3-15",
+    "R5-9",
+    "R6-1",
+    "R6-11"
+   ],
+   "rounds_seen": [
+    1,
+    2,
+    3,
+    5,
+    6
+   ],
+   "past_fixes_were_narrow": "Yes. R1-6 added a per-head (not per-PR) step guard. R1-8, R2-6 and R3-8 each added a 'back off once, then logged reason' mapping for ESCALATE_IN_FLIGHT at a different call site, plus a new sentinel (HANDOFF_IN_FLIGHT). R6-1 added a startInFlight proxy and an in-process pending stop instead of ordering START and STOP. R3-15, R6-11 and R5-9 were closed as 'verified, no change' by arguing the current behavior is safe, not by removing the hidden dependency.",
+   "hotspots": [
+    "src/lib/harbor.server.ts:playGithub l.622 recordLoopStart + enqueueFromDecision l.1258 — the start is recorded only at admission, but any newer job for the PR (for example a synchronize review) cancels every live job. A /review-loop superseded before admission is never recorded, and the loop silently never starts.",
+    "src/lib/harbor.server.ts:applyLoopControl run() — the stop becomes pending only after await installationToken() and stopLoop's await productionDeps(). If the token fetch fails, an edit-time or PR-body stop, which the fold cannot replay, is dropped entirely: the claim is released and nothing is pending.",
+    "src/lib/harbor.server.ts:applyLoopControl startInFlight — a proxy computed from live jobs with loop.kind==='start', which also matches continuation-triggered jobs",
+    "src/lib/review-loop-runtime.server.ts:stopLoop vs runPostReviewLoop.afterCommit — not serialized against each other. A stop processed between afterCommit's session read and ensureContinuation still posts a continuation, which triggers a review after STOPPED.",
+    "src/lib/review-loop-runtime.server.ts:inFlightSteps (stepKey not lowercased) / continuing / inFlightStop / pendingStopsByClient / productionGh and src/lib/review-loop-engine.server.ts:inFlightEscalate / postedByClient — overlapping module-level guards and caches with different keys and casing, shared across tests",
+    "src/lib/review-loop-engine.server.ts:maybeEscalate — inFlightEscalate is held across the reconstructRounds reads, so pure reads surface ESCALATE_IN_FLIGHT. The runtime's escalate() (l.554) and the pre-fix path (l.642) map it with one-shot ESCALATE_BACKOFF_MS sleeps.",
+    "src/lib/github-payload.ts:parseGitHubPayload — a stop-only PR-body edit becomes kind 'review' with trigger pull_request.body_mention. harbor applyLoopControl runs before decideIngress, and the full review is suppressed only by ingress.ts:reviewSkipReason's control-only rule."
+   ],
+   "structural_fix_direction": "Create one LoopRuntime instance, injected: one per process in production and a fresh one per test. It owns all process state (K1 journal, delivery claims, registered rounds) and a per-PR serial executor withPr(ref, fn) keyed by the lowercased owner/repo#pr. Every control decision and control write runs in it as a short critical section, in arrival order. That includes: the start, recorded at webhook receipt rather than review admission so job supersession cannot drop it; a stop, appended synchronously before any await; the push continuation; the step's pre-fix gates; handoffs; and the commit's final relevance check, ref update and post-commit continuation. The multi-hour provider request runs outside the section and re-enters for the commit. Callers await their turn instead of receiving sentinels. Delete STEP_IN_FLIGHT, ESCALATE_IN_FLIGHT, HANDOFF_IN_FLIGHT, 'stop already in flight', their backoffs, startInFlight and every module-level Set/Map. Parse control-only deliveries as a distinct ParsedDelivery kind 'control' that routes to the plane and never depends on ingress skip rules."
+  },
+  {
+   "id": "K3-time-ordered-session-fold",
+   "name": "Session state is a fold over mixed, backdated, second-resolution timestamps with no session-identified transition log",
+   "mechanism": "The session is rebuilt by sorting events by embedded times from different clocks and sources. These are: the directive time inside a start record posted later; the stop's own time inside a STOPPED record (the receiver clock when updated_at is absent); a continuation's createdAt; a review's submitted_at (a different id space); the PR's updated_at for a push or body directive; and the receiver clock as a fallback. GitHub times have 1 s resolution, comments can be edited, and records land late. Ties, backdating, edits and late records therefore keep misordering start/stop/converged/push. Records identify their session only by time, so a late record can end the wrong session. MERGE NOTE: B also put R3-3 here; it is in K1.",
+   "root_cause": "There is no App-authored, totally ordered transition log that names its session. The fold orders by when things supposedly happened, not by the order in which the App decided them. Some transitions are never recorded at decision time. CONVERGED is inferred later from review timestamps: the zero-findings step returns at l.532 before any head read, and harbor skips the step when headMovedTo. A push is an injected, non-durable event. A human stop lives in mutable text or process memory until it is acknowledged. Stop records, handoffs and continuations carry no session id. Every new interleaving therefore needs another tie rule or timestamp source, and the rules now conflict: R6-2 orders a stop after a same-second start, while R5-1 places a late stop record at its original at=.",
+   "finding_ids": [
+    "R3-6",
+    "R4-2",
+    "R4-3",
+    "R5-1",
+    "R5-2",
+    "R6-2",
+    "R6-4",
+    "R6-6"
+   ],
+   "rounds_seen": [
+    3,
+    4,
+    5,
+    6
+   ],
+   "past_fixes_were_narrow": "Yes, every round adjusted a timestamp source or tie-break rule. R3-6 compared epoch ms instead of strings. R4-2 and R4-3 stopped replaying mutable text. R5-1 embedded at= in stop records. R5-2 scoped handoffs and continuations by startSeq but left reviews and stop records on time. R6-2 added another rule to the ORDER tie table. R6-6 fell back to the receiver clock. R6-4 was deferred because no trustworthy head-move time exists. The reviewer's R5-2 suggestion (a session id in every control record) was only partly adopted.",
+   "hotspots": [
+    "src/lib/review-loop-session.ts:deriveLoopSession — ORDER tie table (start:1, stop:2). A stop followed by a re-start in the same second is swallowed as an in-session re-issue and then ended. A late stop record from session A with at=T ends session B started in second T. staleClean and the resumable 'continuation after converged' inference are more of the same heuristics.",
+    "src/lib/review-loop-engine.server.ts:readLoopEvents — each event uses a different clock: start at start.at (directive time, posted later), stop record at the stop's time, escalate and continue at createdAt, converged at the review's submittedAt, human stop at createdAt. No record carries a session id.",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop l.532 + src/lib/harbor.server.ts:finishJob l.1124 — the zero-findings exit returns before any head read, and the step is skipped when headMovedTo (a 7-char compare). This throws away the one moment the App knows a clean review is stale: a missed push plus a stale clean review ends the session as converged (R6-4, R2-2 residue).",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop.continueOn / continueLoopOnPush — head moves are never recorded; the push is an injected, non-durable event at pr.updated_at",
+    "src/lib/review-loop-runtime.server.ts:loopStartAt (falls back to job.createdAt) and stopLoop (stopAt ?? new Date()) — the receiver clock is mixed with GitHub's clock",
+    "src/lib/review-loop-runtime.server.ts:stopLoop endedIt — 'this stop' is identified by isoMs(endedAt) === isoMs(at)",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop relevance() l.706 and afterCommit l.806 — session identity is compared by the startIso string, not startSeq",
+    "src/lib/review-loop-engine.server.ts:reconstructRounds/inSession — rounds are reviews strictly after the directive time, so a review requested before the start but submitted after it counts as round 1. controlInSession falls back to time scoping when the id is missing, and listIssueComments maps a missing id to 0.",
+    "src/lib/github-payload.ts:parseGitHubPayload eventAt / commentEventAt — pr.updated_at serves as the push and body-directive time, but it also moves on unrelated PR updates"
+   ],
+   "structural_fix_direction": "Make every session transition an App-authored issue-comment record, decided when the App processes the event (serialized per PR, K2). Each record carries session=<start-record comment id>. Fold by session id and then by comment id (posting order), never by time; the directive time stays only as audit metadata. CONVERGED becomes a record too: the clean review's own step reads the live head and records either converged(H) or stale → continuation(live), and harbor runs the step for every loop-session review, including when headMovedTo. Head moves are recorded: continueOn and the push handler record the observed live head before deciding. Stops that arrive by webhook (edited comments, PR body, inline comments) become stop records that name the session they stop, so a late record ends exactly that session. Unedited human stop issue comments share the same id space. Human text, review timestamps and pr.updated_at become inputs to decisions, never fold keys. This deletes ORDER, staleClean/resumable, ordering by at= and the receiver-clock fallbacks."
+  },
+  {
+   "id": "K4-untrusted-text-in-control-channel",
+   "name": "Untrusted text shares one channel with machine control records and prompt instructions",
+   "mechanism": "Untrusted model, repo and error text (fix summaries, returned paths, error and rejection detail, findings, CI text) is interpolated into two kinds of trusted strings. One is bot comments, which ashlar's own parsers and external substring detectors (cc_digest, design §3) read as control: escalate, stopped, continue, converged. The other is the fix prompt, which the model treats as instructions. That lets the text forge markers, ping users, or inject instructions. Each new emitter or field reopens the hole unless someone remembers to sanitize or encode it.",
+   "root_cause": "One comment is both a human-readable report and a machine control record, and comment and prompt bodies are built by template interpolation with no type distinction between trusted and untrusted strings. Parsers accept a marker followed by arbitrary text; only canonicalContinuation checks the exact canonical form. External detectors match marker names and fixed human phrases by substring, and sanitizeUntrusted neutralizes neither. Safety therefore depends on every emitter sanitizing every field and every prompt builder JSON-encoding every piece, and the type system enforces none of it.",
+   "finding_ids": [
+    "R1-1",
+    "R2-3",
+    "R3-7",
+    "R3-11",
+    "R3-14",
+    "R5-3",
+    "R5-4"
+   ],
+   "rounds_seen": [
+    1,
+    2,
+    3,
+    5
+   ],
+   "past_fixes_were_narrow": "Partly. R2-3 consolidated sanitization into sanitizeUntrusted ('fixed as a class'), and parsers were anchored to the comment start (R1-1, R3-11). But R3-7 (paths JSON-encoded), R5-3 (retry detail JSON-encoded) and R5-4 (sanitization added at call sites) followed, which shows that per-site discipline still leaks when a field is added. R3-14 and R5-4 were verified by reading sanitizeUntrusted rather than being made evident at the call site.",
+   "hotspots": [
+    "src/lib/review-loop.ts:sanitizeUntrusted/neutralizeMarkers — only '<!--'/'-->' are escaped and '@' is defanged. Marker names (ashlar-loop-escalate, ashlar-findings total=0) and the fixed phrases (REVIEW_LOOP_ESCALATE_HUMAN, REVIEW_LOOP_STOPPED_HUMAN, REVIEW_LOOP_CONTINUE_HUMAN) survive, so model text in a fix report or in Detail can raise a false ESCALATE, STOPPED or CONTINUE in the substring detectors described in design §3.",
+    "src/lib/review-loop.ts:parseEscalateMarker/ESCALATE_MARKER_RE — the handoff mixes the marker with Detail and other untrusted text. There is no canonical re-render check, head is not validated as 40-hex, and pr is not compared to the PR.",
+    "src/lib/review-loop.ts:isStoppedComment — any bot comment that opens with the STOPPED marker counts as an ack",
+    "src/lib/review-loop.ts:escalateComment — Detail, repeatedFiles, ciState and repo are each sanitized by hand",
+    "src/lib/review-loop-runtime.server.ts:renderFixReport — the model summary is posted as raw markdown (links, image beacons, fake '### Ashlar fix agent — applied' headings). Paths are wrapped in backticks, so a backtick in a path escapes the code span. Sanitization is per field, through the sanitizeModelText alias.",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop escalate() call sites l.839/l.841 — sanitized per call",
+    "src/lib/review-loop-runtime.server.ts:retryFeedback + src/lib/fix-agent.ts:buildFixPrompt — prompt sections are assembled by string concatenation, so every new field must remember JSON encoding and placement in the data section",
+    "src/lib/review-loop-engine.server.ts:readLoopEvents pushStop — a stop directive anywhere in any non-App author's comment counts as a stop, including another bot quoting it",
+    "src/lib/review-loop-runtime.server.ts:trace — untrusted error and model text reaches server logs with only whitespace flattening"
+   ],
+   "structural_fix_direction": "Separate control from prose. A control record is a dedicated comment whose entire body is the canonical rendering: marker plus fixed phrase only. Every ashlar parser goes through one parseControlComment that re-renders from the parsed fields and requires byte equality. This extends the canonicalContinuation rule to start, stop record, escalate, stopped and fixing, validates head as 40-hex, and checks pr equality. Human-readable Detail and fix reports go in a separate comment that can never parse as control, rendered inside a fenced or quoted block. Introduce branded types: every external string enters as Untrusted, with only two exits. renderUntrustedInComment neutralizes delimiters, marker names and fixed phrases, defangs mentions, and escapes markdown and backticks. promptData(label, value) emits JSON in the declared untrusted section. Comment and prompt composers then accept only SafeText and typed fields, so a raw interpolation fails type-checking."
+  },
+  {
+   "id": "K5-guarded-effect-boundary",
+   "name": "Round relevance and write authority re-checked at hand-placed checkpoints, not at one guarded write boundary",
+   "mechanism": "A long step (history reads, a provider queue of up to 6 h, the commit) acts on facts captured at its start: live head, session identity, mode, starter, write permission, head-repo provenance, enablement. Each checkpoint re-checks a different subset of this predicate with a different exit mapping. Adapters also coerce an unknown fact into a value: Boolean(fork) in R2-1, permission ?? 'none' in R4-7. Any side effect whose path lacks a fresh re-check can write for a superseded head, a stopped or newer session, or an authority that is stale or unknown. While queued, relevance is polled (stillWanted every 2 min, fail-open). A stop cancels only loop-start jobs (R4-6), so invalidation is pull-based. MERGE NOTE: B left R4-6 unclustered. It is here because it is the stop-scope side of pull-based invalidation. Both analysts put R4-7 in contracts. It is here because the permission adapter's coercion is the same 'unknown becomes a value' defect as R2-1. A put R6-8 here; it is in K8 as a watcher lifecycle defect, and this class's push invalidation removes the dependence on the probe.",
+   "root_cause": "Validity is a mutable external epoch, but checks are placed call site by call site. No guarded-effect abstraction exists that every write must pass through: comment, handoff, continuation, ref update, start record. Such a guard would re-validate one predicate at the moment of the write, using tri-state facts where unknown means refuse. Instead, entry gates (loopEnabled) are duplicated across six entrypoints. Invalidation is pull-based even though the stop, push and start handlers run in the same process.",
+   "finding_ids": [
+    "R1-5",
+    "R2-1",
+    "R2-2",
+    "R3-1",
+    "R3-2",
+    "R4-1",
+    "R4-6",
+    "R4-7",
+    "R5-6"
+   ],
+   "rounds_seen": [
+    1,
+    2,
+    3,
+    4,
+    5
+   ],
+   "past_fixes_were_narrow": "Yes, one checkpoint was added per finding. R1-5: suggest mode. R2-2: head read before the verdict. R3-1: supersession continuation. R3-2: session end or newer session, but authorization stayed separate, so R4-1 then had to add starter and permission checks inside validate(). R5-6: loopEnabled duplicated at the harbor call site. R2-1: positive provenance, but fork is still Boolean-coerced. R4-6 was accepted as the scope of stop, and R4-7 was verified against the live API with no change.",
+   "hotspots": [
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop — escalate() for no snapshot, fork, permission, no editable files, or unverifiable history (after up to 21 s of backoff) posts before any relevance re-check. A handoff can therefore land for a moved head or a stopped session: an ESCALATE after STOPPED is a false terminal signal for external detectors.",
+    "src/lib/review-loop-engine.server.ts:maybeEscalateInner — posts the stuck/round-cap handoff with no live-head or session re-check at post time. continueLoopOnPush checks the head once, then spends up to 7 s of retries and falls back to escalateNow for a head that may have moved.",
+    "src/lib/fix-commit.ts:commitFiles + src/lib/review-loop-runtime.server.ts validate wrapper (l.733) — relevance and permission are checked in validate() before blob/tree/commit. The internal retry re-runs the whole sequence, including the ref write, without re-checking stop, starter or permission.",
+    "src/lib/review-loop-runtime.server.ts continuation mode — afterCommit uses effectiveLoopMode, but continueOn (l.584) and continueLoopOnPush (l.882) use the raw session.mode ?? 'suggest', so the settings ceiling is applied at one site only",
+    "src/lib/github.server.ts:fetchUserPermission l.884 — String(permission ?? 'none') coerces a missing field instead of failing on shape. fetchPullHeadRef still returns fork: Boolean(...).",
+    "src/lib/harbor.server.ts:applyLoopControl — stop cancels only jobs whose thread.loop.kind==='start' (R4-6), and loopEnabled is gated separately in runPostReviewLoop, continueLoopOnPush, startLoop, stopLoop, applyLoopControl and recordLoopStart",
+    "src/lib/fix-request-watch.ts:check / src/lib/review-loop-runtime.server.ts:stillWanted — relevance is polled and fails open, and the in-process stop and push handlers never abort the in-flight round directly"
+   ],
+   "structural_fix_direction": "Capture an immutable RoundEpoch {headSha, sessionSeq, mode, starter, sameRepo} at the start of the step. Route every side effect through guardedEffect(epoch, kind, fn) inside the per-PR plane (K2): comment, handoff, continuation, and the ref update, via a precondition hook passed into commitFiles/updateBranchRef that its retry also runs. Immediately before the write, the guard re-validates the head, an active session with the same id, the mode under the effectiveLoopMode ceiling, the starter, write permission, and sameRepo === true for writes. It uses tri-state facts from shape-validated adapters: a missing field means unknown, which is refused with its own reason. One exit table maps failures: head moved → continuation for the live head; stopped, handoff, converged or newer → quiet; lost authority → loop-error. Make invalidation push-based: the stop, push and start handlers call runtime.invalidate(pr, why), which aborts the AbortController of every round registered for that PR, not only loop-start jobs. The polled stillWanted stays only as a backstop for missed webhooks. One entry wrapper owns enablement for every loop entrypoint."
+  },
+  {
+   "id": "K6-closed-step-outcome",
+   "name": "Termination contract enforced per return site with string-typed outcomes and untyped errors",
+   "mechanism": "runPostReviewLoop has about 30 exits, each returning an ad hoc {ran:false, reason:string}. Whether an exit is silent is decided by membership in SILENT_REASONS, and harbor decides logging and claim release with regexes over free text. Posting the fixed signal is interleaved with other posts. So an exit path that forgets its fixed emission, or maps an error to the wrong class, silently stalls a session or ends it wrongly. Past examples: post-commit ordering and the wrong head (R1-2), a deps-load failure (R1-3), a throw before the report (R1-4), a transient commit failure treated as terminal (R2-5), an escalate rejection escaping (R3-9), and a handoff mislabeled as an operator stop (R4-5). MERGE NOTE: B put R3-13 and R6-10 here; they are in K1 because their cause is own-write visibility. A put R6-7 here; it is in K8.",
+   "root_cause": "No closed outcome type exists, and no single settle/finalize owner performs and verifies the terminal emission. Errors are untyped. Transient infrastructure failures, moot cancellations, auth loss and model failures are told apart by side-channel flags (moot, authFailure), string equality and regex. The GitHub transport (gh/ghListAll) never retries idempotent GETs, so each site picks its own transient-versus-terminal mapping.",
+   "finding_ids": [
+    "R1-2",
+    "R1-3",
+    "R1-4",
+    "R2-5",
+    "R3-9",
+    "R4-5"
+   ],
+   "rounds_seen": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "past_fixes_were_narrow": "Yes, each fix touched one exit path. R1-2 and R1-4 reordered the post-commit phase. R1-3 lazy-loaded provider transports. R2-5 added a retry inside commitFiles only. R3-9 wrapped escalate() in try/catch. R4-5 renamed a quiet reason to distinguish stop, handoff and converged.",
+   "hotspots": [
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop.continueOn l.580-593 + quietExit('head') — a session-read failure (.catch→null) and an ensureContinuation failure are only traced, yet the step returns the SILENT 'superseded'. In the same situation, afterCommit and continueLoopOnPush hand off loop-error.",
+    "src/lib/review-loop-runtime.server.ts:escalate — a handoff that fails to post only returns ran:false plus a log line, so the PR gets no terminal signal",
+    "src/lib/review-loop-runtime.server.ts validate wrapper + src/lib/fix-agent.ts:runFixRound l.153 — a transient GitHub read throw in the relevance or permission check becomes validation-failed, which is RETRYABLE. The model is asked again with the GitHub error as 'rejection detail', and the last attempt ends in a fix-failed handoff that blames the model.",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop catch l.842 — any transient read becomes a terminal loop-error (fetchPullHeadRef, or the 3 paginated lists behind each sessionOf), because src/lib/github.server.ts:gh/ghListAll never retry idempotent GETs",
+    "src/lib/harbor.server.ts:finishJob l.1124 — no loop step runs when the review failed to post or the head moved, so an active session's loop review that fails or is cancelled leaves no terminal signal",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop self-heal l.598-611 — when startLoop returns 'start failed' for a start job, the step returns NO_SESSION silently and nothing is posted",
+    "src/lib/review-loop-runtime.server.ts:stopLoop — a stop whose record cannot be posted is only logged and kept in process memory. It is lost on restart, and the PR never shows STOPPED.",
+    "src/lib/review-loop-runtime.server.ts:fixingComment — a moot quiet exit leaves the FIXING marker without the report plus continuation, or handoff, that design §3 promises",
+    "src/lib/review-loop-runtime.server.ts:afterCommit — sessionOf(...).catch(()=>null) and the report's .catch(()=>{}) treat read and post failures as success paths",
+    "src/lib/review-loop-runtime.server.ts:SILENT_REASONS + src/lib/harbor.server.ts:applyLoopControl l.1360 (/failed|in flight/) — outcome handling by string. Docs §5 says there are only 3 quiet exits, while the code has 8 silent non-gate reasons."
+   ],
+   "structural_fix_direction": "The step body returns a closed discriminated union and never posts terminal or continuation signals itself: StepOutcome = Converged(head) | Continue(head) | Suggested | Handoff(reason, head, detail) | Quiet(kind: superseded|stopped|handoff-ended|converged-ended|newer|disabled|no-session, proof) | Unsignaled(error). One settle(outcome) posts through the K1 emitter and closes the FIXING marker on every exit. If that post fails, it tries a loop-error handoff for the head named in the outcome; otherwise it returns Unsignaled, which is always logged and never silent. Quiet(superseded) must carry an ensured continuation, otherwise it becomes Handoff(loop-error). Use typed errors so retries are decided once: Transient (from a GitHub transport that retries idempotent GETs with backoff), BranchMoved, Moot, AuthLost, ModelRejected. validate() rethrows Transient and Moot instead of turning them into validation-failed. Harbor switches on the outcome kind instead of regexes, and calls the loop step for every loop-session review outcome (posted, failed, head moved). Regenerate the docs §5 quiet-exit list from the union type."
+  },
+  {
+   "id": "K7-budget-from-own-fix-ledger",
+   "name": "Hard fix-round budget inferred from reconstructed review history instead of counted from the App's own fix rounds",
+   "mechanism": "The fix-round cap is enforced as classifyStuck(rounds). Rounds are distinct reviewed heads rebuilt from bot reviews, filtered by login and time window and collapsed per head. Enforcement therefore depends on four things: classifyStuck's branch order, empty-history behavior (classifyStuck([]) is null), seeing the current review despite list lag (CURRENT_ROUND_MISSING), and tests pinning helper internals. Fix rounds that produce no new head, such as suggest mode or a re-review of the same head, are never counted. Reviewers keep re-flagging the precedence and the lenient mode as unverifiable. MERGE NOTE: B filed these under cross-module contracts. A's root cause (counting a proxy) is sharper and code-confirmed: suggest mode is unbounded, and ensureContinuation falls back to round 1.",
+   "root_cause": "The budget counts an observed proxy (reviews) instead of the thing it limits (fix rounds the App ran). The App already emits a record per fix round (FIXING, continuation) but does not count those records. The lenient requireCurrentRound mode stays in the API although the runtime never uses it, and the cap clamp lives in a different file (roundCap vs MAX_CONTINUE_ROUND).",
+   "finding_ids": [
+    "R1-7",
+    "R3-12",
+    "R5-8"
+   ],
+   "rounds_seen": [
+    1,
+    3,
+    5
+   ],
+   "past_fixes_were_narrow": "Yes. R1-7 reordered classifyStuck so round-cap comes first. R3-12 documented that lenient callers get no guarantee. R5-8 pinned boundary tests. The budget is still inferred.",
+   "hotspots": [
+    "src/lib/review-loop-engine.server.ts:maybeEscalateInner/reconstructRounds + src/lib/review-loop.ts:classifyStuck — the hard cap equals the number of reconstructed heads and is enforced only after CURRENT_ROUND_MISSING passes; the budget is an emergent property of branch order",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop suggest mode — repeated reviews of one head collapse into one round, so each runs a fresh FIXING, fix request and suggestion without consuming budget (unbounded)",
+    "src/lib/review-loop-runtime.server.ts:ensureContinuation l.496 — round = reconstructRounds(...).catch(()=>[]).length+1, so a read failure yields round 1",
+    "src/lib/review-loop-runtime.server.ts:fixingComment({round: rounds.length}) l.764",
+    "src/lib/review-loop-engine.server.ts:maybeEscalate requireCurrentRound?: optional lenient mode; src/lib/review-loop-runtime.server.ts:roundCap clamps against MAX_CONTINUE_ROUND from review-loop.ts"
+   ],
+   "structural_fix_direction": "Count the budget from a durable ledger of the App's own fix-round records per session, keyed by (sessionSeq, head) and emitted through the K1 primitive; the FIXING record is the ledger entry. Before any fix, the cap check becomes 'fix rounds recorded ≥ cap', which leads to the round-cap handoff. Enforce one fix round per (session, head), and take round numbers for FIXING and the continuation from the same counter. classifyStuck and stuckPattern become advisory detail over the review trend, so the hard bound no longer depends on review attribution or lag. Remove the lenient requireCurrentRound mode and co-locate the cap clamp with the ledger."
+  },
+  {
+   "id": "K8-fix-request-lifecycle",
+   "name": "Fix-request lifecycle built from hand-rolled timers and latches, trusting the transport to honor abort and report activity",
+   "mechanism": "watchFixRequest guarantees bounded time and prompt cancellation with manual flags (done, checking, recheck, phase), a setInterval and a hand-wired Promise executor. Each unhandled lifecycle edge became a finding. A synchronous throw from request() left the interval armed and the signal never aborted (R6-7). A hung stillWanted() latched 'checking' forever, disabling stop and head-move detection (R6-8). The guarantees rely on the transport honoring ctl.signal and firing onActivity, and fixReportsActivity is derived from a transport default rather than a declared capability (R3-10). MERGE NOTE: A split these across termination (R6-7), relevance (R6-8) and contracts (R3-10). They share one file, one mechanism and one fix, so B's grouping is kept.",
+   "root_cause": "The lifecycle is composed imperatively rather than from self-cleaning primitives. Every exit edge (sync throw, hung probe, late answer after settle, a provider that ignores the abort) must remember to settle, clear and abort. The transport contract (signal honored, activity reported) is neither declared as a capability nor tested at the transport boundary.",
+   "finding_ids": [
+    "R3-10",
+    "R6-7",
+    "R6-8"
+   ],
+   "rounds_seen": [
+    3,
+    6
+   ],
+   "past_fixes_were_narrow": "Yes. R6-7 added a try/catch around request(). R6-8 added a per-check timeout plus a recheck flag, which is more latch state. R3-10 verified the plumbing and only moved where fixReportsActivity is read. CI then needed 86fd8c9 to stop unref()-ing the interval.",
+   "hotspots": [
+    "src/lib/fix-request-watch.ts:watchFixRequest.check — the checking/recheck latch; a probe whose late answer can arrive after settle; relevance fails open",
+    "src/lib/fix-request-watch.ts:watchFixRequest — the interval is deliberately kept ref'd (86fd8c9). The normal resolve/reject path never aborts ac, and a transport that ignores the abort keeps working until its promise settles.",
+    "src/lib/review-loop-runtime.server.ts:productionDeps requestFix — relies on requestLocalChat forwarding signal and onActivity; fixReportsActivity comes from localStreamingDefault(); there is no capability object or contract test",
+    "src/lib/review-loop-runtime.server.ts realSleep backoffs (HISTORY_RETRY_DELAYS_MS, ESCALATE_BACKOFF_MS, POST_RETRY_DELAYS_MS) cannot be aborted by a stop"
+   ],
+   "structural_fix_direction": "Rewrite watchFixRequest as an async function composed from AbortSignals: signal = AbortSignal.any([round.signal (K5 invalidation), cancel.signal]), with each deadline as its own abort source. Race each relevance probe against AbortSignal.timeout(checkEveryMs), with no shared latch. Wrap the request as try { return await raceAbort(request(prompt, {signal, onActivity}), signal) } finally { clearInterval(tick); cancel.abort() }. A synchronous throw then becomes a rejection, and the watcher settles even if the transport ignores the abort. Make the runtime's sleeps abortable with the same round signal. Give each transport a declared capability object {abortable, reportsActivity}, asserted by a co-located contract test per provider."
+  }
+ ],
+ "unclustered": [
+  "R3-5"
+ ]
+}

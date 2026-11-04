@@ -1,0 +1,288 @@
+[
+ {
+  "class_id": "K1-idempotent-emission-and-own-write-visibility",
+  "instances": [
+   {
+    "file": "src/lib/review-loop-engine.server.ts",
+    "line": 300,
+    "fn": "maybeEscalateInner",
+    "description": "The stuck/round-cap handoff POST sits outside the try. It is tried once, returns no typed result, and rememberPosted only runs after it resolves. A rejection escapes maybeEscalate into runPostReviewLoop's catch-all (runtime l.842), which posts a second handoff reclassified as loop-error.",
+    "failure_scenario": "Budget spent (rounds [5,4,3,2,2,2]). maybeEscalate POSTs the round-cap handoff; it lands, but the response is lost (timeout or 502). The exception reaches runtime l.842 with requested=true, which calls escalate('loop-error','loop step failed: GitHub API timeout'). escalateNow's alreadyEscalated scan runs on a list that has not caught up, and postedRecently is false because rememberPosted never ran, so a second ESCALATE is posted on the same head. Reproduced: handoffs = [round-cap, loop-error]. With a definite 502 instead, the round-cap reason is lost and the only handoff is loop-error.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-engine.server.ts",
+    "line": 356,
+    "fn": "escalateNow (+ runtime escalate closure l.549-569, continueLoopOnPush l.886)",
+    "description": "Terminal handoffs (fix-failed / fix-declined / loop-error, plus the push-path loop-error) get exactly one POST attempt with no retry or re-scan. Continuation, start and stop posts get 3 attempts.",
+    "failure_scenario": "The fix agent's replies are unparseable twice, so escalate('fix-failed') runs. The handoff POST gets one transient 502. The step returns {ran:false, reason:'ESCALATE fix-failed failed to post: ...'}, which harbor only console.warns. No handoff exists and the durable session stays active (reproduced: active=true, handoffs=0). The loop stalls silently. The same happens in continueLoopOnPush when the continuation fails 3 times and then the single handoff attempt fails.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 1046,
+    "fn": "stopLoop / sessionOf (l.451)",
+    "description": "The in-process pending stop is cleared as soon as the STOPPED-record POST succeeds (or postedRecently says it exists). The record is not yet listed, and sessionOf has no read-your-writes overlay, so for a moment the stop is visible nowhere.",
+    "failure_scenario": "An apply-mode fix request is running. The operator stops the loop by editing the PR body (or an existing comment), so the fold has no human stop comment to replay. stopLoop posts the stop record (success) and clears the pending stop. The fix reply arrives while the list still lags. The pre-commit checkpoint's relevance() calls sessionOf, sees an active session, and runFixRound commits and posts a continuation. Reproduced: stop returned 'stopped', then committed=true and one continuation. This breaks 'no round commits past a stop'.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-engine.server.ts",
+    "line": 399,
+    "fn": "readLoopEvents / readLoopSession (via runtime sessionOf)",
+    "description": "A handoff the App just posted is not folded into the session, so the session still reads as active. postedRecently(handoffKey) is consulted only after classifyStuck returns non-null. R3-3 comes back through list lag instead of through the fold.",
+    "failure_scenario": "Apply session. Step 1 on head H ends in a fix-failed handoff. Review 2 of the same H (a human '@ashlar-bot review' made during the fix) finishes right after, while the list lags. Its step sees an active session, maybeEscalate finds nothing stuck (rounds collapse per head), and the fix round runs again: the provider replies and the commit is pushed after the terminal handoff (reproduced: committed=true after the fix-failed handoff). In suggest mode, the same sequence after a fix-declined handoff re-runs the provider request and posts a second no-change report.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 478,
+    "fn": "ensureContinuation",
+    "description": "The retry re-scan assumes the list shows a POST whose response was lost within 2 s. A list error counts as 'absent' (() => false). The comment that 'a lost response never duplicates the post' is false under lag, or when the list fails during the same outage.",
+    "failure_scenario": "A human pushes and continueLoopOnPush runs. The first continuation POST lands, but GitHub returns 502 or times out. Retry at +2 s: postedRecently is false, and listIssueComments either lags or also 502s (same incident, so absent), so a second canonical continuation is posted. Reproduced: 2 continuations in both variants. The result is two review triggers for one head: harbor supersedes and restarts the first review, wasting provider work. The continuation marker is also a trigger, so any duplicate is duplicate work.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 987,
+    "fn": "ensureStopRecord / startLoop (l.937)",
+    "description": "Same hand-rolled scan-then-post retry, with a list error mapped to 'absent' (.catch(() => null)). A lost response followed by a lagging or failing re-scan posts the record again.",
+    "failure_scenario": "A stop ends the active session. The first STOPPED-record POST lands but its response is lost. Retry at +2 s: the list lags, so a second STOPPED record is posted for the same stop (reproduced: 2). This breaks the 'acknowledged at most once' contract from R4-8/R5-7. startLoop does the same: 2 start records for one directive (reproduced).",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 833,
+    "fn": "runPostReviewLoop (suggestion / no-change report posts, l.833 and l.838)",
+    "description": "The round's result reports are raw createIssueComment calls with no retry, no key and no typed result. Any rejection, including a lost response where the report landed, jumps to the catch-all at l.842, which ends the session with a loop-error handoff.",
+    "failure_scenario": "Suggest mode. The suggestion report POST lands but times out. The catch at l.842 posts ESCALATE loop-error 'loop step failed: GitHub API timeout' (reproduced). The session a suggestion should leave open, waiting for the human's push, is now ended. The human applies the suggestion and pushes; continueLoopOnPush returns NO_SESSION. For no-change, loop-error replaces fix-declined.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 764,
+    "fn": "runPostReviewLoop (FIXING marker / fix round)",
+    "description": "There is no durable per-(session, head) fix-round key. inFlightSteps only blocks steps that overlap in time, and the FIXING post has no key. Rounds collapse per head, so a repeat is not counted against the budget either (overlaps K7).",
+    "failure_scenario": "Active suggest session. Step 1 on head H posts FIXING, the provider request and the suggestion. A second review of the same H follows sequentially: a human re-request, or a second review triggered by a duplicate continuation (see ensureContinuation). Its step re-runs the whole round: a second FIXING marker, a second provider request (which can sit hours in the local-LLM queue), and a second suggestion report. Reproduced: fixing=2, prompts=2, reports=2.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/harbor.server.ts",
+    "line": 1125,
+    "fn": "finishJob (review just posted) + engine readLoopEvents l.435 via continueLoopOnPush",
+    "description": "The review harbor just posted, including a CLEAN (total=0) one, is never handed to the loop. The push handler folds the session from lagging lists and misses its own convergence.",
+    "failure_scenario": "The session waits on head H. Harbor posts a clean review of H at t (CONVERGED). A human pushes H2 at t+2 s. continueLoopOnPush's listPullReviews does not show the clean review yet, so the session reads as active and a continuation for H2 is posted. After the lag clears, the fold sees converged(H) and then continue(H2). H is not live, so the 'stale converged' resume rule re-opens the session (reproduced: active=true). The H2 review then runs a fix round on a PR that had converged, breaking 'a push after a real convergence starts nothing'.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 635,
+    "fn": "runPostReviewLoop (CURRENT_ROUND_MISSING poll)",
+    "description": "Harbor already knows it posted this review, yet the step polls 3/6/12 s for it to appear in the list. The review's inline comments (listReviewComments) are never waited for at all.",
+    "failure_scenario": "During a GitHub list-lag incident longer than 21 s, the healthy session's review still isn't the latest listed round, so the step posts a terminal loop-error ('could not verify the loop history') and ends the loop (residual of R3-13). If the review row shows up but its inline comments do not, reconstructRounds gives the current round files=[]. The round-cap handoff's repeated-files list and the whack-a-mole vs oscillation label are then computed from a history missing the current round.",
+    "previously_reported": true
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 602,
+    "fn": "runPostReviewLoop (start self-heal re-read)",
+    "description": "'start already recorded' can come from postedRecently alone. That cache stores only a key, with no row or LoopEvent, so the fold cannot see the start until the list catches up. The 3/6/12 s poll puts a bound on the lag it tolerates, and past that bound the step returns a silent NO_SESSION.",
+    "failure_scenario": "Harbor's recordLoopStart posted the start record; that POST succeeded and was remembered. The review's loop step starts while the list lags, calls startLoop, and gets postedRecently, meaning 'already recorded'. Three re-reads still miss the record, so the step returns {ran:false, reason:'no active loop session'}, which is silent (reproduced with a persistently lagging list; residual of R6-10). The first round of a started loop is skipped with no signal.",
+    "previously_reported": true
+   },
+   {
+    "file": "src/lib/github.server.ts",
+    "line": 258,
+    "fn": "ghHttps (called by createIssueComment for every control post)",
+    "description": "After any exception, including a 20 s timeout or a reset after the request was sent, the transport re-sends the same method and body to a re-resolved host. Control-comment POSTs are included. The duplicate is created inside one createIssueComment call, so no emitter's scan can run in between.",
+    "failure_scenario": "The POST of a STOPPED record, handoff or continuation reaches GitHub, but the response times out after 20 s. resolveGithubHost(true) returns a different api.github.com address, and ghCall re-POSTs the identical body. Two control comments appear from one createIssueComment call, before any scan, cache or single-flight can intervene.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 582,
+    "fn": "runPostReviewLoop.continueOn",
+    "description": "A third per-emitter read-failure policy: a session read that fails (.catch(() => null)) silently skips requesting the live head's review. continueOn is the path meant to guarantee that 'a missed push event can never stall an active loop'.",
+    "failure_scenario": "Harbor misses a human push's synchronize webhook (for example, it was restarting). The next posted review is for the old head, so its step finds the head moved and calls continueOn. The session read hits a transient list 502, which returns null, so no continuation is requested. The step returns SUPERSEDED, which is silent. The active session now waits on a head nobody will review.",
+    "previously_reported": false
+   }
+  ],
+  "structural_fix": {
+   "summary": "Add ONE control-emission choke point and ONE read-your-writes journal, in a new DI module src/lib/review-loop-control.ts. (1) controlKey(): a typed ControlKey {kind: start|stop|continue|handoff|fixing|report, pr (owner/repo lowercased + number), session (startSeq, else isoMs(startIso)), head?, by? (lowercased), at? (isoMs), mode?}, rendered by one function. It replaces handoffKey, the 'continue:'/'start:'/'stop:' strings and the stop in-flight key. (2) OwnWrites: a per-PR journal of the App's own writes, stored as the rows GitHub returned (issue comment {id, userLogin, body, createdAt}; review {id, userLogin, body, commitId, submittedAt} plus its inline comment paths), plus write-ahead stop intents and 'unknown outcome' markers. It is bounded and TTL-pruned, injected through LoopRuntimeDeps.journal (production: one module instance shared with harbor). (3) withOwnWrites(gh, journal): an overlay whose listIssueComments/listPullReviews/listReviewComments return listed rows plus journal rows, deduplicated by id. Every existing parser and fold (readLoopEvents, readLoopSession, reconstructRounds, controlInSession, the kind parsers) then sees the App's own writes under the SAME authorship and session-scoping rules, so none of them needs its own lag handling. (4) emitControl(gh, journal, token, key, {body, sleep}) returns a typed EmitResult {posted,row} | {exists,row?} | {failed, outcome: rejected|unknown|unreadable, error}. It never throws, and runs one algorithm for every kind: join an in-flight call with the same key through a shared promise; on each attempt of one retry schedule [0, 2 s, 5 s], scan the overlaid list with the kind's own matcher (session-scoped); POST; on success append the server-returned row to the journal, atomically replacing any intent for that key; classify failures as 4xx = rejected (safe to retry) or status 0 / 5xx / timeout = unknown (reconcile first: no re-POST until a readable scan misses it, and re-POST at most on the last attempt, and only for the liveness kinds continue/handoff). Per-kind policy lives in ONE table, KIND_POLICY {onUnreadable: post|abort, onUnknown: repost-last|hold}, not in each emitter. (5) Harbor passes the review it just posted, clean ones included, into the journal. A fix round is claimed by the FIXING effect keyed (session, head) and completed by a report effect carrying a new anchored report marker. Harbor releases a delivery claim from the typed result, not from a regex over reason text. Net result: no emitter hand-rolls exists/read-failure/retry/remember, and every fold sees what the App itself wrote.",
+   "changes": [
+    "src/lib/review-loop-control.ts (new): ControlKey + controlKey(); matchesKey(key,row,botLogin), which dispatches to parseStartMarker+sameStart / parseStopRecord / canonicalContinuation / parseEscalateMarker / parseFixingMarker / parseReportMarker, each gated by isSelfLogin and controlInSession; OwnWrites journal (addRow, addReview, intend, settle, markUnknown, rows/reviews/intents per prKey; TTL + max bound); withOwnWrites(gh, journal) overlay deduped by id; emitControl() + KIND_POLICY table; EmitResult type; the single POST_RETRY_DELAYS_MS.",
+    "src/lib/review-loop-engine.server.ts:maybeEscalateInner: replace 'alreadyEscalated || postedRecently' + bare createIssueComment + rememberPosted with emitControl({kind:'handoff', session, head}) under onUnreadable='abort' (keeps test F6: no post on an unreadable idempotency read). Map posted to escalated, exists to {reason, escalated:false}, failed to {error}. The POST is now inside the typed result, so it never escapes to the runtime catch-all.",
+    "src/lib/review-loop-engine.server.ts:escalateNow: the same emitControl key under onUnreadable='post' (keeps the 'the failure is the signal' test), so it gets the same 3-attempt retry/reconcile as continuations. Delete postedByClient, rememberPosted, postedRecently, POSTED_TTL_MS/POSTED_MAX, handoffKey, alreadyEscalated and escalateNow's catch fallback. The inFlightEscalate classification guard (ESCALATE_IN_FLIGHT) is untouched here; it belongs to K2.",
+    "src/lib/review-loop-engine.server.ts:readLoopSession: fold journal.intents(pr) (write-ahead stops) together with opts.extra. readLoopEvents/reconstructRounds keep their signatures and get the overlaid gh from the runtime.",
+    "src/lib/review-loop-runtime.server.ts:LoopRuntimeDeps: add journal?: OwnWrites (production: exported ownWrites singleton). At every entry point (runPostReviewLoop, continueLoopOnPush, startLoop, stopLoop) wrap once: const gh = withOwnWrites(d.gh, journal).",
+    "src/lib/review-loop-runtime.server.ts:ensureContinuation, startLoop, ensureStopRecord: reduce each to one emitControl call ({continue, session, head}, {start, by, at, mode}, {stop, by, at}). Delete the 'continuing' single-flight map, the three retry loops and the three '.catch(() => false/null)' read policies.",
+    "src/lib/review-loop-runtime.server.ts:stopLoop: journal.intend(stopKey, event) replaces setPendingStop(true). emitControl's success swaps intent for row atomically; a failure or unknown outcome keeps the intent, so the stop is honored in-process until recorded. Delete pendingStopsByClient/pendingStops/setPendingStop and the inFlightStop busy set (joins replace it).",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop: new optional ownReview parameter written into the journal before the first read. Delete the start self-heal poll (l.600-609): startLoop's posted or exists row is already in the overlay, and failed becomes a LOGGED reason, never a silent NO_SESSION. Keep the CURRENT_ROUND_MISSING backoff only as the fallback when no ownReview was given, which preserves the existing 'three backed-off re-reads' test. continueOn: a failed session read returns a logged reason instead of being swallowed.",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop FIXING (l.764): emitControl({kind:'fixing', session: startSeq, head}). If FIXING and a completion (report or handoff) already exist for (session, head), take a quiet exit with the new SILENT reason 'a fix round already ran for this head in this session'. If FIXING exists with no completion (crash recovery), re-run without re-posting FIXING. This record is also K7's fix-round ledger entry.",
+    "src/lib/review-loop-runtime.server.ts:renderFixReport posts (l.816, l.833, l.838): route through emitControl({kind:'report', session, head, outcome}). The report opens with an anchored '<!-- ashlar-loop-report outcome= pr= head= -->' line (review-loop.ts: reportMarker/parseReportMarker, plus parseFixingMarker). A lost response is reconciled, not turned into a loop-error handoff. Only a definite failure after retries maps to the existing fixed outcome.",
+    "src/lib/review-loop-runtime.server.ts:continueLoopOnPush/stopLoop/startLoop: return {posted, reason, effect: EmitResult['status']}.",
+    "src/lib/harbor.server.ts:finishJob: once createPullReview succeeds, record the posted review (id, user.login, body, commit_id, submitted_at, inline paths) in the journal for EVERY review, clean ones included, and pass it to runPostReviewLoop. applyLoopControl: release the delivery claim iff effect === 'failed' (not /failed|in flight/ on reason text).",
+    "src/lib/github.server.ts:createIssueComment/createPullReview: return server truth (id, user.login, created_at / submitted_at, commit_id) and throw an error carrying .status so emitControl can separate rejected from unknown. ghHttps: re-send on a re-resolved host only for GET, or for errors raised before the request was written (DNS/connect); never re-POST after a timeout or reset.",
+    "src/lib/review-loop-engine.server.ts ReviewLoopGithub.createIssueComment type: Promise<{id?: number; userLogin?: string; createdAt?: string}> (test fakes return the id their list reports)."
+   ],
+   "removes_narrow_patches": [
+    "R2-4: escalateNow's catch that falls back to postedRecently on an unreadable history",
+    "R3-4 / R5-5: the 'continuing' single-flight map plus postedRecently in ensureContinuation",
+    "R4-4: the continuation-only POST_RETRY_DELAYS_MS loop (now the one schedule for every kind)",
+    "R5-5: postedByClient / rememberPosted / postedRecently / POSTED_TTL_MS / POSTED_MAX (a key-only cache the folds could not see)",
+    "R5-7 / R4-8: ensureStopRecord's hand-rolled scan and retry",
+    "R6-5 / R6-9: handoffKey and the '|| postedRecently(...)' plus rememberPosted added to maybeEscalate",
+    "R6-10: the start self-heal re-read and poll loop (runPostReviewLoop l.600-609)",
+    "R3-13: the CURRENT_ROUND_MISSING poll becomes a fallback only for callers that do not pass the posted review",
+    "Round-5/6 pendingStopsByClient / setPendingStop / pendingStops (replaced by journal write-ahead intents with an atomic intent-to-row swap)",
+    "inFlightStop 'stop already in flight' busy sentinel (replaced by a shared-promise join on the stop key)",
+    "R6-3 (part): harbor's /failed|in flight/ regex claim release (replaced by the typed EmitResult)",
+    "startLoop's own scan/retry loop and its list-error-as-absent policy"
+   ],
+   "tests": [
+    "src/lib/review-loop-control.test.ts: a table-driven emission contract run for EVERY ControlKind (start, stop, continue, handoff via maybeEscalate AND escalateNow, fixing, report) over a fault matrix: frozen list, list throws, POST 4xx, POST 5xx not landed, POST landed with a lost response, concurrent callers, sequential callers. Assert: never more than one row per ControlKey within the reconcile horizon; liveness kinds (continue, handoff) posted at least once unless every attempt is a definite 4xx; emitControl never throws and its typed status matches the fake's ground truth.",
+    "Read-your-writes property test: after every emitter returns posted or exists, run readLoopSession, reconstructRounds and maybeEscalate against a list FROZEN at the time before the post. Expected: session ended after a handoff or stop record, active after a start record, the current round present after harbor's ownReview, and converged after a clean ownReview followed by a push (the push handler returns NO_SESSION).",
+    "Runtime regressions (one per instance): PR-body stop during an apply fix with a frozen list gives no commit; a fix-failed handoff with a frozen list, then a sequential review of the same head, gives no provider request and no commit; a round-cap handoff with a lost response gives exactly one handoff with reason=round-cap; one 502 on a fix-failed handoff is retried and posted (session ended); a suggestion report with a lost response gives no loop-error and the session stays active; two sequential suggest steps on one (session, head) give one FIXING and one provider request; a lagging start record gives no poll and no silent NO_SESSION. The reproductions are saved at /tmp/claude-0/-home-user-Chatgpt-Code-Review-Github-Connect/fcaa4c9b-e958-594d-91d6-ee617f901f75/scratchpad/r74/k1-repro.test.ts (14 cases, all currently demonstrating the bug).",
+    "Choke-point guard test: in review-loop-*.ts (non-test) sources, createIssueComment( is called only from review-loop-control.ts, and rememberPosted/postedRecently/pendingStops no longer exist.",
+    "github.server test: a POST whose first attempt times out is not re-sent on the host-fallback path; a GET still is.",
+    "All existing runtime and engine tests keep passing unchanged, apart from fixtures whose createIssueComment must return the id their list reports: F6 (unreadable read means maybeEscalate does not post), 'escalateNow still posts when the idempotency read fails', 'three backed-off re-reads' (no ownReview passed) and 'two backed-off retries' for continuations."
+   ],
+   "risk": "Medium. It touches every control emitter, so the overlay must use server-returned ids and timestamps: the fold's instant ordering and id-based session scoping (K3) then stay byte-identical, and deduplication by id keeps a review from being counted twice. Journal rows keep the response's user.login, so a misconfigured bot login still fails attribution closed. The new report marker must be anchored like the other markers (K4) and stay invisible to external substring detectors. Two residuals remain documented non-goals: duplicates across processes or restarts, and a lost response whose row stays unlisted past the reconcile horizon (a liveness kind may then post twice, which the existing stance already accepts for handoffs). The per-(session, head) fix-round key changes behavior for a human re-request on an unchanged head in suggest mode (it now exits quietly), so it must land together with K7's ledger. It depends on K2 only for where the journal lives, not for correctness.",
+   "size": "large"
+  }
+ },
+ {
+  "class_id": "K2-per-pr-control-plane",
+  "instances": [
+   {
+    "file": "src/lib/harbor.server.ts",
+    "line": 1359,
+    "fn": "applyLoopControl.run / stopLoop",
+    "description": "A stop is only recorded as pending after two awaits: `await installationToken()` in harbor, then `await productionDeps()` in stopLoop (runtime l.1032-1034). If the token fetch throws, stopLoop never runs, so the stop is neither pending in the process nor durable on GitHub. The claim is then released so that 'a redelivery may retry', but that path is dead. ingestGitHubWebhook always records a 202 event for the delivery (the control-only skip in enqueueFromDecision), so a redelivery returns at the acceptedDeliveryIds guard (l.1350), and decideIngress also reports it as a duplicate. This contradicts the R6-3 disposition. Confirmed by a harbor app-fixture repro: scratchpad r74/k2-repro/k2-harbor-repro.e2e.mjs, I9.",
+    "failure_scenario": "An apply loop is active. The operator edits a comment (or the PR body) to '/review-loop stop'. POST /app/installations/:id/access_tokens returns 502. The warning 'installation token 502' is logged, and no stop is pending or recorded. The operator clicks Redeliver in GitHub, and harbor answers 'duplicate delivery_id stop-1' without calling stopLoop. The fold cannot replay an edit-time stop, so the next review's step sees an ACTIVE session and commits code after the operator stopped the loop.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 599,
+    "fn": "runPostReviewLoop (self-heal startLoop) vs stopLoop",
+    "description": "A stop is ordered against a start only through harbor's startInFlight proxy: a live harbor job whose thread.loop.kind is 'start' (harbor l.1379-1384). The proxy is blind to the start record that the loop step's self-heal posts (l.598-609) after the admission-time record failed. At that point the review job is already 'posted', not live. stopLoop reads the session before the record lands, sees NO_SESSION and drops its pending stop (l.1041-1043). The record then lands with the earlier directive time, and the step re-reads an active session and fixes. The proxy is also over-inclusive: it counts the App's own continuation jobs, which github-payload tags loop.kind 'start'. Confirmed by scratchpad r74/k2-repro/k2-repro.test.ts I1: the step commits AND posts a continuation after the stop.",
+    "failure_scenario": "At T1 alice comments '/review-loop apply'. The admission-time recordLoopStart fails 3 times (5xx), and the review posts at T5. The loop step starts, finds no session and calls startLoop(at=T1), whose POST is in flight. At T6 alice edits a comment to '/review-loop stop'. harbor finds no live start job, so startInFlight=false. stopLoop reads no session, returns 'no active loop session' and forgets the stop. The start record lands. The step re-reads the session as active, runs the fix round, commits to the branch and posts a continuation. The operator's stop is lost, and it cannot be replayed after the fact.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/harbor.server.ts",
+    "line": 622,
+    "fn": "playGithub / recordLoopStart / enqueueFromDecision",
+    "description": "The loop start is recorded only when the start's own job is ADMITTED (l.622). enqueueFromDecision (l.1256-1258) cancels every live job on the PR when any newer job is queued. A start job superseded before admission returns at the 'cancelled' check (l.546/569), so recordLoopStart never runs. The superseding job carries no loop intent. The start directive is a job property instead of plane state. Confirmed by harbor repro I10: no start record is posted, and startLoop never runs.",
+    "failure_scenario": "alice comments '/review-loop apply'. While that job is still in its snapshot stage (fetchPullHead/fetchPullSnapshot, a few seconds), bob comments '@ashlar-bot review'. The start job is cancelled ('superseded by job-...'), and bob's review runs and posts. Its loop step reads no session and returns the SILENT 'no active loop session'. The loop alice asked for never starts. There is no eyes reaction, no handoff and no marker, and nothing tells her.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/harbor.server.ts",
+    "line": 1380,
+    "fn": "applyLoopControl (stop sweep)",
+    "description": "The stop sweep cancels every live loop-start job on the PR without comparing the job's directive time (thread.eventAt) with the stop's time (parsed.eventAt). It then passes startInFlight=true, so stopLoop records the stop even though it ends nothing. Control is applied in arrival order with no event-time ordering. A stale or reordered stop (a manual redelivery of a delivery that failed during an outage, or out-of-order webhooks) therefore cancels a NEWER start's review. Confirmed by harbor repro I8: an older stop cancels the newer start job.",
+    "failure_scenario": "The server was down at T1 when alice's stop edit was delivered, so the delivery failed. At T2 alice starts a new loop with '/review-loop apply'. It is admitted and its start record (at=T2) posted. The operator then redelivers the failed T1 stop. harbor cancels the live T2 start review, and stopLoop (startInFlight) posts a STOPPED record at T1. The fold reads stop(T1) < start(T2), so the session is ACTIVE, but its review was cancelled and nothing else is in flight. The loop is silently stalled until someone pushes, and the external driver has seen a STOPPED marker for a loop that is active.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 882,
+    "fn": "continueLoopOnPush vs stopLoop",
+    "description": "The push continuation reads the session (l.880) and then runs ensureContinuation, which does a list, reconstructRounds and a POST. None of this is ordered against stopLoop. A stop handled between the session read and the POST still gets a continuation posted after it. That continuation's issue_comment webhook creates a new loop-review job after the stop's cancellation sweep has already run, so nothing cancels it. Confirmed by k2-repro.test.ts I2: the continuation is posted after STOPPED.",
+    "failure_scenario": "alice pushes H2 and a second later comments '/review-loop stop'. The push handler has already read the session as active and is inside ensureContinuation. The stop delivery arrives: harbor finds no live start job to cancel, and stopLoop posts STOPPED. Then the continuation POST lands. Its webhook queues a review of H2, the review runs (LLM cost) and posts after STOPPED. The external driver sees CONTINUE after STOPPED, which contradicts design section 2b: a stop cancels the loop's own review work.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 813,
+    "fn": "runPostReviewLoop.afterCommit vs stopLoop",
+    "description": "afterCommit reads the session (l.802) and then calls ensureContinuation (l.813) and posts the report. None of this is ordered against stopLoop. A stop that arrives after the read and before the continuation POST lands still gets a continuation posted, and the applied report says 'Loop continues: the next review is requested on the new head.' The existing stopAfterCommit test only covers a stop that lands BEFORE afterCommit's read. Confirmed by k2-repro.test.ts I4.",
+    "failure_scenario": "An apply round commits NEW_SHA, and afterCommit reads an active session. The operator comments '/review-loop stop', and stopLoop posts STOPPED. The continuation for NEW_SHA is posted next, followed by the report 'Loop continues'. A review of NEW_SHA then runs after the stop. The PR thread shows STOPPED, then CONTINUE, then 'Loop continues', which contradicts design section 2b: after the commit, no continuation is requested.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 452,
+    "fn": "sessionOf / validate checkpoint / runFixRound commit",
+    "description": "sessionOf builds `extra: [...pendingStops(gh, ref)]` synchronously when it is CALLED, before its three list reads, so a stop that becomes pending while those reads are in flight is not in that fold. After the pre-commit checkpoint in validate (l.733-743), runFixRound also performs baseTree, createBlob xN, createTree, createCommit and updateBranchRef (fix-commit.ts l.64-72). None of that is ordered against stopLoop, so the claim 'every session read in THIS process honors it, so no round commits past a stop' does not hold. This overlaps K5, but the root is the missing per-PR ordering between the stop and the commit write. Confirmed by k2-repro.test.ts I3: STOPPED is posted, then the commit lands.",
+    "failure_scenario": "An apply fix is validated, and the validate checkpoint starts its session read. During that read the operator edits a comment to '/review-loop stop'. stopLoop marks the stop pending, reads the session and posts STOPPED. The checkpoint's fold was built without that stop, and its list snapshot predates the STOPPED record, so the check passes. The blobs, tree, commit and ref update land after the operator's stop was acknowledged.",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 572,
+    "fn": "runPostReviewLoop (inFlightSteps / STEP_IN_FLIGHT)",
+    "description": "Busy is an outcome value, not a wait. A second step for the same head returns the SILENT reason STEP_IN_FLIGHT and is never re-run. relevance() only treats an apply DOWNGRADE (or a different starter) as 'newer', so an in-session UPGRADE from suggest to apply neither aborts the running suggest round nor survives as its own step. The guard is also keyed per head, not per PR, and is not lowercased: `${owner}/${repo}#${pr}@${headSha}`, where prKey is lowercased. The engine's inFlightEscalate key has the same casing problem. Confirmed by k2-repro.test.ts I5: B returns 'another loop step is in flight for this head', A posts a suggestion, and nothing is committed.",
+    "failure_scenario": "A suggest-mode loop's fix request for head H has been queued in the local LLM for an hour. alice re-issues '/review-loop apply' in the same session, so only the mode and starter change. Its review of H (via ChatGPT) posts, and step B hits the guard and returns the silent STEP_IN_FLIGHT reason. A still posts a suggestion and hands off 'apply them and push'. alice's explicit apply request is dropped with no signal anywhere. The unlowercased key causes a second problem: after an owner rename changes the owner's letter case, a job created before the rename and one created after it get different step keys for the same head, so two fix rounds run on that head (R1-6 again).",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 165,
+    "fn": "module-level state (inFlightSteps, continuing l.460, inFlightStop l.1002, pendingStopsByClient l.434, productionGh l.374; engine inFlightEscalate l.221, postedByClient l.174)",
+    "description": "Two isolation models are mixed at module level. The guards (inFlightSteps, inFlightEscalate, continuing, inFlightStop) are process-wide across every GitHub client. The caches (postedByClient, pendingStopsByClient) are WeakMaps keyed per client. Each test's 'fresh fake client' is therefore isolated for the caches but not for the guards. The existing test 'a handoff for this head still in flight after one backoff' even DEPENDS on inFlightEscalate being shared between two different clients (slowGh and f.deps.gh). R3-15 and R6-11 were closed as 'verified, no change' on the grounds that keys are released in finally and caches are per client. Confirmed by k2-repro.test.ts I6: a hung step on one client makes an unrelated client's step return STEP_IN_FLIGHT.",
+    "failure_scenario": "A runtime test whose fake requestFix never settles (a deferred that is never released, or a test that times out) leaves 'o/r#7@HEAD' in inFlightSteps (or inFlightEscalate) for the rest of the process. Every later test in the file on the same coordinates, each with its own fresh fake client, returns 'another loop step is in flight for this head' or ESCALATE_IN_FLIGHT. The failures cascade, and the cause is far from the test that leaked the key.",
+    "previously_reported": true
+   },
+   {
+    "file": "src/lib/review-loop-runtime.server.ts",
+    "line": 886,
+    "fn": "continueLoopOnPush (escalateNow sentinel mapping)",
+    "description": "This is a fourth call site of the busy sentinel, with a different mapping. The step's escalate() backs off once, and the pre-fix check backs off once and then returns HANDOFF_IN_FLIGHT. continueLoopOnPush does neither: it folds ESCALATE_IN_FLIGHT into 'handoff failed: escalate already in flight', and harbor's `/failed|in flight/` regex then logs a failure and releases the claim. Every new caller has to rediscover the mapping (R1-8, R2-6, R3-8).",
+    "failure_scenario": "An apply round commits H2, and the continuation POST fails 3 times. afterCommit and the synchronize handler for the App's own push share that failing single-flight run and both call escalateNow(H2, loop-error). The push handler loses the race and returns 'continue on push failed: 502; handoff failed: escalate already in flight for this head'. harbor logs a handoff FAILURE while the step is posting that same handoff, so operators get a false alarm, and the claim release does nothing (see instance 1).",
+    "previously_reported": false
+   },
+   {
+    "file": "src/lib/github-payload.ts",
+    "line": 180,
+    "fn": "parseGitHubPayload (control rides on kind 'review')",
+    "description": "Control-only deliveries are parsed as kind 'review' and must pass through the ingress skip rules: a stop-only PR-body edit becomes trigger 'pull_request.body_mention' (l.111-139), and synchronize is also a 'review'. The App's continuation is tagged `loop: {kind: 'start'}`, the same tag as a human start. That shared tag makes harbor's startInFlight proxy count bot continuation jobs. It also sends bot continuations through recordLoopStart and the step's self-heal, which then reply 'bot-authored start ignored'. Routing a stop still depends on reviewSkipReason's control-only rule (R5-9).",
+    "failure_scenario": "After instance 5 or 6, a continuation posted after a stop creates a live bot job with loop.kind 'start'. The operator, seeing a new review start, comments '/review-loop stop' again. The sweep counts the bot continuation job as a start in flight, so startInFlight=true. stopLoop finds the session already ended by the first stop, and because startInFlight is set it still posts a SECOND STOPPED record, although nothing was stopped. The 'no false terminal signals' rule from R6-1 is broken.",
+    "previously_reported": true
+   }
+  ],
+  "structural_fix": {
+   "summary": "Add ONE injected LoopRuntime instance, created by createLoopRuntime(deps): one per process in production and a fresh one per test. It owns all loop process state: the K1 own-write journal, delivery claims, and a map of per-PR Lanes keyed ONLY by the lowercased owner/repo#pr. Each Lane has three parts: (1) a synchronous, arrival-ordered control log (start intents, stops, pushes, each with deliveryId/at/actor/state); (2) a non-reentrant serial executor withPr(ref, fn) for short critical sections; (3) one step slot with an AbortController. receive(control) is synchronous and appends to the log before any await (token fetch, import or list read). Every control decision and control write then runs as a withPr section. Those writes include: the start record; the STOPPED record; the push continuation; the step's pre-fix gates and handoff; and the commit section. The commit section does the final relevance check, then commitFiles, then the continuation POST and the report. Every fold is durable history plus the lane log, read at FOLD time. Right before updateBranchRef and right before the continuation POST, the section synchronously checks the log for any stop or newer start received since the step began. Callers wait for their turn instead of receiving busy sentinels. A newer step for the same PR aborts the older step's provider request and then runs; the same job coalesces. A stop aborts the running step at once. Stops cancel only intents and jobs whose directive time is at or before the stop time. Start intents are registered at receipt and recorded when the PR passes admission, whether through the start's own job or the job that superseded it; they are dropped only when the admission gate skips. The runtime retries control writes that did not land, with bounded backoff and a logged final failure, and never relies on GitHub redelivery. Control-only deliveries become a distinct ParsedDelivery kind 'control' that goes straight to receive() and never reaches decideIngress. The App's continuation gets thread.loop kind 'continue' instead of 'start', and its job is admitted only while the fold is active.",
+   "changes": [
+    "NEW src/lib/loop-runtime.server.ts:createLoopRuntime({ gh, requestFix, validate, token: (installationId) => Promise<string>, env, settings: () => BotSettings, sleep?, now? }). Returns { receive(ctl): { cancelJobIds: string[] } (synchronous), admitted(ref), gateSkipped(ref), step(job, sample): Promise<LoopStepResult>, sessionActive(ref): Promise<boolean> }. Internals: lanes: Map<lowercased prKey, Lane{ tail: Promise<void>; log: ControlEvent[]; step?: { jobId; head; abort: AbortController; done: Promise<LoopStepResult> } }>; withPr(ref, fn) as a promise chain, where AsyncLocalStorage detects re-entry and runs the call inline (never deadlocks); journal = the K1 own-write record (moved out of the engine's postedByClient); claims = createDeliveryClaims() (moved out of harbor). Idle lanes are pruned once every log entry is durable.",
+    "src/lib/review-loop-runtime.server.ts:sessionOf: fold `[...await readLoopEvents(...), ...lane.log.filter(effective)]` AFTER the reads resolve, inside the section. Delete pendingStopsByClient, setPendingStop and the call-time `extra` capture.",
+    "src/lib/review-loop-runtime.server.ts:stopLoop becomes receive({type:'stop', ref, actor, at, deliveryId, installationId}). It appends to lane.log synchronously. It aborts lane.step with moot 'stopped' when the step's session is ended by this stop in the fold. It returns cancelJobIds only for intents/jobs whose `at` is at or before stop.at. It then schedules a withPr task: fetch the token (retried by the runtime; on failure the stop STAYS in the log and the task is rescheduled), fold durable plus log (pending start intents included), and ensure the STOPPED record iff this stop ended a session. Delete inFlightStop, the 'stop already in flight' result and the startInFlight parameter.",
+    "src/lib/review-loop-runtime.server.ts:startLoop becomes receive({type:'start', ...}) at webhook receipt, which appends a pending intent. admitted(ref) runs a withPr task that records every pending intent for the PR (journal-idempotent). gateSkipped(ref) drops them with a logged reason. Delete harbor recordLoopStart and the runPostReviewLoop self-heal block (l.595-610): the step's pre-fix section is queued after the intent's record task on the same lane.",
+    "src/lib/review-loop-runtime.server.ts:continueLoopOnPush becomes receive({type:'push', ...}) plus a withPr task (fold, then ensureContinuation). Delete the `continuing` single-flight Map, because one section runs at a time per PR.",
+    "src/lib/review-loop-runtime.server.ts:runPostReviewLoop becomes runtime.step. It claims lane.step; the same jobId awaits the existing promise, and a different job aborts the older step (moot 'newer') and awaits its release. Phase A runs in withPr: head check, fold, maybeEscalate (no guard) and the handoff. Phase B, the provider request, runs OUTSIDE any section, with lane.step.abort as its signal. Phase C runs in withPr: a synchronous log check, then commitFiles, a synchronous log check, then the continuation POST, then the report. Delete inFlightSteps, STEP_IN_FLIGHT, HANDOFF_IN_FLIGHT and ESCALATE_BACKOFF_MS, both one-shot backoff blocks (l.554-560 and l.642-646), and their SILENT_REASONS entries. Delete the module-level productionGh (the runtime owns its client).",
+    "src/lib/review-loop-engine.server.ts:maybeEscalate/escalateNow: delete inFlightEscalate, the ESCALATE_IN_FLIGHT export and the postedByClient WeakMap. Both functions take the runtime's journal as a parameter; serialization is the lane's job.",
+    "src/lib/github-payload.ts:parseGitHubPayload: add `{ ok: true; kind: 'control'; control: { type: 'stop' | 'push'; target; actor; at; installationId } }` for a stop-only comment, inline comment or PR-body stop (no independent mention) and for synchronize. A 'review' delivery gains an optional `control` field for stop plus independent mention. The App's continuation becomes thread.loop = { kind: 'continue', mode } (not 'start').",
+    "src/lib/harbor.server.ts:ingestGitHubWebhook: for kind 'control', call loop.receive() synchronously, cancel the returned job ids, record one 202 control event with the outcome, and never call decideIngress. For a review that carries `control`, call receive() first, then ingest as today. Delete applyLoopControl's live-job scan, the startInFlight proxy, the module-level loopControlClaims and the `/failed|in flight/` release. playGithub: at admission call loop.admitted(ref), and on a gate skip call loop.gateSkipped(ref); admit a thread.loop.kind 'continue' job only if `await loop.sessionActive(ref)`. finishJob: `void loop.step(token, job, sample)`. Create the instance once per process: `const loop = createLoopRuntime({ ...productionGh, token: installationToken, settings: () => state.settings })`.",
+    "src/lib/ingress.ts:reviewSkipReason: keep the control-only stop rule as a defensive skip, so nothing weakens. It is now unreachable for control deliveries.",
+    "docs/review-loop-design.md sections 2b and 5: replace the quiet exit 'another loop step for the same head is in progress (in-process per-head guard)' with the Lane contract: control is appended at receipt; decisions and writes are serialized per PR; callers wait; the newest step for a PR supersedes the older one; stops are ordered by event time, never by job liveness; start intents survive supersession."
+   ],
+   "removes_narrow_patches": [
+    "R1-6: the per-head inFlightSteps guard and the STEP_IN_FLIGHT quiet reason (plus its SILENT_REASONS entry)",
+    "R1-8: ESCALATE_IN_FLIGHT carrying rounds:[], mapped to STEP_IN_FLIGHT at the pre-fix check",
+    "R2-6: the one-shot ESCALATE_BACKOFF_MS retry in escalate() and its 'another handoff for this head is in flight' logged reason",
+    "R3-8: the one-shot backoff at the pre-fix check and the HANDOFF_IN_FLIGHT sentinel",
+    "Engine G7: the inFlightEscalate guard (and the ESCALATE_IN_FLIGHT export) around maybeEscalate/escalateNow",
+    "R3-4/R5-5 (in part): the `continuing` single-flight Map in ensureContinuation (the durable re-scan remains, K1)",
+    "R5-1: pendingStopsByClient/setPendingStop captured at sessionOf call time",
+    "R5-7: the inFlightStop set and the 'stop already in flight' result",
+    "R6-1: the startInFlight flag, harbor's live loop-start job scan, and 'record the stop even if it ended nothing when a start job is live'",
+    "R6-3: harbor's module-level loopControlClaims with release-on-failure and the `/failed|in flight/` regex",
+    "R6-10: the runPostReviewLoop self-heal startLoop call and its 3/6/12 s re-read loop for the start record",
+    "R5-9: harbor's reliance on reviewSkipReason's control-only rule to route stop-only deliveries",
+    "R3-15 / R6-11: test isolation that depended on finally-releases and per-client WeakMaps (each test builds its own runtime)",
+    "The module-level productionGh memo that the per-client caches depended on"
+   ],
+   "tests": [
+    "Lane linearizability property test (runtime, fresh createLoopRuntime per case). Use a gated fake GitHub where every list, POST, git-data call and the token provider can be held and released by a deterministic scheduler. Enumerate interleavings of: a start intent whose record POST is delayed; an edit-time stop; a push; and an apply step (fix request, commit, continuation). Assert for every interleaving: (1) no updateBranchRef call begins after a stop was received; (2) no continuation POST begins after a stop was received; (3) exactly one STOPPED record, if and only if the stop ended a session in the fold of durable history plus the lane log; (4) a brand-new runtime folding only the final durable history reaches the same session (restart equivalence); (5) no result reason matches /in flight/.",
+    "Regression tests from scratchpad r74/k2-repro/k2-repro.test.ts, inverted: I1, a stop racing the start record (no self-heal any more), gives no commit and no continuation; I2/I4, no continuation after STOPPED, and the applied report says 'Loop stopped by the operator'; I3, no commit after a STOPPED acknowledgement; I5, an in-session suggest-to-apply upgrade supersedes the running suggest step and runs in apply mode, and neither result is a silent busy reason; I6, two runtimes in one process are isolated (a hung step in A never affects B).",
+    "Harbor tests via tests/review/app-fixture.mjs mocking the loop runtime with a recorder (see r74/k2-repro/k2-harbor-repro.e2e.mjs and app-fixture.patch). I8: a stop whose time precedes a live start does not cancel that start's job. I9: when the token provider fails, the stop stays in the lane log and the runtime retries the record, with no redelivery needed. I10: a start superseded before admission is recorded when the superseding job is admitted, and dropped when that job is gate-skipped. Stop-only comment, inline and PR-body edits, and synchronize, parse as kind 'control', create no job and never call decideIngress. A bot continuation job is skipped at admission when the fold is inactive.",
+    "Keep with stronger assertions: 'two steps for the SAME head never run two fix rounds' (exactly one fix request; the other result is superseded or newer, never a busy reason); engine G7 'concurrent escalation posts at most once', now driven through the lane; 'a handoff that lands during the step ends the session: no fix' (the step waits for the handoff section instead of backing off); all round-5 and round-6 stop and start tests, unchanged in intent.",
+    "github-payload.test.ts: stop-only deliveries (comment created or edited, inline followup, PR body opened or edited, and a mention inside the stop directive) produce kind 'control'. A stop with an independent mention produces kind 'review' with control set. The App's continuation parses as loop.kind 'continue'."
+   ],
+   "risk": "This is a large, cross-cutting change: harbor ingest and admission, the runtime, the engine and the payload parser. Ordering semantics move from 'busy returns early' to 'wait for your turn', which brings several risks. (a) Deadlock through re-entrant withPr, for example a section calling ensureContinuation that itself calls withPr. Mitigate with an AsyncLocalStorage re-entry guard that runs the call inline, plus a test-time assertion. (b) A section must never contain the multi-hour provider request or a sleep-heavy retry loop, or stops queue behind it. Keep retries as rescheduled tasks, not awaits inside a section. (c) ingestGitHubWebhook must stay synchronous, so receive() only appends and schedules. (d) Newest-step-wins can abort a nearly finished fix, but only outside the commit section; inside it the older step completes and the newer one then sees 'head moved'. (e) Several existing tests assert sentinel strings ('another loop step is in flight for this head', 'still being posted by another loop step'). They must be rewritten to assert the stronger guarantee (one fix request, no fix past a handoff, never a silent drop), not deleted. (f) Cross-process coordination stays a documented non-goal (single harbor instance). The lane gives in-process linearizability, and durable records keep restart equivalence.",
+   "size": "large"
+  }
+ }
+]

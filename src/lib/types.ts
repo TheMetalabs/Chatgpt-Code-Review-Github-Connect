@@ -4,6 +4,9 @@ import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 import type { ReviewLoopDirective } from "./review-loop.ts";
 import type { GateMode, GateStats, PriorFinding } from "./finding-gate.ts";
 
+/** One finding the bot posted earlier on the PR (finding-gate.ts owns the shape; prior-findings.ts reads it back from GitHub). */
+export type { PriorFinding };
+
 /** null means the head repository provenance is not established. */
 export type ForkStatus = boolean | null;
 
@@ -224,8 +227,15 @@ export interface Job {
   notes?: Finding[];
   /** The finding gate's counts for the merged result (ops comment "Gate:" line). */
   gateStats?: GateStats;
-  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. */
+  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. With Settings
+   * postLatestHeadOnly on, a moved head means the review was NOT posted (status skipped). */
   headMovedTo?: string;
+  /** Ops note when the bot's prior findings could not be listed (duplicate checks then fail open). */
+  priorFindingsNote?: string;
+  /** Findings the finding gate dropped as repeats of the bot's prior findings (GateResult reasons;
+   * set by the gate wiring). With nothing left to post, the poster skips instead of posting a clean
+   * (total=0) review, which the loop would read as CONVERGED. */
+  priorDuplicates?: number;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
 }
@@ -382,8 +392,12 @@ export interface SamplePr {
    * code_review.md): the policy authority, so a PR cannot rewrite the rules it is reviewed by. `files`
    * holds every changed path at HEAD, these included (github-snapshot.ts changedPolicyDocs). */
   basePolicyFiles?: SnapshotFile[];
-  /** The bot's earlier findings on this PR (finding-gate dedupe), when the snapshot was given them. */
+  /** The bot's own earlier findings on this PR (inline finding comments + unanchored body findings),
+   * listed at validation time for the finding gate (GateContext.priorFindings) and the same-head
+   * repost check. Absent: not listed (setting off, or the listing failed — fail open). */
   priorFindings?: PriorFinding[];
+  /** Commits the bot already posted a review summary on. */
+  priorReviewedHeads?: string[];
 }
 
 export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";

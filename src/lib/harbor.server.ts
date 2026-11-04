@@ -15,7 +15,8 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listPullReviews, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { collectPriorFindings, dedupePriorOn, postLatestHeadOnlyOn, sameHeadRepost, sameSha, type PriorFindingsResult } from "./prior-findings";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { truncatedReviewField } from "./extract-chat-json";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
@@ -41,7 +42,7 @@ import { auxiliaryFailed, outcomeNote, reviewOutcome, salvagedReview, skippedNot
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { AuxiliaryProviderFailure, BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { AuxiliaryProviderFailure, BotSettings, Finding, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -1346,6 +1347,22 @@ export async function submitHarborChat(
   }
   // Snapshot succeeded: token is defined for the rest of this validation.
   if (!token) return revert("missing installation token");
+  // The bot's own earlier findings on this PR (D: no re-posting), listed at gate time so the finding
+  // gate (GateContext.priorFindings) and the poster's same-head check see every review posted up to
+  // now. Fail open: a listing failure drops the duplicate checks, never the review.
+  if (dedupePriorOn(state.settings) || postLatestHeadOnlyOn(state.settings)) {
+    const prior = await loadPriorFindings(token, job);
+    if ("error" in prior) {
+      const note = `Prior findings could not be listed (${prior.error.slice(0, 80)}) — no duplicate check`;
+      transitionJob(jobId, (j) => ({ ...j, priorFindingsNote: note }));
+    } else {
+      sample = { ...sample, priorFindings: prior.findings, priorReviewedHeads: prior.reviewedHeads };
+      transitionJob(jobId, (j) => (j.priorFindingsNote ? { ...j, priorFindingsNote: undefined } : j));
+    }
+    const cur = state.jobs.find((j) => j.id === jobId);
+    if (!cur || cur.status === "cancelled") return { ok: false, error: "cancelled" };
+    if (!ownsValidatorGeneration(cur, validatorGeneration)) return { ok: false, error: "stale validator" };
+  }
 
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
@@ -1797,6 +1814,39 @@ function finishResult(jobId: string): { ok: true } | { ok: false; error: string 
   return { ok: true };
 }
 
+/** The bot's own earlier findings and reviewed heads on the job's PR (prior-findings.ts), or why
+ * they could not be listed. Never throws. */
+async function loadPriorFindings(token: string, job: Pick<Job, "owner" | "repo" | "pr">): Promise<PriorFindingsResult | { error: string }> {
+  try {
+    const [comments, reviews] = await Promise.all([
+      listReviewComments(token, job.owner, job.repo, job.pr),
+      listPullReviews(token, job.owner, job.repo, job.pr),
+    ]);
+    return collectPriorFindings({ comments, reviews, botLogin: ashlarBotLogin() });
+  } catch (e) {
+    return { error: formatGithubError(e) };
+  }
+}
+
+/**
+ * D4 — nothing new to post: the review would only repeat what the bot already posted. Either the
+ * finding gate dropped every finding as a repeat of a prior one (Job.priorDuplicates) — posting the
+ * empty remainder would read as a clean pass (total=0, the loop's CONVERGED) although those findings
+ * still stand — or the bot already reviewed this exact head and every finding repeats one it posted
+ * there (Settings findingDedupePrior). A verbatim salvaged reply always posts (it is evidence, not a
+ * structured finding), and a loop-driven review keeps its same-head verdict (the loop needs one).
+ * Returns the commit of the review that already says it, or undefined to post.
+ */
+function noNewFindingsSince(job: Job, findings: Finding[], sample: SamplePr | undefined, settings: BotSettings): string | undefined {
+  if (job.rawReview) return undefined;
+  const heads = sample?.priorReviewedHeads ?? [];
+  if (!findings.length && (job.priorDuplicates ?? 0) > 0) {
+    return heads[0] ?? sample?.priorFindings?.find((f) => f.commitId)?.commitId ?? "an earlier head";
+  }
+  if (!dedupePriorOn(settings) || job.thread?.loop?.kind === "start" || !sample?.priorFindings) return undefined;
+  return sameHeadRepost(findings, { findings: sample.priorFindings, reviewedHeads: heads }, job.headSha) ? job.headSha : undefined;
+}
+
 async function finishJob(jobId: string, sample: SamplePr | undefined, token?: string) {
   const after = state.jobs.find((j) => j.id === jobId);
   if (!after || after.status === "cancelled" || after.status === "posted") return;
@@ -1804,6 +1854,22 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const policy = state.settings;
   const { inline, unanchored } = partitionPublishable(after, policy, sample);
   const review = buildReview(after, inline, unanchored, policy);
+
+  const since = review && token && after.origin === "github" ? noNewFindingsSince(after, [...inline, ...unanchored], sample, policy) : undefined;
+  if (since) {
+    const at = since.length >= 7 ? since.slice(0, 7) : since;
+    transitionJob(jobId, (j) => ({
+      ...j,
+      status: "skipped",
+      skipReason: `poster: no new findings since the review on ${at}`,
+      mergeRecommendation: undefined,
+      postedReviewId: undefined,
+      updatedAt: Date.now(),
+    }));
+    if (token) void reactQuiet(token, after, "+1");
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", `No new findings since the review on ${at} — review not posted.`].filter(Boolean));
+    return;
+  }
 
   if (!review) {
     transitionJob(jobId, (j) => ({
@@ -1825,9 +1891,44 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   let githubError: string | undefined;
   let postedToGithub = false;
   let inlineDropped = false;
+  // Settings postLatestHeadOnly, read live: the head is checked immediately before posting, so a
+  // review of a head the PR has moved past is never posted (a job can wait hours in the local queue).
+  const latestHeadOnly = postLatestHeadOnlyOn(policy);
+  let headCheckNote: string | undefined;
   if (token && after.origin === "github") {
     const still = state.jobs.find((j) => j.id === jobId);
     if (!still || still.status === "cancelled" || still.status === "posted") return;
+    if (latestHeadOnly) {
+      let liveHead: string | undefined;
+      try {
+        liveHead = (await fetchPullHead(token, after.owner, after.repo, after.pr)).headSha;
+      } catch (e) {
+        // Fail open: an unreadable head posts on the reviewed head, as before this check existed.
+        headCheckNote = `HEAD check before posting failed (${formatGithubError(e).slice(0, 80)}) — posted on the reviewed head`;
+      }
+      const cur = state.jobs.find((j) => j.id === jobId);
+      if (!cur || cur.status === "cancelled" || cur.status === "posted") return;
+      if (liveHead && !sameSha(liveHead, after.headSha)) {
+        const old = after.headSha.slice(0, 7);
+        const moved = liveHead.slice(0, 7);
+        // Skipped, never posted: no findings marker reaches GitHub, so the loop cannot read this as
+        // clean (CONVERGED) and no fix round starts on a stale head.
+        transitionJob(jobId, (j) => ({
+          ...j,
+          status: "skipped",
+          skipReason: `stale head: reviewed ${old}, HEAD moved to ${moved} — review not posted`,
+          headMovedTo: liveHead,
+          mergeRecommendation: undefined,
+          postedReviewId: undefined,
+          updatedAt: Date.now(),
+        }));
+        void upsertOpsComment(token, jobId, "skipped", [
+          after.localVerifyNote ?? "",
+          `Reviewed ${old}, but HEAD moved to ${moved} — review not posted (request /review again).`,
+        ].filter(Boolean));
+        return;
+      }
+    }
     try {
       const posted = await createPullReview(token, {
         owner: review.owner,
@@ -1882,7 +1983,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;
-  if (token && after.origin === "github") {
+  // With postLatestHeadOnly off the review posts whatever the head; the move is only noted after.
+  if (token && after.origin === "github" && !latestHeadOnly) {
     try {
       const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
       if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
@@ -1896,6 +1998,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
+  if (headCheckNote) notes.push(headCheckNote);
+  if (postedJob.priorFindingsNote) notes.push(postedJob.priorFindingsNote);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
   // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
   // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
@@ -2298,6 +2402,9 @@ export function ingestGitHubWebhook(opts: {
   }
 
   applyLoopControl(parsed, opts.deliveryId);
+  // D — a pushed head supersedes reviews of the old head. The push itself never starts an LLM review
+  // (the explicit-request rule in ingress stays); it only ends work whose result could not be posted.
+  const staleCancelled = parsed.trigger === "pull_request.synchronize" ? supersedeStaleHeadJobs(parsed.target) : [];
 
   const ingressMs = Math.max(8, performance.now() - t0);
   const decision = decideIngress({
@@ -2310,7 +2417,7 @@ export function ingestGitHubWebhook(opts: {
     knownDeliveries: acceptedDeliveryIds(state.events),
     thread: parsed.thread,
   });
-  return enqueueFromDecision(decision, {
+  const result = enqueueFromDecision(decision, {
     deliveryId: opts.deliveryId,
     trigger: parsed.trigger,
     sample: parsed.target,
@@ -2323,6 +2430,29 @@ export function ingestGitHubWebhook(opts: {
     hmac: "ok",
     untrustedBody: parsed.untrustedBody,
   });
+  return staleCancelled.length ? { ...result, cancelled: staleCancelled } : result;
+}
+
+/**
+ * Settings postLatestHeadOnly: a push (pull_request.synchronize) cancels the PR's live review jobs
+ * pinned to another head — their review could only be skipped at the pre-post head check, so they
+ * would hold a reviewer and the local queue for nothing. A job still resolving its head (headSha "",
+ * a comment trigger) resolves the pushed head and is kept, as is one already posting (its own pre-post
+ * head check decides). Cancellation goes through transitionJob, which aborts a local leg and writes
+ * the terminal ops comment ("Cancelled: superseded … No review posted.").
+ */
+function supersedeStaleHeadJobs(target: { owner: string; repo: string; pr: number; headSha: string }): string[] {
+  if (!postLatestHeadOnlyOn(state.settings) || !target.headSha) return [];
+  const short = target.headSha.slice(0, 7);
+  const stale = state.jobs.filter((j) => j.owner === target.owner && j.repo === target.repo && j.pr === target.pr &&
+    isLive(j.status) && j.status !== "posting" && Boolean(j.headSha) && !sameSha(j.headSha, target.headSha));
+  for (const j of stale) {
+    cancelLocalJsonRepairs("superseded", j.id);
+    transitionJob(j.id, (cur) => (isLive(cur.status) && cur.status !== "posting"
+      ? { ...cur, status: "cancelled", skipReason: `superseded: HEAD moved to ${short} (push) — request /review again`, headMovedTo: target.headSha, updatedAt: Date.now() }
+      : cur));
+  }
+  return stale.filter((j) => state.jobs.find((c) => c.id === j.id)?.status === "cancelled").map((j) => j.id);
 }
 
 // Boot, once per process: hand off the fix rounds a restart cut — sessions left at FIXING with

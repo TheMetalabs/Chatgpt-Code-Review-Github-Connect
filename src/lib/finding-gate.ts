@@ -29,7 +29,10 @@ export interface PriorFinding {
   file: string;
   title: string;
   evidence?: string;
+  /** The commit the finding was posted on. */
   commitId?: string;
+  /** Posted line (informational; duplicate checks ignore line numbers). */
+  line?: number;
 }
 
 export interface GateContext {

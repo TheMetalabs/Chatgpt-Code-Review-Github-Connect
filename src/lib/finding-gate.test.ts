@@ -494,6 +494,30 @@ describe("finding gate: C1 notes", () => {
     assert.notEqual(one(mk({ title: "Hard-coded API key in the request", rootCause: "A secret key is committed." })).action, "note");
   });
 
+  it("matches categories on the title and reads defect cues across the whole claim", () => {
+    for (const patch of [
+      { title: "Misleading variable name hides a doubled order total", failureScenario: "A cart of 10 is saved with a total of 20." },
+      { title: "Order total is saved twice; no test covers it" },
+      { title: "Renaming the total field breaks the receipt mail", failureScenario: "Receipts render an empty amount." },
+      { title: "Order total is saved before the stock check", rootCause: "saveOrder runs before the reservation; there is no test for the last-item case." },
+      { title: "번역된 주문 총액이 두 배로 저장됨", failureScenario: "10원 주문이 20원으로 저장된다." },
+      { title: "Readability of submitOrder: the total is computed incorrectly for free items", failureScenario: "A cart with a free item is saved with a wrong total." },
+    ] as Partial<Finding>[]) {
+      const d = one(mk(patch));
+      assert.equal(d.action, "keep", `${patch.title} -> ${d.reasons.join("; ")}`);
+    }
+  });
+
+  it("never routes a P0/P1 proven on a changed line that states a failure outcome to notes", () => {
+    const f = { title: "Readability refactor of submitOrder: guest orders are not saved", failureScenario: "A guest checkout shows success but the order is not saved." };
+    assert.equal(one(mk(f)).action, "keep");
+    // The same remark at P2, or without a changed-line quote, is still a style note.
+    assert.equal(one(mk({ ...f, severity: "P2" })).reasons[0], "note:style");
+    assert.equal(one(mk({ ...f, evidence: UNCHANGED_EV })).reasons[0], "note:style");
+    // A pure lint remark at P1 with a changed-line quote and no failure outcome is still a note.
+    assert.equal(one(mk({ title: "Ref assigned during render", failureScenario: "React strict mode double-invokes render and the linter flags the write." })).reasons[0], "note:style");
+  });
+
   it("leaves categories as findings when notes are off", () => {
     assert.notEqual(one(mk({ title: "Ref assigned during render" }), ctx(), { ...ON, notes: false }).action, "note");
   });

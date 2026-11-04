@@ -692,7 +692,10 @@ function ownReplyContradiction(f: Finding, ctx: GateContext, provenOnChanged: bo
 // ── C1 notes routing ──────────────────────────────────────────────────────────────────────────────
 
 /** A concrete runtime failure in the claim: such a finding is never routed to notes by wording alone. */
-const DEFECT_CUE = /\b(?:crash(?:es)?|throws?|exception|TypeError|ReferenceError|leaks?|leaked|race|deadlock|double[- ]?(?:charge|capture|post|submit|count|send)|twice|bypass(?:es)?|unauthori[sz]ed|injection|xss|csrf|ssrf|vulnerab\w*|overflow|corrupt(?:s|ion)?|data loss|lost|collision|never (?:terminates?|resolves?|runs?|called|fires?|triggers?|sent|delivered)|hangs?|infinite|null pointer|undefined is not|wrong (?!name|naming|wording|words?|labels?|spelling|case|indentation|format)\w+|privilege|exposes?)\b|크래시|예외|누수|경쟁\s*상태|중복\s*(?:결제|처리|실행|발송)|우회|권한\s*상승|데이터\s*손실|무한/i;
+const DEFECT_CUE = /\b(?:crash(?:es)?|(?<!\b(?:the|a|an|this|that|its)\s+)throws?|exception|TypeError|ReferenceError|leaks?|leaked|race|deadlock|double[- ]?(?:charge|capture|post|submit|count|send)|doubl(?:ed|es)|twice|bypass(?:es)?|unauthori[sz]ed|injection|xss|csrf|ssrf|vulnerab\w*|overflow|corrupt(?:s|ed|ion)?|data loss|lost|loses?|losing|collision|never (?:terminates?|resolves?|runs?|called|fires?|triggers?|sent|delivered)|hangs?|infinite|null pointer|undefined is not|breaks?|broken|incorrect (?:results?|amounts?|values?|totals?|data|state|output|counts?|prices?|balances?|responses?|status)|(?:computed|calculated|returned|stored|saved|charged|applied|set|is|are|was|were) incorrectly|incorrectly (?:computed|calculated|returned|stored|saved|charged|applied|set)|wrong (?!name|naming|wording|words?|labels?|spelling|case|indentation|format)\w+|privilege|exposes?)\b|크래시|예외|누수|경쟁\s*상태|중복\s*(?:결제|처리|실행|발송)|우회|권한\s*상승|데이터\s*손실|무한|잘못|두\s*배|두\s*번|깨짐|깨진|깨지|누락된\s*(?:처리|결제|저장|이벤트|요청)|손상/i;
+/** Any stated failure outcome. A P0/P1 proven by a verified quote on a changed line whose claim states
+ * one is never routed to notes: its category words (a rename, a log line, a test) are context. */
+const OUTCOME_CUE = /\b(?:fails?|failing|failures?|errors?|returns? (?:null|undefined|nothing|0|zero|false|empty|stale|the wrong|an? (?:wrong|stale|empty|error))|5\d\d|4\d\d|rejects?|rejected|blocks?|blocked|stuck|timeouts?|times? out|silently|not (?:saved|sent|delivered|applied|called|run|persisted|charged|refunded)|users? (?:sees?|gets?|loses?|cannot|can't|are (?:charged|logged|shown))|undefined|NaN)\b|실패|오류|에러|저장되지|전송되지|반영되지|호출되지|undefined/i;
 const SENSITIVE = /\b(?:passwords?|passwd|secrets?|api[- ]?keys?|tokens?|credentials?|private keys?|pii|personal data|ssn|card numbers?)\b|개인정보|비밀번호|토큰|민감/i;
 
 const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
@@ -757,17 +760,22 @@ const CATEGORY_RULES: { category: GateNoteCategory; re: RegExp[] }[] = [
 const isTestPath = (p: string) => /\.spec\.|\.test\.|__tests__|\/tests?\//.test(p);
 const ADD_TEST_FIX = /\b(?:add|write|extend|cover)\b.{0,60}\b(?:tests?|test cases?|specs?|assertions?)\b|테스트(?:를|케이스를)?\s*(?:추가|작성|보강)/i;
 
-function noteCategory(f: Finding): GateNoteCategory | undefined {
-  const head = stripQuoted([f.title, f.rootCause].join("\n"));
-  const defect = DEFECT_CUE.test(stripQuoted([f.title, f.failureScenario].join("\n")));
+/** The note category of a finding, or undefined for a defect claim. Categories match on the TITLE (the
+ * headline is what the finding is about; a root cause that mentions "no test" or a log line explains a
+ * defect, it does not make it advice). A defect cue anywhere in the claim keeps it a finding, and so
+ * does any stated failure outcome on a P0/P1 proven by a verified quote on a changed line. */
+function noteCategory(f: Finding, provenOnChanged: boolean): GateNoteCategory | undefined {
+  const title = stripQuoted(f.title);
+  const claim = claimText(f);
+  const defect = DEFECT_CUE.test(claim) || (provenOnChanged && RANK[f.severity] <= RANK.P1 && OUTCOME_CUE.test(claim));
   if (isDocPath(f.file) && !/\.txt$/i.test(f.file)) return "docs";
   // A finding on a test file whose fix is more tests is coverage advice: a failure cue in its text
   // ("throws") describes the production path the test exercises, not a defect in the change.
-  if (isTestPath(f.file) && ADD_TEST_FIX.test(f.recommendedFix) && !SENSITIVE.test(head)) return "test";
+  if (isTestPath(f.file) && ADD_TEST_FIX.test(f.recommendedFix) && !SENSITIVE.test(claim)) return "test";
+  if (defect) return undefined;
   for (const rule of CATEGORY_RULES) {
-    if (!rule.re.some((re) => re.test(head))) continue;
-    if (defect) continue;
-    if ((rule.category === "log" || rule.category === "i18n") && SENSITIVE.test(head)) continue;
+    if (!rule.re.some((re) => re.test(title))) continue;
+    if ((rule.category === "log" || rule.category === "i18n") && SENSITIVE.test(claim)) continue;
     return rule.category;
   }
   return undefined;
@@ -869,7 +877,7 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
     // A note-category remark (docs / i18n / style / log wording / test advice) needs no proof: it is
     // never counted, never inline, never REQUEST_CHANGES. R3 exists to stop an unproven DEFECT claim,
     // so such a remark becomes a note instead of a drop; noteCategory never matches a defect claim.
-    const category = opts.notes ? noteCategory(f) : undefined;
+    const category = opts.notes ? noteCategory(f, ev.onChanged) : undefined;
     if (category) {
       const why = ev.quotes.length ? `${ev.quotes.length} quote(s), none found at head` : "no code quote";
       return { finding: f, action: "note", reasons: [`note:${category}`, `note_evidence_unverified: ${why}`], severityBefore: before };
@@ -882,7 +890,7 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (ev.noContent) reasons.push("evidence_unchecked: no head content or diff to verify against");
 
   if (opts.notes) {
-    const category = noteCategory(f);
+    const category = noteCategory(f, ev.onChanged);
     if (category) return { finding: f, action: "note", reasons: [`note:${category}`, ...reasons], severityBefore: before };
   }
 

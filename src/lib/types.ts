@@ -2,6 +2,7 @@ import type {RepairReceipt} from "./json-repair-types.ts";
 import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 import type { ReviewLoopDirective } from "./review-loop.ts";
+import type { GateMode, GateStats, PriorFinding } from "./finding-gate.ts";
 
 /** null means the head repository provenance is not established. */
 export type ForkStatus = boolean | null;
@@ -218,6 +219,11 @@ export interface Job {
   coverageDeterministic?: { path: string; inDiff: boolean; inContext: boolean; reason?: string }[];
   /** Review-coverage: findings dropped by the precision gate. */
   droppedCount?: number;
+  /** Findings the finding gate routed to notes (finding-gate.ts C1): rendered under "Notes (not
+   * findings)" in the review body; never counted, never inline, never REQUEST_CHANGES. */
+  notes?: Finding[];
+  /** The finding gate's counts for the merged result (ops comment "Gate:" line). */
+  gateStats?: GateStats;
   /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. */
   headMovedTo?: string;
   /** Public snapshot only — never includes reviewer raw JSON. */
@@ -327,6 +333,20 @@ export interface BotSettings {
   promptContextMaxChars: number;
   promptPolicyMaxChars: number;
   contextPadLines: number;
+  /** Finding precision (finding-gate.ts), operated from the Settings screen. "off" posts every
+   * finding on changed code (the pre-2026-11 policy); "rules" applies the deterministic gate;
+   * "refute" applies the same rules (a model refute pass, when wired, runs after them). */
+  findingGate: GateMode;
+  /** A P0/P1 keeps its severity only with a closed reproduction path (a verified quote on a changed
+   * line, a failure scenario, no hedge); otherwise it is demoted to P2. */
+  findingP1ClosedPath: boolean;
+  /** Docs / i18n / style / log-wording / test-advice findings become body notes, not findings. */
+  findingNotes: boolean;
+  /** Drop a finding the bot already reported on this PR (an older head, or this head again). */
+  findingDedupePrior: boolean;
+  /** Post a review only for the PR's latest head (a review of a head the PR has moved past is not
+   * posted, and an earlier head's findings are never re-posted). */
+  postLatestHeadOnly: boolean;
   localLlmApiKeySet?: boolean;
   webhookSecretSet?: boolean;
 }
@@ -362,6 +382,8 @@ export interface SamplePr {
    * code_review.md): the policy authority, so a PR cannot rewrite the rules it is reviewed by. `files`
    * holds every changed path at HEAD, these included (github-snapshot.ts changedPolicyDocs). */
   basePolicyFiles?: SnapshotFile[];
+  /** The bot's earlier findings on this PR (finding-gate dedupe), when the snapshot was given them. */
+  priorFindings?: PriorFinding[];
 }
 
 export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";
@@ -475,6 +497,11 @@ export const DEFAULT_SETTINGS: BotSettings = {
   promptContextMaxChars: 200_000,
   promptPolicyMaxChars: 32_768,
   contextPadLines: 20,
+  findingGate: "rules",
+  findingP1ClosedPath: true,
+  findingNotes: true,
+  findingDedupePrior: true,
+  postLatestHeadOnly: true,
 };
 
 export const DEFAULT_REVIEW_ORDER: ReviewProvider[] = ["local", "chatgpt", "grok"];

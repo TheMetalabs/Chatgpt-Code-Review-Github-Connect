@@ -43,6 +43,7 @@ import {
 } from "./types.ts";
 import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
 import { modelRateLimitsProblem } from "./local-model-rate-limit.ts";
+import { GATE_MODES } from "./finding-gate.ts";
 
 /** Per-provider facts every fix-agent decision reads (design §6b): the Settings rules, the loop
  * runtime's transport routing (productionRequestFix), and the fix watcher's deadlines
@@ -388,6 +389,11 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   promptContextMaxChars: int("promptContextMaxChars"),
   promptPolicyMaxChars: int("promptPolicyMaxChars"),
   contextPadLines: int("contextPadLines"),
+  findingGate: oneOf("finding_precision.gate", GATE_MODES),
+  findingP1ClosedPath: bool("finding_precision.p1_closed_path"),
+  findingNotes: bool("finding_precision.notes"),
+  findingDedupePrior: bool("finding_precision.dedupe_prior"),
+  postLatestHeadOnly: bool("finding_precision.post_latest_head_only"),
 };
 
 export const SETTINGS_FIELDS = Object.keys(SETTINGS_FIELD_RULES) as SettingsField[];

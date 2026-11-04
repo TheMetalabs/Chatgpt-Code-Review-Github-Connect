@@ -26,6 +26,7 @@ import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.s
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
+import { gateStatsLine } from "./finding-gate";
 import {
   buildReview,
   partitionPublishable,
@@ -1642,6 +1643,10 @@ export async function submitHarborChat(
       auxiliaryProviderFailures: auxiliaryFailures,
       coverage: [...coverageByFile.values()],
       droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
+      // Gate notes render in the body only (never counted, inline, or REQUEST_CHANGES); the gate's
+      // counts go to the ops comment.
+      notes: merged.notes?.length ? merged.notes : undefined,
+      gateStats: merged.gateStats,
       plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}${cutLegs.length ? `; no finding in the complete verdict of ${cutLegs.join(" + ")}, reply posted as coverage evidence` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,
@@ -1810,7 +1815,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       updatedAt: Date.now(),
     }));
     if (token) void reactQuiet(token, after, "+1");
-    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted."].filter(Boolean));
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted.", after.gateStats ? gateStatsLine(after.gateStats) : ""].filter(Boolean));
     return;
   }
 

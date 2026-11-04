@@ -32,7 +32,11 @@ export async function appFixture(options={}, githubOptions={}) {
  server.requestTimeout=0;server.timeout=0;
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  const origin=`http://127.0.0.1:${server.address().port}`;
- const settings={...types.DEFAULT_SETTINGS,reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ // findingGate 'off' by default: these suites pin pipeline mechanics (merge, lifecycle, verify-clean,
+ // raw evidence) with placeholder findings whose evidence quotes no fixture code, which the precision
+ // gate (finding-gate.ts, default 'rules') would rightly drop. A test of the gate itself passes
+ // {findingGate:'rules'} (finding-gate-wiring.test.mjs).
+ const settings={...types.DEFAULT_SETTINGS,findingGate:'off',reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
   changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],diff:'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n'};
  const clock={now:Date.now()};class Clock extends Date{static now(){return clock.now;}}

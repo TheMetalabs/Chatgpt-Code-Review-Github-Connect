@@ -474,8 +474,12 @@ function groupReviewValid(raw: string, groupPaths: string[], sample: SamplePr, s
   // Validate against THIS group's subset (a finding in another group's file must not count here) and
   // with publishMinSeverity forced to P2 (a group that found only lower-severity issues still did
   // review them — the publish threshold governs posting, not whether the group was reviewed).
+  // The finding gate (finding-gate.ts) is off here: whether a group was reviewed is a shape question,
+  // and its precision decisions are made once, on the merged leg, against the full snapshot (harbor
+  // gateLeg). Gating here would mark a group whose findings the gate drops as failed and post its reply
+  // verbatim instead.
   const subset = subsetSample(sample, new Set(groupPaths));
-  const gate = gateLiveSubmission(parseChatSubmission(raw), subset, { ...settings, publishMinSeverity: "P2" });
+  const gate = gateLiveSubmission(parseChatSubmission(raw), subset, { ...settings, publishMinSeverity: "P2", findingGate: "off" });
   return gate.ok === true && (gate.findings.length > 0 || gate.investigatedSafe.length > 0);
 }
 

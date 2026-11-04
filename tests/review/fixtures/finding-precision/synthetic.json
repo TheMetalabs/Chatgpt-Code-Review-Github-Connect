@@ -1,0 +1,454 @@
+{
+  "description": "SYNTHETIC finding-precision eval for the deterministic finding gate (src/lib/finding-gate.ts). Every file, line and finding here is invented for this fixture; none is copied from a real repository. One shared PR snapshot; each case is one reviewer finding plus the same reply's own assumptions / investigated_safe / coverage and the bot's earlier findings on the PR. 'pattern' is the false-positive class it models (speculation, design-intent, factual, concurrency, style-policy, stale-head) or 'valid'. 'expect' is the gate outcome under the default Settings (findingGate=rules, every precision switch on); 'gap' marks a false positive the deterministic rules cannot judge (left to the model refute pass).",
+  "pr": {
+    "headSha": "c0ffee1234567890c0ffee1234567890c0ffee12",
+    "baseSha": "ba5e000000000000000000000000000000000000",
+    "body": "Split invoices (dark launch). SPLIT_INVOICES stays off by default; enabling it is a follow-up PR. Migration 0042 is forward-only.",
+    "files": {
+      "services/notify/listener.ts": [
+        "import { sendMail } from \"./mailer\";",
+        "import { outbox } from \"../outbox/queue\";",
+        "",
+        "export async function onInvoicePaid(event: InvoicePaid) {",
+        "  const result = await sendMail(event.email, renderReceipt(event));",
+        "  if (!result.ok) throw new Error(`receipt mail failed: ${result.error}`);",
+        "  logger.info(\"receipt sent\", { invoiceId: event.id });",
+        "}",
+        "",
+        "export function renderReceipt(event: InvoicePaid) {",
+        "  return { subject: \"결제가 완료되었습니다\", body: `금액: ${event.amount}` };",
+        "}"
+      ],
+      "services/notify/CLAUDE.md": [
+        "# notify module",
+        "",
+        "Listeners throw when delivery fails; the outbox retries the event with backoff.",
+        "",
+        "## Endpoints",
+        "",
+        "- POST /receipts/resend: re-sends a receipt mail (admin only)."
+      ],
+      "services/outbox/queue.ts": [
+        "export const outbox = {",
+        "  async dispatch(event: OutboxEvent, handler: (e: OutboxEvent) => Promise<void>) {",
+        "    try {",
+        "      await handler(event);",
+        "    } catch {",
+        "      await this.retryLater(event);",
+        "    }",
+        "  },",
+        "};"
+      ],
+      "services/billing/migrations/0042_split_invoices.ts": [
+        "export async function up(db: Db) {",
+        "  await db.exec(\"ALTER TABLE invoices ADD COLUMN parent_id TEXT\");",
+        "}",
+        "",
+        "export async function down() {",
+        "  throw new Error(\"forward-only migration: restore from backup instead\");",
+        "}"
+      ],
+      "services/billing/flags.ts": [
+        "export const SPLIT_INVOICES = flag(\"split-invoices\", { default: false });"
+      ],
+      "services/billing/routes.ts": [
+        "import { Router } from \"express\";",
+        "import { refundInvoice } from \"./refund\";",
+        "",
+        "export const router = Router();",
+        "router.post(\"/invoices/:id/refund\", refundInvoice);"
+      ],
+      "services/billing/refund.ts": [
+        "export async function refundInvoice(req: Request, res: Response) {",
+        "  const invoice = await invoices.find(req.params.id);",
+        "  const amount = invoice.total - invoice.refunded;",
+        "  await payments.refund(invoice.paymentId, amount);",
+        "  res.json({ ok: true, amount });",
+        "}"
+      ],
+      "web/src/cart/addItem.ts": [
+        "export async function addItem(db: IDBDatabase, item: CartItem) {",
+        "  const tx = db.transaction([\"items\", \"totals\"], \"readwrite\");",
+        "  const items = tx.objectStore(\"items\");",
+        "  const totals = tx.objectStore(\"totals\");",
+        "  items.put(item);",
+        "  const current = await read(totals.get(\"sum\"));",
+        "  totals.put({ id: \"sum\", value: (current?.value ?? 0) + item.price });",
+        "  await done(tx);",
+        "}"
+      ],
+      "web/src/cart/addItem.test.ts": [
+        "import { addItem } from \"./addItem\";",
+        "",
+        "it(\"adds an item\", async () => {",
+        "  const db = await openTestDb();",
+        "  await addItem(db, { id: \"a\", price: 3 });",
+        "  expect(await count(db, \"items\")).toBe(1);",
+        "});"
+      ],
+      "web/src/cart/CartBadge.tsx": [
+        "export function CartBadge({ count }: { count: number }) {",
+        "  const lastCount = useRef(count);",
+        "  lastCount.current = count;",
+        "  return <span className=\"badge\">{count}</span>;",
+        "}"
+      ],
+      "web/src/feed/loader.ts": [
+        "import { fetchPage } from \"./page\";",
+        "",
+        "export async function loadAll(cursor: string | null) {",
+        "  const out: Item[] = [];",
+        "  while (true) {",
+        "    const rows = await fetchPage(cursor);",
+        "    if (rows.length === 0) break;",
+        "    out.push(...rows);",
+        "    cursor = rows[rows.length - 1].id;",
+        "  }",
+        "  return out;",
+        "}"
+      ],
+      "web/src/feed/page.ts": [
+        "export async function fetchPage(cursor: string | null): Promise<Item[]> {",
+        "  const res = await api.get(\"/feed\", { cursor });",
+        "  return res.ok ? res.items : [];",
+        "}"
+      ]
+    },
+    "referencePaths": ["services/outbox/queue.ts", "web/src/feed/page.ts"],
+    "newFiles": [
+      "services/notify/listener.ts",
+      "services/billing/migrations/0042_split_invoices.ts",
+      "services/billing/flags.ts",
+      "services/billing/refund.ts",
+      "web/src/cart/addItem.ts",
+      "web/src/cart/addItem.test.ts",
+      "web/src/cart/CartBadge.tsx",
+      "web/src/feed/loader.ts"
+    ],
+    "modifiedDiffs": [
+      "diff --git a/services/notify/CLAUDE.md b/services/notify/CLAUDE.md",
+      "--- a/services/notify/CLAUDE.md",
+      "+++ b/services/notify/CLAUDE.md",
+      "@@ -1,2 +1,7 @@",
+      " # notify module",
+      " ",
+      "+Listeners throw when delivery fails; the outbox retries the event with backoff.",
+      "+",
+      "+## Endpoints",
+      "+",
+      "+- POST /receipts/resend: re-sends a receipt mail (admin only).",
+      "diff --git a/services/billing/routes.ts b/services/billing/routes.ts",
+      "--- a/services/billing/routes.ts",
+      "+++ b/services/billing/routes.ts",
+      "@@ -2,4 +2,4 @@",
+      " import { refundInvoice } from \"./refund\";",
+      " ",
+      " export const router = Router();",
+      "-router.post(\"/invoices/:id/refund\", requireAdmin, refundInvoice);",
+      "+router.post(\"/invoices/:id/refund\", refundInvoice);"
+    ]
+  },
+  "cases": [
+    {
+      "id": "speculation-unverified-dispatcher",
+      "pattern": "speculation",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "services/notify/listener.ts", "line": 6,
+        "title": "Receipt mail failure is unhandled",
+        "failure_scenario": "If the outbox dispatcher does not catch listener errors, the worker process crashes on the first failed mail.",
+        "root_cause": "Whether the dispatcher catches listener errors is unverified; the dispatcher is not in the reviewed group.",
+        "evidence": "services/notify/listener.ts:6 `if (!result.ok) throw new Error(`",
+        "recommended_fix": "Catch the error in the listener.",
+        "recommended_test": "Simulate a failed mail."
+      },
+      "expect": { "action": "drop", "reason": "speculative" }
+    },
+    {
+      "id": "speculation-not-in-snapshot",
+      "pattern": "speculation",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "services/billing/refund.ts", "line": 4,
+        "title": "Refund can be issued twice on a payment timeout",
+        "failure_scenario": "A slow payment provider times out and the client retries, refunding twice.",
+        "root_cause": "The payments client is not present in the snapshot; it retries on timeout without an idempotency key.",
+        "evidence": "services/billing/refund.ts:4 `await payments.refund(invoice.paymentId, amount);`",
+        "recommended_fix": "Pass an idempotency key.",
+        "recommended_test": "Retry a timed-out refund."
+      },
+      "expect": { "action": "drop", "reason": "speculative" }
+    },
+    {
+      "id": "speculation-hedge-unchanged-only",
+      "pattern": "speculation",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 4,
+        "title": "Outbox retry may run the listener concurrently",
+        "failure_scenario": "Two retries of the same event might send two receipt mails.",
+        "root_cause": "retryLater may schedule a retry while the first attempt is still running.",
+        "evidence": "services/outbox/queue.ts:6 `await this.retryLater(event);`",
+        "recommended_fix": "Lock per event id.",
+        "recommended_test": "Two overlapping retries."
+      },
+      "expect": { "action": "drop", "reason": "speculative" }
+    },
+    {
+      "id": "design-intent-outbox-retry",
+      "pattern": "design-intent",
+      "label": "fp",
+      "reply": {
+        "coverage": [
+          { "file": "services/notify/CLAUDE.md", "status": "cleared", "reason": "Documents that listeners throw when delivery fails so the outbox retries the event." }
+        ]
+      },
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 6,
+        "title": "Listener throws on mail failure",
+        "failure_scenario": "A failed receipt mail throws out of onInvoicePaid and the event is not completed.",
+        "root_cause": "The listener throws instead of swallowing the delivery error.",
+        "evidence": "services/notify/listener.ts:6 `if (!result.ok) throw new Error(`",
+        "recommended_fix": "Log and return.",
+        "recommended_test": "Failed mail does not throw."
+      },
+      "expect": { "action": "drop", "reason": "contradicted_by_own_reply" }
+    },
+    {
+      "id": "design-intent-dark-launch",
+      "pattern": "design-intent",
+      "label": "fp",
+      "reply": {
+        "investigated_safe": ["services/billing/flags.ts: SPLIT_INVOICES defaults off by design; the PR body says enabling it is a follow-up."]
+      },
+      "finding": {
+        "severity": "P1", "file": "services/billing/flags.ts", "line": 1,
+        "title": "Split invoices flag defaults off so splitting never runs",
+        "failure_scenario": "Invoices are never split in production after this PR ships.",
+        "root_cause": "SPLIT_INVOICES is created with default false and nothing turns it on.",
+        "evidence": "services/billing/flags.ts:1 `export const SPLIT_INVOICES = flag(\"split-invoices\", { default: false });`",
+        "recommended_fix": "Default the flag on.",
+        "recommended_test": "Split path runs with default flags."
+      },
+      "expect": { "action": "drop", "reason": "contradicted_by_own_reply" }
+    },
+    {
+      "id": "design-intent-forward-only-migration",
+      "pattern": "design-intent",
+      "label": "fp",
+      "gap": "the throw message itself documents a forward-only migration; judging intent needs the model refute pass",
+      "finding": {
+        "severity": "P1", "file": "services/billing/migrations/0042_split_invoices.ts", "line": 6,
+        "title": "down() throws, so rollback is impossible",
+        "failure_scenario": "Rolling back release 42 fails with an error and the deploy is stuck.",
+        "root_cause": "down() throws instead of dropping the new column.",
+        "evidence": "services/billing/migrations/0042_split_invoices.ts:6 `throw new Error(\"forward-only migration: restore from backup instead\");`",
+        "recommended_fix": "Drop parent_id in down().",
+        "recommended_test": "Run down() after up()."
+      },
+      "expect": { "action": "keep", "severity": "P1" }
+    },
+    {
+      "id": "factual-doc-in-diff",
+      "pattern": "factual",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 5,
+        "title": "CLAUDE.md not updated for the resend endpoint",
+        "failure_scenario": "Operators cannot find the new resend endpoint.",
+        "root_cause": "The PR diff has no change to services/notify/CLAUDE.md, so the endpoint is undocumented.",
+        "evidence": "services/notify/listener.ts:5 `const result = await sendMail(event.email, renderReceipt(event));`",
+        "recommended_fix": "Document the endpoint.",
+        "recommended_test": "n/a"
+      },
+      "expect": { "action": "drop", "reason": "contradicted_by_diff" }
+    },
+    {
+      "id": "factual-fabricated-quote",
+      "pattern": "factual",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "services/billing/refund.ts", "line": 3,
+        "title": "Refund amount ignores earlier partial refunds",
+        "failure_scenario": "An invoice refunded twice pays out more than its total.",
+        "root_cause": "The refund amount is the invoice amount, not the remaining balance.",
+        "evidence": "services/billing/refund.ts:3 `const amount = invoice.amount;`",
+        "recommended_fix": "Subtract invoice.refunded.",
+        "recommended_test": "Second partial refund."
+      },
+      "expect": { "action": "drop", "reason": "evidence_unverified" }
+    },
+    {
+      "id": "factual-self-retracting",
+      "pattern": "factual",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "services/billing/refund.ts", "line": 3,
+        "title": "Refund can exceed the paid amount",
+        "failure_scenario": "A refund larger than the payment is sent to the provider.",
+        "root_cause": "Re-reading the line: amount is total minus refunded, so this path is safe.",
+        "evidence": "services/billing/refund.ts:3 `const amount = invoice.total - invoice.refunded;`",
+        "recommended_fix": "No change needed.",
+        "recommended_test": "n/a"
+      },
+      "expect": { "action": "drop", "reason": "self_retracted" }
+    },
+    {
+      "id": "concurrency-single-readwrite-transaction",
+      "pattern": "concurrency",
+      "label": "fp",
+      "gap": "both requests run inside one readwrite IndexedDB transaction, which serializes them; only the model refute pass can see that. The deterministic gate demotes the hedged P1 to P2.",
+      "finding": {
+        "severity": "P1", "file": "web/src/cart/addItem.ts", "line": 7,
+        "title": "Item and total writes race",
+        "failure_scenario": "Two addItem calls interleave and the cart total loses an item price.",
+        "root_cause": "items.put and totals.put could interleave because nothing locks the totals store.",
+        "evidence": "web/src/cart/addItem.ts:5 `items.put(item);` | web/src/cart/addItem.ts:7 `totals.put({ id: \"sum\", value: (current?.value ?? 0) + item.price });`",
+        "recommended_fix": "Lock the totals store.",
+        "recommended_test": "Two concurrent addItem calls."
+      },
+      "expect": { "action": "demote", "severity": "P2" }
+    },
+    {
+      "id": "style-ref-during-render",
+      "pattern": "style-policy",
+      "label": "fp",
+      "finding": {
+        "severity": "P1", "file": "web/src/cart/CartBadge.tsx", "line": 3,
+        "title": "Ref assigned during render",
+        "failure_scenario": "React may warn in strict mode.",
+        "root_cause": "lastCount.current is written in the render body instead of an effect.",
+        "evidence": "web/src/cart/CartBadge.tsx:3 `lastCount.current = count;`",
+        "recommended_fix": "Move the write into useEffect.",
+        "recommended_test": "Render twice."
+      },
+      "expect": { "action": "note", "reason": "note:style" }
+    },
+    {
+      "id": "style-hardcoded-korean-email",
+      "pattern": "style-policy",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 11,
+        "title": "Hard-coded Korean text in the receipt email",
+        "failure_scenario": "Non-Korean customers get a Korean subject line.",
+        "root_cause": "The subject and body strings are not localized.",
+        "evidence": "services/notify/listener.ts:11 `subject: \"결제가 완료되었습니다\"`",
+        "recommended_fix": "Move the copy to the i18n catalog.",
+        "recommended_test": "Render with an English locale."
+      },
+      "expect": { "action": "note", "reason": "note:i18n" }
+    },
+    {
+      "id": "style-log-wording",
+      "pattern": "style-policy",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "services/notify/listener.ts", "line": 7,
+        "title": "Log message wording is misleading",
+        "failure_scenario": "On-call reads that a receipt was delivered when only the send call returned.",
+        "root_cause": "The log line says sent before delivery is confirmed.",
+        "evidence": "services/notify/listener.ts:7 `logger.info(\"receipt sent\", { invoiceId: event.id });`",
+        "recommended_fix": "Log 'receipt queued'.",
+        "recommended_test": "n/a"
+      },
+      "expect": { "action": "note", "reason": "note:log" }
+    },
+    {
+      "id": "style-test-coverage-advice",
+      "pattern": "style-policy",
+      "label": "fp",
+      "finding": {
+        "severity": "P2", "file": "web/src/cart/addItem.test.ts", "line": 6,
+        "title": "Spec does not verify the totals update",
+        "failure_scenario": "A regression in the totals write would not fail this spec.",
+        "root_cause": "The test only asserts the items store.",
+        "evidence": "web/src/cart/addItem.test.ts:6 `expect(await count(db, \"items\")).toBe(1);`",
+        "recommended_fix": "Assert the sum too.",
+        "recommended_test": "Assert totals.sum."
+      },
+      "expect": { "action": "note", "reason": "note:test" }
+    },
+    {
+      "id": "stale-head-repost",
+      "pattern": "stale-head",
+      "label": "fp",
+      "priorFindings": [
+        { "file": "services/billing/refund.ts", "title": "Refunding an unknown invoice crashes with a TypeError", "commitId": "0ld0000000000000000000000000000000000000" }
+      ],
+      "finding": {
+        "severity": "P2", "file": "services/billing/refund.ts", "line": 3,
+        "title": "Refunding an unknown invoice id crashes with a TypeError",
+        "failure_scenario": "POST /invoices/missing/refund throws TypeError and returns 500.",
+        "root_cause": "invoices.find returns undefined for an unknown id and the next line dereferences it.",
+        "evidence": "services/billing/refund.ts:3 `const amount = invoice.total - invoice.refunded;`",
+        "recommended_fix": "Return 404 when the invoice is missing.",
+        "recommended_test": "Refund an unknown id."
+      },
+      "expect": { "action": "drop", "reason": "already_reported" }
+    },
+    {
+      "id": "stale-same-head-reviewed-twice",
+      "pattern": "stale-head",
+      "label": "fp",
+      "priorFindings": [
+        { "file": "services/billing/routes.ts", "title": "Refund route lost its admin check", "evidence": "services/billing/routes.ts:5 `router.post(\"/invoices/:id/refund\", requireAdmin, refundInvoice);`", "commitId": "c0ffee1234567890c0ffee1234567890c0ffee12" }
+      ],
+      "finding": {
+        "severity": "P1", "file": "services/billing/routes.ts", "line": 5,
+        "title": "Refund endpoint no longer requires admin",
+        "failure_scenario": "Any signed-in customer can POST /invoices/:id/refund and refund any invoice.",
+        "root_cause": "The PR removed requireAdmin from the refund route.",
+        "evidence": "services/billing/routes.ts:5 `router.post(\"/invoices/:id/refund\", refundInvoice);` replaced `router.post(\"/invoices/:id/refund\", requireAdmin, refundInvoice);`",
+        "recommended_fix": "Restore requireAdmin.",
+        "recommended_test": "Non-admin refund returns 403."
+      },
+      "expect": { "action": "drop", "reason": "already_reported" }
+    },
+    {
+      "id": "valid-two-locations-one-unchanged",
+      "pattern": "valid",
+      "label": "valid",
+      "finding": {
+        "severity": "P1", "file": "web/src/feed/loader.ts", "line": 7,
+        "title": "An error page ends pagination early and drops the rest of the feed",
+        "failure_scenario": "When /feed returns a 500 for page 3, fetchPage returns [] and loadAll stops, so the user sees a truncated feed with no error.",
+        "root_cause": "fetchPage maps a failed response to an empty page, and loadAll treats an empty page as the end of the feed.",
+        "evidence": "web/src/feed/loader.ts:7 `if (rows.length === 0) break;` | web/src/feed/page.ts:3 `return res.ok ? res.items : [];`",
+        "recommended_fix": "Throw on a failed page instead of returning [].",
+        "recommended_test": "A 500 on page 3 surfaces an error."
+      },
+      "expect": { "action": "keep", "severity": "P1" }
+    },
+    {
+      "id": "valid-removed-admin-guard",
+      "pattern": "valid",
+      "label": "valid",
+      "finding": {
+        "severity": "P1", "file": "services/billing/routes.ts", "line": 5,
+        "title": "Refund endpoint no longer requires admin",
+        "failure_scenario": "Any signed-in customer can POST /invoices/:id/refund and refund any invoice.",
+        "root_cause": "The PR removed requireAdmin from the refund route.",
+        "evidence": "services/billing/routes.ts:5 `router.post(\"/invoices/:id/refund\", refundInvoice);` replaced `router.post(\"/invoices/:id/refund\", requireAdmin, refundInvoice);`",
+        "recommended_fix": "Restore requireAdmin.",
+        "recommended_test": "Non-admin refund returns 403."
+      },
+      "expect": { "action": "keep", "severity": "P1" }
+    },
+    {
+      "id": "valid-p2-unknown-invoice",
+      "pattern": "valid",
+      "label": "valid",
+      "finding": {
+        "severity": "P2", "file": "services/billing/refund.ts", "line": 3,
+        "title": "Refunding an unknown invoice id crashes with a TypeError",
+        "failure_scenario": "POST /invoices/missing/refund throws TypeError and returns 500.",
+        "root_cause": "invoices.find returns undefined for an unknown id and the next line dereferences it.",
+        "evidence": "services/billing/refund.ts:3 `const amount = invoice.total - invoice.refunded;`",
+        "recommended_fix": "Return 404 when the invoice is missing.",
+        "recommended_test": "Refund an unknown id."
+      },
+      "expect": { "action": "keep", "severity": "P2" }
+    }
+  ]
+}

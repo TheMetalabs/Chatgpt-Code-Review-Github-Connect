@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { resetDotenvLoadedForTests } from "./dotenv-file.server.ts";
 import {
   botSettingsToEnv,
+  diskFindingPrecisionWins,
   diskFixAgentWins,
   diskReviewerFlagsWin,
   loadBotSettings,
@@ -166,6 +167,49 @@ describe("sanitizeBotSettings", () => {
       assert.equal(sanitizeBotSettings(overlayEnv({ localLeaseCapacity: 2 })).localLeaseCapacity, 2);
     } finally {
       if (prev === undefined) delete process.env.ASHLAR_LOCAL_LEASE_CAPACITY; else process.env.ASHLAR_LOCAL_LEASE_CAPACITY = prev;
+    }
+  });
+
+  it("finding precision: defaults on, normalizes stored values, validates saves strictly, and the saved value beats the env seed", () => {
+    const d = sanitizeBotSettings({});
+    assert.deepEqual(
+      [d.findingGate, d.findingP1ClosedPath, d.findingNotes, d.findingDedupePrior, d.postLatestHeadOnly],
+      ["rules", true, true, true, true],
+    );
+    // load-time normalization of a stored document: unknown gate mode / non-boolean -> default
+    const odd = sanitizeBotSettings({ findingGate: "strict", findingNotes: "false", postLatestHeadOnly: 0 });
+    assert.equal(odd.findingGate, "rules");
+    assert.equal(odd.findingNotes, true);
+    assert.equal(odd.postLatestHeadOnly, true);
+    const saved = sanitizeBotSettings({ findingGate: "off", findingP1ClosedPath: false, findingNotes: false, findingDedupePrior: false, postLatestHeadOnly: false });
+    assert.deepEqual(
+      [saved.findingGate, saved.findingP1ClosedPath, saved.findingNotes, saved.findingDedupePrior, saved.postLatestHeadOnly],
+      ["off", false, false, false, false],
+    );
+    // the single validator: a save with a wrong-typed value is rejected, never coerced
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, findingGate: "strict" }) ?? "", /finding_precision\.gate must be one of: off, rules, refute/);
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, findingNotes: "true" }) ?? "", /finding_precision\.notes must be true or false/);
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, postLatestHeadOnly: 1 }) ?? "", /finding_precision\.post_latest_head_only must be true or false/);
+    assert.equal(settingsProblem({ ...DEFAULT_SETTINGS, findingGate: "refute", findingDedupePrior: false }), null);
+    // env round-trip: mirrored on save, seeds a never-saved value, and loses to a saved one
+    const env = botSettingsToEnv(saved);
+    assert.equal(env.ASHLAR_FINDING_GATE, "off");
+    assert.equal(env.ASHLAR_FINDING_P1_CLOSED_PATH, "false");
+    assert.equal(env.ASHLAR_POST_LATEST_HEAD_ONLY, "false");
+    const prev = { gate: process.env.ASHLAR_FINDING_GATE, notes: process.env.ASHLAR_FINDING_NOTES };
+    try {
+      process.env.ASHLAR_FINDING_GATE = "off";
+      process.env.ASHLAR_FINDING_NOTES = "false";
+      const seeded = sanitizeBotSettings(diskFindingPrecisionWins({}, overlayEnv({})));
+      assert.equal(seeded.findingGate, "off");
+      assert.equal(seeded.findingNotes, false);
+      const disk = { findingGate: "rules", findingNotes: true };
+      const loaded = sanitizeBotSettings(diskFindingPrecisionWins(disk, overlayEnv(disk)));
+      assert.equal(loaded.findingGate, "rules", "the Settings screen value wins over the env seed");
+      assert.equal(loaded.findingNotes, true);
+    } finally {
+      if (prev.gate === undefined) delete process.env.ASHLAR_FINDING_GATE; else process.env.ASHLAR_FINDING_GATE = prev.gate;
+      if (prev.notes === undefined) delete process.env.ASHLAR_FINDING_NOTES; else process.env.ASHLAR_FINDING_NOTES = prev.notes;
     }
   });
 

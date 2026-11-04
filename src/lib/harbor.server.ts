@@ -2337,7 +2337,7 @@ export function ingestGitHubWebhook(opts: {
   deliveryId: string;
   event: string;
   payload: unknown;
-}): HarborFireResult & { pong?: boolean; ignored?: string; cancelled?: string[] } {
+}): HarborFireResult & { pong?: boolean; ignored?: string; cancelled?: string[]; superseding?: string[] } {
   const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings, { botLogin: ashlarBotLogin() });
   const t0 = performance.now();
 
@@ -2436,10 +2436,14 @@ export function ingestGitHubWebhook(opts: {
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }
 
+  // A redelivered push (a delivery id already accepted) is a duplicate: it supersedes nothing again.
+  const redelivered = acceptedDeliveryIds(state.events).includes(opts.deliveryId);
   applyLoopControl(parsed, opts.deliveryId);
   // D — a pushed head supersedes reviews of the old head. The push itself never starts an LLM review
   // (the explicit-request rule in ingress stays); it only ends work whose result could not be posted.
-  const staleCancelled = parsed.trigger === "pull_request.synchronize" ? supersedeStaleHeadJobs(parsed.target) : [];
+  const superseding = parsed.trigger === "pull_request.synchronize" && !redelivered
+    ? supersedeStaleHeadJobs(parsed.target, { eventAt: parsed.eventAt, installationId: parsed.installationId })
+    : [];
 
   const ingressMs = Math.max(8, performance.now() - t0);
   const decision = decideIngress({
@@ -2465,7 +2469,7 @@ export function ingestGitHubWebhook(opts: {
     hmac: "ok",
     untrustedBody: parsed.untrustedBody,
   });
-  return staleCancelled.length ? { ...result, cancelled: staleCancelled } : result;
+  return superseding.length ? { ...result, superseding } : result;
 }
 
 /**
@@ -2475,19 +2479,46 @@ export function ingestGitHubWebhook(opts: {
  * a comment trigger) resolves the pushed head and is kept, as is one already posting (its own pre-post
  * head check decides). Cancellation goes through transitionJob, which aborts a local leg and writes
  * the terminal ops comment ("Cancelled: superseded … No review posted.").
+ *
+ * A push event can arrive late or out of order (GitHub retries, a redelivery): an older head's push
+ * must never cancel the review of the current head. So only a job created before the push
+ * (pull_request.updated_at) is a candidate, and the candidates are cancelled only after the live PR
+ * head is confirmed to BE the pushed sha (fetchPullHead). Fail-open: no installation, a head read that
+ * fails, or a live head other than the pushed one cancels nothing — the pre-post head check still
+ * keeps a stale review from posting. Returns the candidate job ids (cancelled asynchronously).
  */
-function supersedeStaleHeadJobs(target: { owner: string; repo: string; pr: number; headSha: string }): string[] {
-  if (!postLatestHeadOnlyOn(state.settings) || !target.headSha) return [];
+function supersedeStaleHeadJobs(
+  target: { owner: string; repo: string; pr: number; headSha: string },
+  push: { eventAt?: string; installationId?: number },
+): string[] {
+  if (!postLatestHeadOnlyOn(state.settings) || !target.headSha || push.installationId === undefined) return [];
+  const pushedAt = push.eventAt ? Date.parse(push.eventAt) : NaN;
   const short = target.headSha.slice(0, 7);
-  const stale = state.jobs.filter((j) => j.owner === target.owner && j.repo === target.repo && j.pr === target.pr &&
-    isLive(j.status) && j.status !== "posting" && Boolean(j.headSha) && !sameSha(j.headSha, target.headSha));
-  for (const j of stale) {
-    cancelLocalJsonRepairs("superseded", j.id);
-    transitionJob(j.id, (cur) => (isLive(cur.status) && cur.status !== "posting"
-      ? { ...cur, status: "cancelled", skipReason: `superseded: HEAD moved to ${short} (push) — request /review again`, headMovedTo: target.headSha, updatedAt: Date.now() }
-      : cur));
-  }
-  return stale.filter((j) => state.jobs.find((c) => c.id === j.id)?.status === "cancelled").map((j) => j.id);
+  const isStale = (j: Job) => j.owner === target.owner && j.repo === target.repo && j.pr === target.pr &&
+    isLive(j.status) && j.status !== "posting" && Boolean(j.headSha) && !sameSha(j.headSha, target.headSha) &&
+    (!Number.isFinite(pushedAt) || j.createdAt < pushedAt);
+  const candidates = state.jobs.filter(isStale).map((j) => j.id);
+  if (!candidates.length) return [];
+  const installationId = push.installationId;
+  void (async () => {
+    let liveHead: string;
+    try {
+      liveHead = (await fetchPullHead(await installationToken(installationId), target.owner, target.repo, target.pr)).headSha;
+    } catch (e) {
+      console.warn(`[harbor] push ${target.owner}/${target.repo}#${target.pr} → ${short}: live head unreadable, nothing superseded (${formatGithubError(e)})`);
+      return;
+    }
+    if (!sameSha(liveHead, target.headSha)) return; // an older (late or redelivered) push: the PR moved on
+    for (const id of candidates) {
+      const cur = state.jobs.find((j) => j.id === id);
+      if (!cur || !isStale(cur)) continue;
+      cancelLocalJsonRepairs("superseded", id);
+      transitionJob(id, (c) => (isStale(c)
+        ? { ...c, status: "cancelled", skipReason: `superseded: HEAD moved to ${short} (push) — request /review again`, headMovedTo: target.headSha, updatedAt: Date.now() }
+        : c));
+    }
+  })();
+  return candidates;
 }
 
 // Boot, once per process: hand off the fix rounds a restart cut — sessions left at FIXING with

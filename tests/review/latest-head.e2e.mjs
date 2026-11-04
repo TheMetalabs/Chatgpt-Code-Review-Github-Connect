@@ -26,9 +26,10 @@ async function ready(app, out) {
 }
 const submit = (app, id, raw) => app.harbor.submitHarborChat(id, raw, [{provider: 'chatgpt', raw}], {force: true});
 const ended = (app, id) => eventually(() => ['posted', 'skipped', 'dlq', 'cancelled'].includes(job(app, id)?.status), `job ${id} did not finish`);
-const push = (app, sha, deliveryId) => app.harbor.ingestGitHubWebhook({hmacOk: true, deliveryId, event: 'pull_request', payload: {
+const push = (app, sha, deliveryId, updatedAt) => app.harbor.ingestGitHubWebhook({hmacOk: true, deliveryId, event: 'pull_request', payload: {
   action: 'synchronize', installation: {id: 1}, repository: {full_name: 'fixture/fixture'}, sender: {login: 'author'},
-  pull_request: {number: 1, title: 'fixture', body: 'No request here', draft: false, head: {sha, repo: {fork: false}}, base: {sha: 'def456'}, user: {login: 'author'}},
+  pull_request: {number: 1, title: 'fixture', body: 'No request here', draft: false, head: {sha, repo: {fork: false}}, base: {sha: 'def456'}, user: {login: 'author'},
+    ...(updatedAt ? {updated_at: updatedAt} : {})},
 }});
 const toInline = (f) => ({id: 'p1', status: 'accepted', severity: f.severity, file: f.file, line: f.line, side: 'RIGHT', title: f.title,
   failureScenario: f.failure_scenario, rootCause: f.root_cause, evidence: f.evidence, recommendedFix: f.recommended_fix, recommendedTest: f.recommended_test});
@@ -86,7 +87,8 @@ test('unchanged head: the pre-post check passes and the review posts', async (t)
 });
 
 test('a push cancels the live review of the old head without starting a new LLM review', async (t) => {
-  const app = await appFixture({reviewLocal: true});
+  const pull = {};
+  const app = await appFixture({reviewLocal: true}, {pull});
   t.after(() => app.close());
   const out = await app.mention('push-supersede');
   await ready(app, out);
@@ -95,9 +97,11 @@ test('a push cancels the live review of the old head without starting a new LLM 
   const same = push(app, 'abc123', 'push-same-head');
   assert.equal(same.queued, false);
   assert.equal(job(app, out.jobId).status, 'awaiting_chat', 'a synchronize at the reviewed head cancels nothing');
+  pull.headSha = 'fff9990aaaabbbb'; // the live PR head IS the pushed sha
   const res = push(app, 'fff9990aaaabbbb', 'push-new-head');
   assert.equal(res.queued, false, 'a push never queues a review');
-  assert.deepEqual([...res.cancelled], [out.jobId]);
+  assert.deepEqual([...res.superseding], [out.jobId]);
+  await eventually(() => job(app, out.jobId).status === 'cancelled', 'superseded once the live head is confirmed');
   const cancelled = job(app, out.jobId);
   assert.equal(cancelled.status, 'cancelled');
   assert.match(cancelled.skipReason, /superseded: HEAD moved to fff9990 \(push\)/);
@@ -116,8 +120,48 @@ test('postLatestHeadOnly off: a push leaves the old-head review running', async 
   const out = await app.mention('push-off');
   await ready(app, out);
   const res = push(app, 'fff9990aaaabbbb', 'push-off-new-head');
-  assert.equal(res.cancelled, undefined);
+  assert.equal(res.superseding, undefined);
   assert.equal(job(app, out.jobId).status, 'awaiting_chat');
+});
+
+// A push event can arrive late, out of order, or twice (GitHub redelivers): it must never cancel the
+// review of the head the PR is actually on.
+test('a redelivered or out-of-order push never cancels the review of the current head', async (t) => {
+  const pull = {};
+  const app = await appFixture({reviewLocal: false}, {pull});
+  t.after(() => app.close());
+  push(app, '0ld0ld0ld0ld', 'push-old');
+  const out = await app.mention('current-head');
+  await ready(app, out);
+  assert.equal(job(app, out.jobId).headSha, 'abc123');
+  // The same delivery redelivered: a duplicate supersedes nothing (and reads no head).
+  const heads = app.githubCalls.head;
+  const again = push(app, '0ld0ld0ld0ld', 'push-old');
+  assert.equal(again.superseding, undefined);
+  // A late push of an older head (new delivery id): the live head is still abc123, so nothing is cancelled.
+  const late = push(app, '0ld0ld0ld0ld', 'push-old-late');
+  assert.deepEqual([...late.superseding], [out.jobId], 'a candidate until the live head is read');
+  await eventually(() => app.githubCalls.head > heads, 'the live head is read before cancelling');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(job(app, out.jobId).status, 'awaiting_chat', 'the current head\'s review keeps running');
+});
+
+test('a push only supersedes jobs created before it, and a failed head read cancels nothing', async (t) => {
+  const pull = {};
+  const opts = {pull};
+  const app = await appFixture({reviewLocal: false}, opts);
+  t.after(() => app.close());
+  const out = await app.mention('created-after-push');
+  await ready(app, out);
+  pull.headSha = 'fff9990aaaabbbb'; // the PR is on the pushed head
+  // The push's updated_at predates the job: the job was requested after that push.
+  const early = push(app, 'fff9990aaaabbbb', 'push-before-job', new Date(job(app, out.jobId).createdAt - 60_000).toISOString());
+  assert.equal(early.superseding, undefined);
+  opts.headError = new Error('head read down');
+  const failing = push(app, 'fff9990aaaabbbb', 'push-head-down');
+  assert.deepEqual([...failing.superseding], [out.jobId]);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(job(app, out.jobId).status, 'awaiting_chat', 'fail-open: an unreadable live head cancels nothing');
 });
 
 test('same head reviewed twice: a review that only repeats the findings already posted on this head is not posted', async (t) => {

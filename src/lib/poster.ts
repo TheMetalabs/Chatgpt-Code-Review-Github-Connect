@@ -76,7 +76,8 @@ export function mergeEvent(findings: Finding[], settings: BotSettings): MergeRec
  * findings reach this partition only after the finding gate (finding-gate.ts, applied by
  * gateLiveSubmission per the Settings "Finding precision" section). With `findingGate` = "rules" or
  * "refute" a finding on changed code CAN be dropped: when it repeats one the bot already reported on
- * this PR (`findingDedupePrior`), retracts itself, claims a file this PR changes was not changed, is
+ * this PR (`findingDedupePrior`; prior findings are listed for every review except a /review-loop
+ * step, which must see an unresolved finding again), retracts itself, claims a file this PR changes was not changed, is
  * contradicted by the same reply's own coverage / investigated_safe, rests on an admitted-unverified
  * premise (or hedges without a verified quote on a changed line), or quotes no code that exists at
  * the reviewed head. Docs / i18n / style / log-wording / test-advice findings become notes

@@ -29,13 +29,14 @@ export type PriorFindingsResult = {
   reviewedHeads: string[];
 };
 
-/** Settings readers. The fields are owned by the Settings screen (BotSettings, default true); an
- * absent field (a settings file saved before they existed) reads as the default. */
-export function postLatestHeadOnlyOn(settings: Partial<BotSettings>): boolean {
-  return (settings as { postLatestHeadOnly?: boolean }).postLatestHeadOnly !== false;
+/** Settings readers for BotSettings.postLatestHeadOnly / findingDedupePrior (Settings screen
+ * "Finding precision", default true). A hand-built settings object without the field reads as the
+ * default, like settings.server normalizes a file saved before the fields existed. */
+export function postLatestHeadOnlyOn(settings: Pick<Partial<BotSettings>, "postLatestHeadOnly">): boolean {
+  return settings.postLatestHeadOnly !== false;
 }
-export function dedupePriorOn(settings: Partial<BotSettings>): boolean {
-  return (settings as { findingDedupePrior?: boolean }).findingDedupePrior !== false;
+export function dedupePriorOn(settings: Pick<Partial<BotSettings>, "findingDedupePrior">): boolean {
+  return settings.findingDedupePrior !== false;
 }
 
 /** Same commit: equal, or one is an abbreviation (>= 7 chars) of the other. Empty never matches. */

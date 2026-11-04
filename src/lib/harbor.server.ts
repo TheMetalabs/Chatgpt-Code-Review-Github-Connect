@@ -1349,8 +1349,10 @@ export async function submitHarborChat(
   if (!token) return revert("missing installation token");
   // The bot's own earlier findings on this PR (D: no re-posting), listed at gate time so the finding
   // gate (GateContext.priorFindings) and the poster's same-head check see every review posted up to
-  // now. Fail open: a listing failure drops the duplicate checks, never the review.
-  if (dedupePriorOn(state.settings) || postLatestHeadOnlyOn(state.settings)) {
+  // now. Fail open: a listing failure drops the duplicate checks, never the review. A loop-driven
+  // review (/review-loop) is exempt: the loop's fix rounds read each head's own findings marker, so a
+  // finding the last fix did not resolve must post again on the new head rather than vanish as a repeat.
+  if ((dedupePriorOn(state.settings) || postLatestHeadOnlyOn(state.settings)) && job.thread?.loop?.kind !== "start") {
     const prior = await loadPriorFindings(token, job);
     if ("error" in prior) {
       const note = `Prior findings could not be listed (${prior.error.slice(0, 80)}) — no duplicate check`;
@@ -1664,6 +1666,9 @@ export async function submitHarborChat(
       // counts go to the ops comment.
       notes: merged.notes?.length ? merged.notes : undefined,
       gateStats: merged.gateStats,
+      // Findings the gate dropped as repeats of the bot's prior findings: with nothing left to post,
+      // finishJob skips instead of posting a clean (total=0) review the loop would read as CONVERGED.
+      priorDuplicates: merged.gateStats?.reasons?.already_reported || undefined,
       plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}${truncatedLegs.length ? `; reply cut off after its findings (coverage incomplete): ${truncatedLegs.join(" + ")}` : ""}${cutLegs.length ? `; no finding in the complete verdict of ${cutLegs.join(" + ")}, reply posted as coverage evidence` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,

@@ -166,21 +166,6 @@ test('a loop-driven review keeps its same-head verdict (the loop needs one)', as
   assert.equal(job(app, out.jobId).status, 'posted');
 });
 
-test('every finding dropped as a prior repeat never posts a clean (CONVERGED) review', async (t) => {
-  const app = await appFixture({reviewLocal: false}, priorOn(OLD_HEAD));
-  t.after(() => app.close());
-  const out = await app.mention('all-prior-duplicates');
-  await ready(app, out);
-  // The finding gate (GateContext.priorFindings) records how many it dropped as repeats.
-  app.harbor.patchHarborJob(out.jobId, (j) => ({...j, priorDuplicates: 1}));
-  await submit(app, out.jobId, clean);
-  await ended(app, out.jobId);
-  const done = job(app, out.jobId);
-  assert.equal(done.status, 'skipped');
-  assert.match(done.skipReason, /no new findings since the review on 0123456/);
-  assert.equal(app.reviews.length, 0, 'no total=0 marker reaches GitHub');
-});
-
 test('prior findings listing fails: the review still posts and the ops comment says the duplicate check was skipped', async (t) => {
   const app = await appFixture({reviewLocal: false}, {listPullReviews: () => { throw new Error('reviews listing down'); }});
   t.after(() => app.close());
@@ -190,4 +175,47 @@ test('prior findings listing fails: the review still posts and the ops comment s
   await ended(app, out.jobId);
   assert.equal(job(app, out.jobId).status, 'posted');
   await eventually(() => app.ops.some((b) => b.includes(out.jobId) && /Prior findings could not be listed \(Error: reviews listing down\) — no duplicate check/.test(b)), 'fail-open note');
+});
+
+// Integration: the finding gate's prior-finding dedupe (GateContext.priorFindings from the listing above)
+// and the poster's "nothing new" skip share one count, Job.priorDuplicates, stamped from the gate's stats.
+test('findingGate=rules: a finding the bot already posted on an older head is dropped and nothing is re-posted', async (t) => {
+  const app = await appFixture({reviewLocal: false, findingGate: 'rules'}, priorOn(OLD_HEAD));
+  t.after(() => app.close());
+  const out = await app.mention('gate-prior-repeat');
+  await ready(app, out);
+  await submit(app, out.jobId, reply(finding));
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.priorDuplicates, 1, 'the gate dropped the repeat and the count reached the job');
+  assert.equal(done.gateStats?.reasons?.already_reported, 1);
+  assert.equal(done.status, 'skipped');
+  assert.match(done.skipReason, /no new findings since the review on 0123456/);
+  assert.equal(app.reviews.length, 0, 'neither the repeat nor a clean total=0 review reaches GitHub');
+});
+
+test('findingGate=rules: a new finding next to a repeat posts alone', async (t) => {
+  const app = await appFixture({reviewLocal: false, findingGate: 'rules'}, priorOn(OLD_HEAD));
+  t.after(() => app.close());
+  const out = await app.mention('gate-prior-plus-new');
+  await ready(app, out);
+  const fresh = {...finding, title: 'Checksum table still pins the old answer', evidence: 'a.ts:1 `export const answer = 42;` while the table expects 41'};
+  await submit(app, out.jobId, reply(finding, fresh));
+  await ended(app, out.jobId);
+  assert.equal(job(app, out.jobId).status, 'posted');
+  assert.equal(app.reviews.length, 1);
+  assert.match(app.reviews[0].body, /<!-- ashlar-findings total=1 /);
+  assert.doesNotMatch(JSON.stringify(app.reviews[0]), /without migrating stored answers/);
+});
+
+test('findingGate=rules: a loop-driven review is not deduped against earlier heads (the loop must see an unresolved finding again)', async (t) => {
+  const app = await appFixture({reviewLocal: false, findingGate: 'rules'}, priorOn(OLD_HEAD));
+  t.after(() => app.close());
+  const out = app.harbor.ingestGitHubWebhook({hmacOk: true, deliveryId: 'loop-start-gate', event: 'issue_comment', payload: {action: 'created', installation: {id: 1},
+    repository: {full_name: 'fixture/fixture'}, sender: {login: 'author'}, issue: {number: 1, pull_request: {}, title: 'fixture'}, comment: {id: 44, body: '/review-loop'}}});
+  await ready(app, out);
+  await submit(app, out.jobId, reply(finding));
+  await ended(app, out.jobId);
+  assert.equal(job(app, out.jobId).status, 'posted');
+  assert.match(app.reviews[0].body, /<!-- ashlar-findings total=1 /);
 });

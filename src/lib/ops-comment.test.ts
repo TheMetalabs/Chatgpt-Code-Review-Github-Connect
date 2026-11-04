@@ -71,6 +71,21 @@ describe("reviewPostedNotes", () => {
     assert.ok(notes.length <= 8);
   });
 
+  it("counts the PR description, call-site and changed-docs sections in the Prompt line", () => {
+    const notes = reviewPostedNotes(
+      {
+        headSha: "abcdef012345",
+        promptStats: { diffChars: 1000, contextChars: 9000, policyChars: 300, diffFilesFull: 3, diffFilesTotal: 3, descriptionChars: 1200, callSitesChars: 800, changedDocsChars: 2500 },
+      },
+      0,
+    );
+    const line = notes.find((n) => n.startsWith("Prompt: ")) ?? "";
+    assert.equal(line, "Prompt: diff 1000 chars (3/3 files full), context 9000 chars (call sites 800, changed docs 2500), policy 300 chars, PR description 1200 chars");
+    // A job recorded before these were counted (or a PR with none of them) keeps the old line.
+    const old = reviewPostedNotes({ headSha: "abcdef012345", promptStats: { diffChars: 1, contextChars: 2, policyChars: 3, diffFilesFull: 1, diffFilesTotal: 1, descriptionChars: 0 } }, 0);
+    assert.ok(old.includes("Prompt: diff 1 chars (1/1 files full), context 2 chars, policy 3 chars"));
+  });
+
   it("notes when HEAD moved and stays minimal without stats", () => {
     const moved = reviewPostedNotes({ headSha: "abcdef012345", headMovedTo: "999888777666" }, 0);
     assert.match(moved[0], /Reviewed abcdef0 \(HEAD moved to 9998887\)/);

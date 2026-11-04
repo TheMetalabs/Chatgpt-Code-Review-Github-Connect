@@ -17,7 +17,7 @@ import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarge
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listPullReviews, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { collectPriorFindings, dedupePriorOn, postLatestHeadOnlyOn, sameHeadRepost, sameSha, type PriorFindingsResult } from "./prior-findings";
-import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { bridgePromptText, buildChatParts, buildLocalChatPrompt, chatPromptText, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, splitChatAttachments, type PromptSections } from "./chat-prompt";
 import { truncatedReviewField } from "./extract-chat-json";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
@@ -90,6 +90,10 @@ const localQueued = new Map<string, { arm: (reset: boolean) => void; clear: () =
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
 const localSamples = new Map<string, SamplePr>();
+// In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
+// the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
+// (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
+const localSinglePrompts = new Map<string, { chatPrompt: string; build: (budgetTokens: number, shrinkContext: boolean) => string }>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -265,7 +269,10 @@ function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
  * still in state never aborts local generation. */
 function releaseJob(job: Job, edge: "terminal" | "removed") {
   const stop = edge === "removed" || job.status === "cancelled";
-  if (edge === "removed" || !localInFlight.has(job.id)) localSamples.delete(job.id);
+  if (edge === "removed" || !localInFlight.has(job.id)) {
+    localSamples.delete(job.id);
+    localSinglePrompts.delete(job.id);
+  }
   if (!stop) return;
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
@@ -290,7 +297,7 @@ export function hasLocalLegState(jobId: string): boolean {
 
 /** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
 export function orphanedLocalState(): string[] {
-  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
+  const ids = new Set([...localSamples.keys(), ...localSinglePrompts.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
   return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
 }
 
@@ -367,7 +374,7 @@ export function publicSettings(s: BotSettings) {
 // WHY: record attachment sizes + deterministic coverage on the job at the single
 // prompt-assembly point, measured by attachment name so it stays correct as later
 // PRs change the snapshot/policy attachments. Never affects the verdict.
-function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
+function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr, sections?: PromptSections) {
   const parts = splitChatAttachments(prompt);
   const body = (name: string) => parts.files.find((f) => f.name === name)?.body ?? "";
   const diffBody = body("ashlar-diff.patch");
@@ -386,7 +393,11 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     contextChars: contextBody.length,
     policyChars: policyBody.length,
     // The PR body's scope section the review carried (chat-prompt.ts PR_SCOPE_RULE), 0 when none.
-    scopeChars: /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
+    scopeChars: sections?.scopeChars ?? /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
+    // The context sections the 2026-11 precision work added (chat-prompt.ts), counted as built.
+    descriptionChars: sections?.descriptionChars ?? 0,
+    callSitesChars: sections?.callSitesChars ?? 0,
+    changedDocsChars: sections?.changedDocsChars ?? 0,
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };
@@ -856,7 +867,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
   }
   const live1 = current();
   if (!live1 || live1.status === "cancelled") return;
-  const prompt = buildChatPrompt({
+  const promptOpts = {
     sample,
     extra,
     untrustedBody,
@@ -864,8 +875,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
     contextMaxChars: state.settings.promptContextMaxChars,
     contextPadLines: state.settings.contextPadLines,
     policyMaxChars: state.settings.promptPolicyMaxChars,
-  });
-  recordReviewCoverage(jobId, prompt, sample);
+  };
+  const chatParts = buildChatParts(promptOpts);
+  const prompt = chatPromptText(chatParts);
+  recordReviewCoverage(jobId, prompt, sample, chatParts.sections);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
   // Pinned once here like reviewProviders: a later settings change never alters a review in flight.
@@ -909,6 +922,11 @@ async function playGithub(jobId: string, untrustedBody: string) {
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
     localSamples.set(jobId, sample);
+    localSinglePrompts.set(jobId, {
+      chatPrompt: prompt,
+      build: (budgetTokens, shrinkContext) =>
+        buildLocalChatPrompt({ ...promptOpts, localBudget: { maxChars: Math.floor(budgetTokens * LOCAL_CHARS_PER_TOKEN), shrinkContext } }),
+    });
     // verify-clean: no local generation now; submitHarborChat starts it only after a clean chat result.
     if (!verifier) void kickLocalRace(jobId, prompt);
   }
@@ -1051,7 +1069,14 @@ async function generateLocalLeg(
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
-  const mode = chooseLocalReviewMode(state.settings.localReviewMode, prompt.length, state.settings.localReviewSingleTurnMaxTokens);
+  // The single-turn prompt is the chat review fitted to the local budget (the chat prompt itself when it
+  // already fits); auto mode routes by that fitted size, measured as the local model reads it.
+  const configured = state.settings.localReviewMode;
+  const singleMax = state.settings.localReviewSingleTurnMaxTokens;
+  const local = localSinglePrompts.get(jobId);
+  const ownPrompt = local && local.chatPrompt.trim() === prompt.trim() ? local : undefined;
+  const fitted = ownPrompt ? ownPrompt.build(singleMax, false) : bridgePromptText(prompt);
+  const mode = chooseLocalReviewMode(configured, fitted.length, singleMax);
   if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
@@ -1089,7 +1114,11 @@ async function generateLocalLeg(
   if (mode === "multiturn") {
     return { ok: false, error: "local skipped: no snapshot for multiturn and prompt too large for single-turn" };
   }
-  return runLocalLlm(prompt, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
+  // A forced single-turn also cuts the code context to the budget (auto only gets here when it fits).
+  const single = ownPrompt && configured === "single" && Math.ceil(fitted.length / LOCAL_CHARS_PER_TOKEN) > singleMax
+    ? ownPrompt.build(singleMax, true)
+    : fitted;
+  return runLocalLlm(single, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
 }
 
 /** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
@@ -1206,6 +1235,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);
+    localSinglePrompts.delete(jobId);
     localActivity.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);

@@ -215,7 +215,12 @@ export interface Job {
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */
-  promptStats?: { diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number; scopeChars?: number };
+  promptStats?: {
+    diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number; scopeChars?: number;
+    /** UNTRUSTED_PR_DESCRIPTION body, CALL_SITES body and CHANGED_NON_CODE_FILES body (the last two are
+     * inside contextChars). Absent on jobs recorded before they were counted. */
+    descriptionChars?: number; callSitesChars?: number; changedDocsChars?: number;
+  };
   /** Review-coverage: model-reported per-file coverage. Never affects the verdict. */
   coverage?: { file: string; status: "cleared" | "not_cleared"; reason: string }[];
   /** Review-coverage: deterministic (harness) coverage per changed code file. */

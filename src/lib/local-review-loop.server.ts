@@ -8,7 +8,7 @@
 // "do not repeat" line. Missing peers are simply not used — the loop never waits. Duplicate findings
 // are acceptable (they collapse in the schema-merge or get fixed in code); no cross-check drops
 // anyone's finding.
-import { buildChatParts, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
+import { buildChatParts, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { extractChatJsonParts } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
@@ -17,9 +17,22 @@ import { gateLiveSubmission } from "./poster.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
 
-// Rough char→token ratio for this transport's prompts (English + code + diff markers). Only used to
-// route auto mode; the real budget lives in max_tokens.
-const CHARS_PER_TOKEN = 3.5;
+// Rough char→token ratio for this transport's prompts (English + code + diff markers), shared with the
+// prompt builder's local budget (chat-prompt.ts). Routes auto mode and drives the loop's context cap.
+const CHARS_PER_TOKEN = LOCAL_CHARS_PER_TOKEN;
+
+// Share of the loop's context cap a group's FIRST request may take. The rest is room for the tool
+// reads the loop exists for (one 400-line file_read is ~4-5K tokens): a first request at the cap
+// would be forced final before it read anything.
+export const LOCAL_TOOL_HEADROOM_SHARE = 0.25;
+
+/** Tokens a group's first request (system + user message) may take: the loop's context cap (or the
+ * single-turn cap when that is smaller or the loop cap is off) less the tool-read headroom. */
+export function localFirstTurnBudgetTokens(settings: Pick<BotSettings, "localReviewSingleTurnMaxTokens">, ctxCapTokens: number): number {
+  const caps = [ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
+  const cap = caps.length ? Math.min(...caps) : 0;
+  return cap > 0 ? Math.floor(cap * (1 - LOCAL_TOOL_HEADROOM_SHARE)) : 0;
+}
 
 // Which local path to run. "auto" keeps a small PR on the faster, higher-recall single-turn pass and
 // routes a large one to the grouped loop — where the whole diff would not fit one completion window
@@ -199,6 +212,10 @@ const SYSTEM = [
   "The other changed files of this PR are part of the same change and readable with file_read and file_read_diff: never report something as unverified or as \"not in the reviewed group\" — read it, or leave it out.",
 ].join("\n");
 
+const LOOP_TOOL_RULE =
+  "Do not search the web, use DeepSearch, browse URLs, fetch GitHub/npm/CVE/docs, or load skills. You DO have local tools — file_read, file_read_diff, code_search — use them to read the changed files and the helpers they call before reporting. The attachments are a starting point, not the only source. If context is still missing, list it in assumptions.";
+const LOOP_DONE_LINE = "When finished, call task_done and return the final review JSON object only.";
+
 const FORCE_FINAL_MSG =
   "Tool access has ended. Using only what you have read, return the final review JSON object now (raw JSON only).";
 
@@ -223,6 +240,12 @@ async function reviewGroup(
 ): Promise<GroupReview> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
+  const others = sample.changedPaths.filter((p) => !groupSet.has(p));
+  const groupBlock = `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files of this PR (the same change; read them with file_read_diff or file_read before any claim about them): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`;
+  // The first request (system + this user message) must leave the loop room to read files: the
+  // context sections are fitted to localFirstTurnBudgetTokens, counting everything the loop adds.
+  const firstTurnChars = Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * CHARS_PER_TOKEN);
+  const overheadChars = SYSTEM.length + (LOOP_TOOL_RULE.length - REVIEW_OFFLINE_RULE.length) + groupBlock.length + LOOP_DONE_LINE.length + 4;
   // The PR description comes from sub.body (the whole snapshot body, bounded in buildChatParts); changed
   // docs and call sites are read across the whole PR, so a group sees the doc a sibling group's file edits.
   const built = buildChatParts({
@@ -232,6 +255,7 @@ async function reviewGroup(
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
     prChangedPaths: sample.changedPaths,
+    ...(firstTurnChars > 0 ? { localBudget: { maxChars: firstTurnChars, overheadChars, shrinkContext: true, toolReads: true } } : {}),
   });
   const attachments = built.files;
   // buildChatParts embeds REVIEW_OFFLINE_RULE, which forbids tool use ("do not call tools, open extra
@@ -239,18 +263,9 @@ async function reviewGroup(
   // loop, whose whole point is to read files/helpers with tools. Swap that one line for a tool-
   // permitting rule that still bans web/DeepSearch/URL/skills, so a model obeying the user message
   // uses the tools instead of reviewing only the initial attachment.
-  const instructions = built.prompt.replace(
-    REVIEW_OFFLINE_RULE,
-    "Do not search the web, use DeepSearch, browse URLs, fetch GitHub/npm/CVE/docs, or load skills. You DO have local tools — file_read, file_read_diff, code_search — use them to read the changed files and the helpers they call before reporting. The attachments are a starting point, not the only source. If context is still missing, list it in assumptions.",
-  );
-  const others = sample.changedPaths.filter((p) => !groupSet.has(p));
+  const instructions = built.prompt.replace(REVIEW_OFFLINE_RULE, LOOP_TOOL_RULE);
   const attachText = attachments.map((f) => `<<<ATTACH:${f.name}>>>\n${f.body}\n<<<END_ATTACH>>>`).join("\n\n");
-  const userParts = [
-    instructions,
-    attachText,
-    `<<<REVIEW_GROUP>>>\nReview only: ${groupPaths.join(", ")}.\nOther changed files of this PR (the same change; read them with file_read_diff or file_read before any claim about them): ${others.join(", ") || "(none)"}\nReport findings and coverage only for this group.\n<<<END>>>`,
-    "When finished, call task_done and return the final review JSON object only.",
-  ];
+  const userParts = [instructions, attachText, groupBlock, LOOP_DONE_LINE];
 
   // Tool backends: changed-file content comes from the head snapshot already fetched; other paths
   // fall back to readFileAtHead when the host provides it. No new PR fetch here.

@@ -83,7 +83,10 @@ export function reviewPostedNotes(
   notes.push(`Reviewed ${sha}${moved}`);
   const ps = job.promptStats;
   if (ps) {
-    notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars, policy ${ps.policyChars} chars`);
+    // The call-site and changed-docs sections ride inside the context attachment; the description is in the prompt.
+    const inContext = [ps.callSitesChars ? `call sites ${ps.callSitesChars}` : "", ps.changedDocsChars ? `changed docs ${ps.changedDocsChars}` : ""].filter(Boolean);
+    const description = ps.descriptionChars ? `, PR description ${ps.descriptionChars} chars` : "";
+    notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars${inContext.length ? ` (${inContext.join(", ")})` : ""}, policy ${ps.policyChars} chars${description}`);
   }
   const det = job.coverageDeterministic ?? [];
   if (det.length) {

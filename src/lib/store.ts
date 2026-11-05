@@ -52,6 +52,8 @@ interface AshlarState {
   bridge: BridgeReady;
   fire: (opts: FireOpts) => Promise<FireResult>;
   cancel: (jobId: string) => void;
+  /** Operator re-review of an ended GitHub job at its live head (no new commit): the new job's id, or why not. */
+  rerun: (jobId: string) => Promise<{ ok: true; jobId: string } | { ok: false; error: string }>;
   resetDemo: () => void;
   setSettings: (patch: Partial<BotSettings>) => Promise<void>;
   mergeRemote: (remote: {
@@ -271,6 +273,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       findingNotes: next.findingNotes,
       findingDedupePrior: next.findingDedupePrior,
       postLatestHeadOnly: next.postLatestHeadOnly,
+      skipVendoredPaths: next.skipVendoredPaths,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;
@@ -341,6 +344,20 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "cancel", jobId }),
     });
+  },
+  rerun: async (jobId) => {
+    try {
+      const res = await fetch("/api/harbor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "rerun", jobId }),
+      });
+      const out = (await res.json()) as { ok?: boolean; jobId?: string; reject?: string; skip?: string; error?: string };
+      if (out.ok && out.jobId) return { ok: true, jobId: out.jobId };
+      return { ok: false, error: out.reject || out.skip || out.error || `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
   },
   fire: async (opts) => {
     const sample = SAMPLE_PRS[opts.sampleKey];

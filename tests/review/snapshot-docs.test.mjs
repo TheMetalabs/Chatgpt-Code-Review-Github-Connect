@@ -28,13 +28,13 @@ const COMPARE = {
   ],
 };
 
-function fakeGithub() {
+function fakeGithub(contents = CONTENTS, compare = COMPARE) {
   const paths = [];
   const reply = (path) => {
-    if (path.startsWith(`/repos/o/r/compare/${BASE}...${HEAD}`)) return [200, COMPARE];
+    if (path.startsWith(`/repos/o/r/compare/${BASE}...${HEAD}`)) return [200, compare];
     if (path === '/repos/o/r/pulls/7') return [200, { title: 't', body: 'PR body', head: { sha: HEAD, repo: { fork: false } }, base: { sha: BASE } }];
     const m = /^\/repos\/o\/r\/contents\/(.+)\?ref=([a-z0-9]+)$/.exec(path);
-    const text = m && CONTENTS[m[2]]?.[decodeURIComponent(m[1])];
+    const text = m && contents[m[2]]?.[decodeURIComponent(m[1])];
     if (text != null) return [200, { type: 'file', encoding: 'base64', size: text.length, content: Buffer.from(text).toString('base64') }];
     return [404, { message: 'Not Found' }];
   };
@@ -44,6 +44,7 @@ function fakeGithub() {
     ...loadTs('src/lib/import-resolve.ts'),
     ...loadTs('src/lib/review-budget.ts'),
     ...loadTs('src/lib/review-diff.ts'),
+    ...loadTs('src/lib/gitattributes.ts'),
     ...loadTs('src/lib/types.ts'),
     dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
     https: { request(options, callback) {
@@ -107,4 +108,36 @@ test('the live snapshot diff (compact blocks) grounds a P1 on a changed line thr
   assert.ok(gate.ok, gate.reason);
   assert.deepEqual(gate.findings.map((f) => [f.file, f.severity]), [['svc/routes.ts', 'P1']]);
   assert.equal(gate.mergeRecommendation, 'REQUEST_CHANGES');
+});
+
+// Live WalkieBoard #523: a vendored upstream drop, marked linguist-vendored by the repository. With the
+// setting on it never reaches the review; a finding on it never posts.
+test('linguist-vendored paths (.gitattributes) are left out of the snapshot, and a finding on one never posts', async () => {
+  const vendored = { filename: 'Packages/Kit/Sources/Audio.swift', status: 'added', patch: '@@ -0,0 +1,2 @@\n+func f() {\n+}' };
+  const compare = { files: [...COMPARE.files, vendored, { filename: '.gitattributes', status: 'modified', patch: '@@ -1 +1,2 @@\n * text=auto\n+Packages/Kit/** linguist-vendored' }] };
+  const contents = {
+    [BASE]: { ...CONTENTS[BASE], '.gitattributes': '* text=auto\n' },
+    [HEAD]: { ...CONTENTS[HEAD], '.gitattributes': '* text=auto\nPackages/Kit/** linguist-vendored\n', 'Packages/Kit/Sources/Audio.swift': 'func f() {\n}' },
+  };
+  const { api, paths } = fakeGithub(contents, compare);
+  const sample = await api.fetchPullSnapshot('token', target, { skipVendored: true });
+  assert.ok(!sample.changedPaths.includes(vendored.filename), 'not a changed path of the review');
+  assert.ok(sample.changedPaths.includes('.gitattributes'), 'the .gitattributes change itself is reviewed');
+  assert.ok(!sample.files.some((f) => f.path === vendored.filename), 'its content is not fetched');
+  assert.ok(!paths.some((p) => p.startsWith('/repos/o/r/contents/Packages/')), 'no request for it at all');
+  assert.doesNotMatch(sample.diff, /Audio\.swift/);
+  assert.deepEqual(JSON.parse(JSON.stringify(sample.vendoredPaths)), [{ path: vendored.filename, kind: 'vendored' }]);
+  const finding = {
+    severity: 'P1', file: vendored.filename, line: 1, side: 'RIGHT', title: 'f() does nothing',
+    failure_scenario: 'Calling f has no effect.', root_cause: 'Empty body.', evidence: 'Packages/Kit/Sources/Audio.swift:1 `func f() {`',
+    recommended_fix: 'Implement f.', recommended_test: 'Call f.',
+  };
+  const gate = gateLiveSubmission({ merge_recommendation: 'REQUEST_CHANGES', findings: [finding], investigated_safe: ['svc/routes.ts ok'] }, sample, DEFAULT_SETTINGS);
+  assert.ok(gate.ok);
+  assert.equal(gate.findings.length, 0, 'a finding on a vendored path is never posted');
+
+  // Setting off: the same PR reviews the vendored file like any other.
+  const off = await fakeGithub(contents, compare).api.fetchPullSnapshot('token', target, { skipVendored: false });
+  assert.ok(off.changedPaths.includes(vendored.filename));
+  assert.equal(off.vendoredPaths, undefined);
 });

@@ -24,9 +24,10 @@ import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
+import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
-import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
+import { attemptFailedNote, buildOpsComment, opsCommentAllowed, reviewPostedNotes, vendoredSkippedNote, type OpsPhase } from "./ops-comment";
 import { gateStatsLine } from "./finding-gate";
 import {
   buildReview,
@@ -38,12 +39,12 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, skippedProvider, stillRacing, verdictEvidence } from "./local-fallback";
+import { canReleaseHeldLocal, chatStalled, escalateSingleTurn, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, skippedProvider, stillRacing, verdictEvidence } from "./local-fallback";
 import { auxiliaryFailed, outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { AuxiliaryProviderFailure, BotSettings, Finding, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { AuxiliaryProviderFailure, BotSettings, Finding, Job, JobThread, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -329,9 +330,11 @@ async function finishOpsComment(jobId: string) {
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || !needsTerminalOps(job) || !job.installationId) return;
   const reason = job.skipReason || job.githubError || "";
-  const phase: OpsPhase = job.status === "dlq" ? "failed" : job.status === "posted" ? "posted" : "skipped";
+  const failedAttempt = job.status === "skipped" && Boolean(job.noReviewAttempt);
+  const phase: OpsPhase = job.status === "dlq" || failedAttempt ? "failed" : job.status === "posted" ? "posted" : "skipped";
   const note = job.status === "posted" ? "Review posted."
     : job.status === "cancelled" ? `Cancelled${reason ? `: ${reason}` : "."} No review posted.`
+    : failedAttempt ? attemptFailedNote(job.headSha, reason, state.settings.mention[0] || `@${state.settings.username}`)
     : `No review posted${reason ? `: ${reason}` : "."}`;
   try {
     await upsertOpsComment(await installationToken(job.installationId), jobId, phase, [note]);
@@ -524,6 +527,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
     canonicalProvider: job.canonicalProvider,
     auxiliaryProviderFailures: job.auxiliaryProviderFailures,
     notes: [`Job: ${job.id}`, ...notes],
+    ...(phase === "failed" && job.noReviewAttempt && job.headSha ? { attemptFailedHead: job.headSha } : {}),
   });
   // One write at a time per job, in call order: a slow "running" write can no longer land after the
   // terminal one, and a write queued behind the comment's creation updates it instead of creating a
@@ -829,7 +833,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
       await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
       return;
     }
-    sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
+    sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars, skipVendored: state.settings.skipVendoredPaths !== false });
   } catch (e) {
     const msg = formatGithubError(e);
     transitionJob(jobId, (j) => ({
@@ -842,6 +846,19 @@ async function playGithub(jobId: string, untrustedBody: string) {
     void reactQuiet(token, live0, "confused");
     void upsertOpsComment(token, jobId, "failed", ["Could not load the pull snapshot. No review posted."]);
     return;
+  }
+
+  const vendored = sample.vendoredPaths ?? [];
+  if (vendored.length) {
+    transitionJob(jobId, (j) => ({ ...j, vendoredSkipped: { count: vendored.length, paths: vendored.slice(0, 3).map((v) => v.path) } }));
+    // Every changed path is vendored / generated: nothing of this repository's own code to review, so no
+    // reviewer is started (a vendored drop alone held the local model for an hour, live #523).
+    if (!sample.changedPaths.length) {
+      const why = `only vendored / generated paths changed (${vendored.length}, per .gitattributes) — nothing to review`;
+      transitionJob(jobId, (j) => ({ ...j, status: "skipped", skipReason: why, updatedAt: Date.now() }));
+      await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${why}.`, vendoredSkippedNote(current()?.vendoredSkipped ?? { count: vendored.length, paths: [] })]);
+      return;
+    }
   }
 
   const gated = current();
@@ -1088,8 +1105,7 @@ async function generateLocalLeg(
   const ownPrompt = local && local.chatPrompt.trim() === prompt.trim() ? local : undefined;
   const fitted = ownPrompt ? ownPrompt.build(singleMax, false) : bridgePromptText(prompt);
   const mode = chooseLocalReviewMode(configured, fitted.length, singleMax);
-  if (mode === "multiturn" && sample) {
-    return runLocalReviewLoop(sample, state.settings, {
+  const runLoop = (loopSample: SamplePr) => runLocalReviewLoop(loopSample, state.settings, {
       signal,
       log: (line) => console.info(`[local] ${jobId} ${line.replace(/\s+/g, " ").slice(0, 300)}`),
       // The multi-turn loop's edge over the one-shot chat legs: it can pull ANY file at the PR head
@@ -1118,7 +1134,7 @@ async function generateLocalLeg(
         },
       } : {}),
     });
-  }
+  if (mode === "multiturn" && sample) return runLoop(sample);
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
   // after a restart). Falling back to single-turn would send the whole large prompt in one completion
   // and spike memory — exactly what auto-mode routes away from. Skip local instead.
@@ -1129,7 +1145,32 @@ async function generateLocalLeg(
   const single = ownPrompt && configured === "single" && Math.ceil(fitted.length / LOCAL_CHARS_PER_TOKEN) > singleMax
     ? ownPrompt.build(singleMax, true)
     : fitted;
-  return runLocalLlm(single, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
+  const first = await runLocalLlm(single, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
+  // A single-turn reply that is no review (findings:[] with no investigated_safe, or no review JSON
+  // even after its correction) escalates once to the multi-turn loop under the same lease instead of
+  // ending the head unreviewed (live WalkieBoard #524, 2026-11-05).
+  const why = sample ? escalateSingleTurn(first, { changedPaths: sample.changedPaths.length, aborted: Boolean(signal?.aborted) }) : undefined;
+  if (!why || !sample) return first;
+  console.info(`[local] ${jobId} single-turn ${why === "empty" ? "returned no review (empty findings without investigated_safe)" : "returned no review JSON"}; escalating to the multi-turn loop`);
+  const loop = await runLoop(sample);
+  // Every completed reply either tier set aside is evidence whatever the loop finds (it may name a
+  // defect): the single-turn reply its correction replaced, text around its accepted JSON, or (failed)
+  // all of its replies; then the loop's own.
+  const firstReplies = first.ok ? [first.unparsedText, first.residualReplies].map((x) => x?.trim() ?? "").filter(Boolean).join("\n\n---\n\n") : localReplies(first);
+  const joinReplies = (...xs: (string | undefined)[]) => [...new Set(xs.map((x) => x?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n") || undefined;
+  if (loop.ok) {
+    const unparsedText = joinReplies(firstReplies, loop.unparsedText);
+    return { ...loop, ...(unparsedText ? { unparsedText } : {}) };
+  }
+  // The escalation found nothing usable either: the single-turn result stands (its gate decides, as
+  // before), carrying the loop's replies as evidence and naming the escalation in its failure.
+  const loopReplies = localReplies(loop);
+  if (first.ok) {
+    const unparsedText = joinReplies(first.unparsedText, loopReplies);
+    return { ...first, ...(unparsedText ? { unparsedText } : {}) };
+  }
+  const unparsedText = joinReplies(firstReplies, loopReplies);
+  return { ok: false, error: `${first.error}; multi-turn escalation: ${loop.error}`.slice(0, 400), ...(unparsedText ? { unparsedText } : {}) };
 }
 
 /** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
@@ -1372,7 +1413,7 @@ export async function submitHarborChat(
       sender: job.sender,
       isFork: job.isFork,
       isDraft: job.isDraft,
-    }, { diffMaxChars: state.settings.promptDiffMaxChars });
+    }, { diffMaxChars: state.settings.promptDiffMaxChars, skipVendored: state.settings.skipVendoredPaths !== false });
   } catch (e) {
     const msg = formatGithubError(e);
     // token is set only when installationToken succeeded before fetchPullSnapshot failed.
@@ -1578,6 +1619,8 @@ export async function submitHarborChat(
         skipReason: blockingInvalid.join("; ") || "no valid review JSON",
         githubError: blockingInvalid.join("; ") || "no valid review JSON",
         plan: "Did not post — no reviewer returned valid JSON.",
+        // No reviewer produced a review: a failed attempt, never this head's review (ops "failed").
+        noReviewAttempt: true,
         auxiliaryProviderFailures: auxiliaryFailures,
         updatedAt: Date.now(),
       };
@@ -2487,6 +2530,57 @@ export function ingestGitHubWebhook(opts: {
     untrustedBody: parsed.untrustedBody,
   });
   return superseding.length ? { ...result, superseding } : result;
+}
+
+/**
+ * Operator re-review (Job page "Re-run review", POST /api/harbor {action:"rerun", jobId}): a new review
+ * of an ended GitHub job's PR at its LIVE head — no new commit, no GitHub comment. For a head left with
+ * no review (a failed attempt: Job.noReviewAttempt, live WalkieBoard #524) or any other ended job.
+ * It is an explicit request like an `@ashlar-bot review` comment: the same ingress rules (fork, draft),
+ * the same worker (the head is resolved at snapshot, as for a comment trigger), and it supersedes any
+ * live job of that PR exactly as a new mention does. Loop directives are never carried over.
+ */
+export function rerunHarborJob(jobId: string): HarborFireResult | { httpStatus: 404 | 409 | 400; reject: string; queued: false } {
+  const src = state.jobs.find((j) => j.id === jobId);
+  if (!src) return { httpStatus: 404, reject: "unknown job", queued: false };
+  if (src.origin !== "github" || src.installationId === undefined) return { httpStatus: 400, reject: "only a GitHub job can be re-run", queued: false };
+  if (isLive(src.status)) return { httpStatus: 409, reject: "the job is still running", queued: false };
+  const mention = state.settings.mention[0] || `@${state.settings.username}`;
+  // The requester's own words ride along when they hold a plain mention; a loop directive never does.
+  const asked = src.thread?.userText && isBotMention(stripLoopDirectives(src.thread.userText), state.settings) && !src.thread.loop
+    ? src.thread.userText
+    : `${mention} review`;
+  const thread: JobThread = { kind: "mention", commentId: src.thread?.commentId ?? 0, userText: asked };
+  const deliveryId = `rerun:${src.id}:${Date.now()}`;
+  const target: IngressTarget = {
+    owner: src.owner, repo: src.repo, pr: src.pr, title: src.title,
+    headSha: "", baseSha: "", sender: src.sender, isFork: src.isFork, isDraft: src.isDraft,
+  };
+  const t0 = performance.now();
+  const decision = decideIngress({
+    hmacOk: true,
+    settings: state.settings,
+    sample: target,
+    trigger: "issue_comment.mention",
+    deliveryId,
+    existing: state.jobs,
+    knownDeliveries: acceptedDeliveryIds(state.events),
+    thread,
+  });
+  console.info(`[harbor] operator re-run of ${src.id} (${src.owner}/${src.repo}#${src.pr}) at the live head`);
+  return enqueueFromDecision(decision, {
+    deliveryId,
+    trigger: "issue_comment.mention",
+    sample: target,
+    thread,
+    origin: "github",
+    installationId: src.installationId,
+    ingressMs: Math.max(8, performance.now() - t0),
+    eventName: "rerun",
+    action: "operator",
+    hmac: "ok",
+    untrustedBody: asked,
+  });
 }
 
 /**

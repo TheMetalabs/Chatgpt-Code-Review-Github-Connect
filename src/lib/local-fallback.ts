@@ -322,3 +322,31 @@ export function failedLocalSalvage(failure: { originalText?: string; unparsedTex
   const replies = localReplies(failure);
   return replies ? salvageReviewJson(replies) : undefined;
 }
+
+/** A local reply that parsed as review JSON but is no review: no finding and no investigated_safe entry
+ * (and no verbatim raw_review). The gate rejects it as "empty findings without investigated_safe"
+ * (poster.gateLiveSubmission), so returned as-is it ends the head with no review at all (live
+ * WalkieBoard #524, 2026-11-05: twice). Same predicate as that gate's guard. */
+export function emptyWithoutSafe(raw: string): boolean {
+  let o: unknown;
+  try { o = JSON.parse(raw); } catch { return false; }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return false;
+  const r = o as Record<string, unknown>;
+  if (typeof r.raw_review === "string" && r.raw_review.trim()) return false;
+  if (Array.isArray(r.findings) && r.findings.length) return false;
+  const safe = Array.isArray(r.investigated_safe) ? r.investigated_safe.map((x) => String(x).trim()).filter(Boolean) : [];
+  return safe.length === 0;
+}
+
+/** Whether a single-turn local result escalates once to the multi-turn loop (the tier that reads files
+ * with tools) instead of ending the leg with no review: a reply that is no review (emptyWithoutSafe),
+ * or completed replies that never became review JSON after the one JSON correction. Never a transport
+ * error with no completed reply, a cancellation, or a PR with no changed path (nothing to read). */
+export function escalateSingleTurn(
+  result: { ok: true; raw: string } | { ok: false; error: string; unparsedText?: string; originalText?: string },
+  ctx: { changedPaths: number; aborted: boolean },
+): "empty" | "not_json" | undefined {
+  if (ctx.aborted || ctx.changedPaths === 0) return undefined;
+  if (result.ok) return emptyWithoutSafe(result.raw) ? "empty" : undefined;
+  return localReplies(result) ? "not_json" : undefined;
+}

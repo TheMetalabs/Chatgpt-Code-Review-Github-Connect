@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DiffView } from "@/components/diff-view";
@@ -24,6 +24,9 @@ function JobPage() {
   const settings = useAshlar((s) => s.settings);
   const fire = useAshlar((s) => s.fire);
   const cancel = useAshlar((s) => s.cancel);
+  const rerun = useAshlar((s) => s.rerun);
+  const navigate = useNavigate();
+  const [rerunState, setRerunState] = useState<{ busy: boolean; error?: string }>({ busy: false });
   const sync = useAshlar(s => s.sync);
 
   if (!job) {
@@ -72,6 +75,23 @@ function JobPage() {
             <Button variant="secondary" size="sm" onClick={() => cancel(job.id)}>
               Cancel
             </Button>
+          ) : job.origin === "github" ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={rerunState.busy}
+              title="Review this PR again at its current head — no new commit or GitHub comment needed"
+              onClick={async () => {
+                setRerunState({ busy: true });
+                const out = await rerun(job.id);
+                if (out.ok) {
+                  setRerunState({ busy: false });
+                  void navigate({ to: "/jobs/$id", params: { id: out.jobId } });
+                } else setRerunState({ busy: false, error: out.error });
+              }}
+            >
+              {rerunState.busy ? "Re-running…" : "Re-run review"}
+            </Button>
           ) : job.sampleKey ? (
             <Button
               variant="secondary"
@@ -83,6 +103,15 @@ function JobPage() {
           ) : null}
         </div>
       </div>
+
+      {rerunState.error ? (
+        <p role="alert" className="mt-3 text-sm text-danger">Re-run not started: {rerunState.error}</p>
+      ) : null}
+      {job.noReviewAttempt ? (
+        <p className="mt-4 rounded-xl border border-warn/30 bg-bg-elevated px-4 py-3 text-sm text-warn">
+          Failed attempt — no reviewer produced a review for {shortSha(job.headSha)}. This is not a review of the head. Use Re-run review to review it again without a new commit.
+        </p>
+      ) : null}
 
       <a className="mt-4 inline-block text-sm text-accent underline" href={`/history?jobId=${encodeURIComponent(job.id)}`}>History, step logs and original responses</a>
 

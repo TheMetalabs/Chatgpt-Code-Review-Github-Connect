@@ -143,6 +143,11 @@ export interface Job {
   installationId?: number;
   postedToGithub?: boolean;
   githubError?: string;
+  /** The job ended without any review because no reviewer produced one (no valid review JSON, an
+   * empty reply with no investigated_safe): a FAILED ATTEMPT, never a review of the head. Its ops
+   * comment reads "failed" and carries the ashlar-attempt marker so a driver does not count it as the
+   * head's review (live WalkieBoard #524/#530/#531, 2026-11-05). */
+  noReviewAttempt?: boolean;
   chatPrompt?: string;
   chatPromptByProvider?: Partial<Record<ReviewProvider, string>>;
   bridgeClaimedAt?: number;
@@ -225,6 +230,9 @@ export interface Job {
   coverage?: { file: string; status: "cleared" | "not_cleared"; reason: string }[];
   /** Review-coverage: deterministic (harness) coverage per changed code file. */
   coverageDeterministic?: { path: string; inDiff: boolean; inContext: boolean; reason?: string }[];
+  /** Changed paths left out of this review because .gitattributes marks them linguist-vendored /
+   * linguist-generated (SamplePr.vendoredPaths): the count and the first few, for the ops comment. */
+  vendoredSkipped?: { count: number; paths: string[] };
   /** Review-coverage: findings dropped by the precision gate. */
   droppedCount?: number;
   /** Findings the finding gate routed to notes (finding-gate.ts C1): rendered under "Notes (not
@@ -361,6 +369,10 @@ export interface BotSettings {
   /** Post a review only for the PR's latest head (a review of a head the PR has moved past is not
    * posted, and an earlier head's findings are never re-posted). */
   postLatestHeadOnly: boolean;
+  /** Leave the paths the repository's .gitattributes marks `linguist-vendored` or `linguist-generated`
+   * out of the review (diff, context, local loop groups), and never post a finding on them (live
+   * WalkieBoard #523: 16 rounds of findings on unmodified vendored WhisperKit sources). */
+  skipVendoredPaths: boolean;
   localLlmApiKeySet?: boolean;
   webhookSecretSet?: boolean;
 }
@@ -392,6 +404,10 @@ export interface SamplePr {
   /** Unchanged modules that changed files import from, fetched at head so cross-file helper
    * definitions can be attached (chat) or served by the loop's cache (local). Not review targets. */
   referenceFiles?: SnapshotFile[];
+  /** Changed paths the repository's .gitattributes marks linguist-vendored / linguist-generated, left
+   * out of the review (Settings skipVendoredPaths): not in changedPaths, files, or the diff, and no
+   * finding is ever posted on them (gitattributes.ts). */
+  vendoredPaths?: { path: string; kind: "vendored" | "generated" }[];
   /** BASE text of changed files that are also policy paths (a module AGENTS.md / CLAUDE.md,
    * code_review.md): the policy authority, so a PR cannot rewrite the rules it is reviewed by. `files`
    * holds every changed path at HEAD, these included (github-snapshot.ts changedPolicyDocs). */
@@ -520,6 +536,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   findingNotes: true,
   findingDedupePrior: true,
   postLatestHeadOnly: true,
+  skipVendoredPaths: true,
 };
 
 export const DEFAULT_REVIEW_ORDER: ReviewProvider[] = ["local", "chatgpt", "grok"];

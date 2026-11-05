@@ -40,11 +40,18 @@ test('verify-clean: the first unparseable reply is kept as evidence even when th
   app.localResponses[0].end(reply('P1 a.ts:1 FIRST-REPLY-MARK: a duplicate request writes twice'));
   await eventually(()=>app.localRequests.length===2,'local did not ask for its one JSON correction');
   app.localResponses[1].end(reply('still prose, sorry'));
+  // Still no review JSON: the leg escalates once to the multi-turn loop, whose group retries once.
+  await eventually(()=>app.localRequests.length===3,'local did not escalate to the multi-turn loop');
+  assert.ok(app.localRequests[2].tools,'the escalation is the tool loop');
+  app.localResponses[2].end(reply('LOOP-REPLY-MARK prose'));
+  await eventually(()=>app.localRequests.length===4,'the loop group did not retry once');
+  app.localResponses[3].end(reply('LOOP-RETRY-MARK prose'));
   await eventually(()=>app.reviews.length===1,'the review was not posted');
   const body=app.reviews[0].body;
   const block=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
   assert.ok(block.includes('FIRST-REPLY-MARK'),'the first reply (the one with the finding) is posted');
   assert.ok(block.includes('still prose, sorry'),'and the correction reply');
+  assert.ok(block.includes('LOOP-REPLY-MARK')&&block.includes('LOOP-RETRY-MARK'),'and the escalated loop replies');
   assert.equal(converged(body),false);
 });
 
@@ -107,4 +114,65 @@ test('race (default): a local first reply set aside for the JSON correction is p
   assert.ok(body.indexOf('FIRST-REPLY')>body.indexOf(REVIEW_RAW_START)&&body.indexOf(REVIEW_RAW_START)>=0,'posted in the raw block');
   assert.deepEqual([...job().incompleteProviders],['local']);
   assert.deepEqual({...job().rawCauses},{local:'not-a-verdict'});
+});
+
+// Live WalkieBoard #524 (2026-11-05): the local single-turn reply was findings:[] with no
+// investigated_safe, twice; each job ended "Instant-tier skip, not a review" and the head got no review.
+test('local-only: a single-turn reply with no review escalates once to the multi-turn loop, which posts',async t=>{
+  const {app,job}=await setup(t,'race',{reviewChatgpt:false,localJsonRepairEnabled:false,localReviewMode:'auto'});
+  await eventually(()=>app.localRequests.length===1,'local did not start');
+  assert.equal(app.localRequests[0].tools,undefined,'auto chose the single-turn leg');
+  app.localResponses[0].end(reply(JSON.stringify({findings:[],merge_recommendation:'COMMENT'})));
+  await eventually(()=>app.localRequests.length===2,'the empty single-turn reply was not escalated');
+  assert.ok(app.localRequests[1].tools,'the escalation is the multi-turn tool loop');
+  app.localResponses[1].end(reply(dirty));
+  await eventually(()=>app.reviews.length===1,'the escalated review was not posted');
+  assert.equal(job().status,'posted');
+  assert.match(app.reviews[0].body,/ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 p2=0/,'the loop\'s finding posts inline');
+  assert.equal(app.localRequests.length,2,'one escalation, no further requests');
+});
+
+test('local-only: an empty reply that the escalation cannot turn into a review still ends without a clean result',async t=>{
+  const {app,job}=await setup(t,'race',{reviewChatgpt:false,localJsonRepairEnabled:false,localReviewMode:'auto'});
+  const empty=reply(JSON.stringify({findings:[],merge_recommendation:'COMMENT'}));
+  await eventually(()=>app.localRequests.length===1,'local did not start');
+  app.localResponses[0].end(empty);
+  await eventually(()=>app.localRequests.length===2,'not escalated');
+  app.localResponses[1].end(empty);
+  await eventually(()=>app.localRequests.length===3,'the loop group did not retry once');
+  app.localResponses[2].end(empty);
+  await eventually(()=>['skipped','posted','dlq'].includes(job().status),'the job never finished');
+  await settle();
+  assert.equal(app.localRequests.length,3);
+  assert.equal(app.reviews.length,0,'nothing claims a clean review');
+  // A failed attempt, not a skip: a driver that budgets re-requests per head must not count it.
+  assert.equal(job().noReviewAttempt,true);
+  await eventually(()=>/\*\*Status:\*\* failed/.test(app.ops.at(-1)??''),'the ops comment never read failed');
+  const ops=app.ops.at(-1);
+  assert.match(ops,/<!-- ashlar-attempt failed head=abc123 -->/);
+  assert.match(ops,/This attempt failed; it is not a review of this head\. Request one again without a new commit: comment `@ashlar-bot review`/);
+});
+
+// A head left with no review (a failed attempt) is reviewed again from the Job page, at the live head,
+// with no new commit and no GitHub comment.
+test('operator re-run: a failed attempt is reviewed again at the live head and posts',async t=>{
+  const {app,jobId,job}=await setup(t,'race',{reviewChatgpt:false,localJsonRepairEnabled:false,localReviewMode:'single'});
+  const empty=reply(JSON.stringify({findings:[],merge_recommendation:'COMMENT'}));
+  assert.equal(app.harbor.rerunHarborJob(jobId).httpStatus,409,'a running job is not re-run');
+  // single-turn reply, its escalation, the loop group's one retry: all empty → a failed attempt
+  for(let i=0;i<3;i++){await eventually(()=>app.localRequests.length===i+1,`local request ${i+1}`);app.localResponses[i].end(empty);}
+  await eventually(()=>job().noReviewAttempt===true,'not a failed attempt');
+  const heads=app.githubCalls.head;
+  const out=app.harbor.rerunHarborJob(jobId);
+  assert.equal(out.httpStatus,202);assert.equal(out.queued,true);assert.notEqual(out.jobId,jobId);
+  const next=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  assert.equal(next().trigger,'issue_comment.mention');
+  assert.equal(next().thread.userText,'@ashlar-bot review','the requester\'s plain mention rides along');
+  await eventually(()=>app.localRequests.length===4,'the re-run did not start local');
+  assert.ok(app.githubCalls.head>heads,'the re-run resolved the live head');
+  assert.equal(next().headSha,'abc123');
+  app.localResponses[3].end(reply(dirty));
+  await eventually(()=>next()?.status==='posted','the re-run did not post');
+  assert.equal(app.reviews.length,1);
+  assert.equal(app.harbor.rerunHarborJob('job-missing').httpStatus,404);
 });

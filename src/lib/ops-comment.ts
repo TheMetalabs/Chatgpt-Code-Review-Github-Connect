@@ -14,9 +14,24 @@ export type OpsCommentInput = {
   canonicalProvider?: ReviewProvider;
   auxiliaryProviderFailures?: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>>;
   notes: string[];
+  /** The head of a job that ended with no review at all (Job.noReviewAttempt): rendered as the
+   * machine-readable ATTEMPT_FAILED marker. */
+  attemptFailedHead?: string;
 };
 
 export const OPS_COMMENT_MARK = "<!-- ashlar-ops -->";
+/** Trailing marker of an ops comment whose job produced no review (a failed attempt, not a review):
+ * `<!-- ashlar-attempt failed head=<sha> -->`. A driver that budgets re-requests per head must not count
+ * such a job as that head's review. */
+export const ATTEMPT_FAILED_MARK = "ashlar-attempt failed";
+export function attemptFailedMarker(headSha: string): string {
+  return `<!-- ${ATTEMPT_FAILED_MARK} head=${headSha.replace(/[^0-9a-f]/gi, "").slice(0, 40)} -->`;
+}
+
+/** The note a failed attempt's ops comment carries: why, and how to ask again without a new commit. */
+export function attemptFailedNote(headSha: string, reason: string, mention: string): string {
+  return `No review was produced for ${headSha.slice(0, 7)}${reason ? `: ${reason}` : ""}. This attempt failed; it is not a review of this head. Request one again without a new commit: comment \`${mention} review\` on this PR, or use Re-run review on the Ashlar job page.`;
+}
 
 /** Only admitted explicit requests, including PR-body mentions, get status comments. */
 export function opsCommentAllowed(job: { trigger: Trigger }): boolean {
@@ -49,6 +64,7 @@ export function buildOpsComment(input: OpsCommentInput): string {
     : "";
   const notes = [providerNote, ...input.notes].map((n) => n.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8);
   const noteLines = notes.length ? notes.map((n) => `- ${n}`).join("\n") : "- No blockers. Failures are skipped; remaining reviewers continue.";
+  const attempt = input.phase === "failed" && input.attemptFailedHead ? `\n${attemptFailedMarker(input.attemptFailedHead)}\n` : "";
   return `${OPS_COMMENT_MARK}
 
 ## Ashlar
@@ -58,10 +74,16 @@ Reviewers: ${reviewers || "none configured"}.
 **Status:** ${status}
 
 ${noteLines}
-`;
+${attempt}`;
 }
 
 const NOTE_MAX_CHARS = 200;
+
+/** The ops line for paths .gitattributes kept out of the review (Settings skipVendoredPaths). */
+export function vendoredSkippedNote(v: { count: number; paths: string[] }): string {
+  const shown = v.paths.slice(0, 3).join(", ");
+  return `Not reviewed (.gitattributes linguist-vendored/generated): ${v.count} path(s)${shown ? ` — ${shown}${v.count > 3 ? ", …" : ""}` : ""}`;
+}
 const MAX_NOTES = 8;
 // WHY: cc_merge.py COVERAGE_RE parses this line from the posted comment to gate merges; a cut
 // line hid files from the gate (#77 job 989: ~7 of 42). Keep the literal format byte-identical.
@@ -73,7 +95,7 @@ const GATE_PREFIX = "Gate: ";
 // reviewed sha (+ whether HEAD moved), prompt sizes, deterministic + model
 // coverage, and precision-dropped count. Pure/read-only; never affects the verdict.
 export function reviewPostedNotes(
-  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount"> & Partial<Pick<Job, "gateStats">>,
+  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount"> & Partial<Pick<Job, "gateStats" | "vendoredSkipped">>,
   returnedFindings: number,
   unanchoredInBody = 0,
 ): string[] {
@@ -88,6 +110,7 @@ export function reviewPostedNotes(
     const description = ps.descriptionChars ? `, PR description ${ps.descriptionChars} chars` : "";
     notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars${inContext.length ? ` (${inContext.join(", ")})` : ""}, policy ${ps.policyChars} chars${description}`);
   }
+  if (job.vendoredSkipped?.count) notes.push(vendoredSkippedNote(job.vendoredSkipped));
   const det = job.coverageDeterministic ?? [];
   if (det.length) {
     const full = det.filter((d) => d.inDiff).length;

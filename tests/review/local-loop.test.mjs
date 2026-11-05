@@ -673,3 +673,91 @@ test("a code group sees the module doc a sibling group's file edits, at head; it
   assert.doesNotMatch(policy, /HEAD_DOC_ADDITION/, "the PR's edit never becomes the policy it is reviewed by");
   assert.match(bodies[1].messages.find((m) => m.role === "tool").content, /HEAD_DOC_ADDITION/, "file_read serves the head");
 });
+
+// ── One retry per group (live WalkieBoard #524/#530/#531, 2026-11-05: heads skipped as "local loop
+// produced no review JSON" / "empty findings without investigated_safe") ──
+
+test("a group whose final reply is prose gets one JSON-only retry, and its JSON is the group's review", async () => {
+  const { request, bodies } = mock([assistant("The change looks risky in pay.ts but I'll describe it in prose."), assistant(REVIEW_JSON)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true, "the retry's review JSON is accepted");
+  assert.equal(JSON.parse(out.raw).findings.length, 1);
+  assert.equal(bodies.length, 2, "exactly one extra request");
+  const retry = bodies[1];
+  assert.equal(retry.tools, undefined, "the retry offers no tools");
+  assert.match(retry.messages.at(-1).content, /not the review JSON/);
+  // The replaced prose reply is evidence, so the JSON is not this leg's complete verdict.
+  assert.match(out.unparsedText ?? "", /describe it in prose/);
+  assert.match(incompleteVerdict({ ok: true, findings: [1] }, out) ?? "", /not review JSON/);
+});
+
+test("a group that answers findings:[] without investigated_safe is asked once to report or clear its files", async () => {
+  const emptyNoSafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT" });
+  const emptySafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT", investigated_safe: ["src/pay.ts: changed() only logs"], coverage: [] });
+  const { request, bodies } = mock([assistant(emptyNoSafe), assistant(emptySafe)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true);
+  assert.match(bodies[1].messages.at(-1).content, /investigated_safe/);
+  assert.deepEqual(JSON.parse(out.raw).investigated_safe, ["src/pay.ts: changed() only logs"]);
+  assert.equal(out.unparsedText, undefined, "an empty JSON reply carries nothing to keep as evidence");
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sampleWith(["src/pay.ts"]), settings);
+  assert.equal(gate.ok, true, "the retried group passes the empty-findings guard");
+});
+
+test("a cut-off reply is dropped from the retry conversation and the retry asks for a short JSON", async () => {
+  const cut = { choices: [{ finish_reason: "length", message: { content: '{"findings":[{"title":"half' } }], usage: { prompt_tokens: 100 } };
+  const { request, bodies } = mock([cut, assistant(REVIEW_JSON)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true);
+  const retry = bodies[1].messages;
+  assert.ok(!retry.some((m) => m.role === "assistant" && /half/.test(m.content)), "the partial reply is not sent back");
+  assert.match(retry.at(-1).content, /cut off/);
+});
+
+test("the group retry happens once: a second unusable reply fails the group with both replies kept", async () => {
+  const { request, bodies } = mock([assistant("first prose"), assistant("second prose")]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /no review JSON/);
+  assert.equal(bodies.length, 2, "one retry, never a loop");
+  assert.match(out.unparsedText, /first prose/);
+  assert.match(out.unparsedText, /second prose/);
+});
+
+test("a retry request that throws keeps the group's first reply as evidence", async () => {
+  let call = 0;
+  const request = async (_b, _k, path) => {
+    if (path === "models") return { data: [] };
+    call += 1;
+    if (call === 2) throw new Error("HTTP 500");
+    return assistant("prose that may name a defect");
+  };
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false);
+  assert.match(out.unparsedText, /may name a defect/);
+});
+
+test("task_done FAILED and a content-filtered reply are never retried", async () => {
+  for (const step of [
+    assistant(REVIEW_JSON, [toolCall("task_done", { state: "FAILED" })]),
+    { choices: [{ finish_reason: "content_filter", message: { content: "" } }], usage: { prompt_tokens: 100 } },
+  ]) {
+    const { request, bodies } = mock([step]);
+    const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+    assert.equal(out.ok, false);
+    assert.equal(bodies.length, 1, "no retry request");
+  }
+});
+
+test("a retry over the context cap drops the unusable reply instead of growing the window", async () => {
+  process.env.ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS = "200";
+  try {
+    const long = "x ".repeat(4000);
+    const { request, bodies } = mock([assistant(long), assistant(REVIEW_JSON)]);
+    await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+    const retry = bodies.at(-1).messages;
+    assert.ok(!retry.some((m) => m.role === "assistant" && m.content === long), "the over-cap reply is not resent");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS;
+  }
+});

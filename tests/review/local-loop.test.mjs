@@ -761,3 +761,22 @@ test("a retry over the context cap drops the unusable reply instead of growing t
     delete process.env.ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS;
   }
 });
+
+test("a not-reviewed reply with prose around its JSON stays evidence after a successful retry (Codex #179)", async () => {
+  const first = 'P1: src/pay.ts duplicates payments on retry.\n{"findings":[],"investigated_safe":[]}';
+  const emptySafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT", investigated_safe: ["src/pay.ts checked"], coverage: [] });
+  const { request } = mock([assistant(first), assistant(emptySafe)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true);
+  assert.match(out.unparsedText ?? "", /duplicates payments/, "the replaced reply's prose is kept");
+  assert.match(incompleteVerdict({ ok: true, findings: [] }, out) ?? "", /not review JSON/, "so the leg is never a clean verdict");
+});
+
+test("a not-reviewed reply with an incomplete finding row stays evidence after a successful retry", async () => {
+  const first = JSON.stringify({ findings: [{ severity: "P1", file: "src/pay.ts", title: "double charge" }] });
+  const emptySafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT", investigated_safe: ["src/pay.ts checked"], coverage: [] });
+  const { request } = mock([assistant(first), assistant(emptySafe)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true);
+  assert.match(out.unparsedText ?? "", /double charge/);
+});

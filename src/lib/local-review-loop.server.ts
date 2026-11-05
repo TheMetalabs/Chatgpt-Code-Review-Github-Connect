@@ -473,9 +473,12 @@ async function reviewGroup(
     const json = !partial && calls === 0 ? extractChatJsonParts(content) : null;
     deps.log?.(`group[${groupPaths[0]}] retry (${kind}): finish=${choice?.finish_reason} json=${json ? "yes" : "no"}`);
     if (json && groupReviewValid(json.json, groupPaths, sample, settings)) {
-      // The completed non-JSON reply the retry replaced may itself name a defect: it stays evidence
-      // (setAside), as the single-turn JSON correction keeps its first reply.
-      return { raw: json.json, reply: content.trim(), residual: Boolean(json.residual), ...(kind === "not_json" && reply ? { setAside: reply } : {}) };
+      // The completed reply the retry replaced may itself name a defect: a non-JSON reply, or unusable
+      // JSON with prose around it or with finding rows the gate could not use. It stays evidence
+      // (setAside), as the single-turn JSON correction keeps its first reply. Only a bare empty JSON
+      // object carries nothing to keep.
+      const keep = kind === "not_json" || (kind === "not_reviewed" && (residual || hasFindingRows(finalRaw)));
+      return { raw: json.json, reply: content.trim(), residual: Boolean(json.residual), ...(keep && reply ? { setAside: reply } : {}) };
     }
     // Still not a usable review: keep the first outcome (its reply stays the group's evidence), and any
     // completed reply the retry produced as well.
@@ -487,6 +490,17 @@ async function reviewGroup(
     if (deps.signal?.aborted) throw e;
     deps.log?.(`group[${groupPaths[0]}] retry (${kind}) failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
     return { raw: finalRaw, reply, residual };
+  }
+}
+
+/** Whether a review JSON carries any finding rows at all (usable or not). */
+function hasFindingRows(raw: string | null): boolean {
+  if (!raw) return false;
+  try {
+    const o = JSON.parse(raw) as { findings?: unknown };
+    return Array.isArray(o.findings) ? o.findings.length > 0 : Boolean(o.findings);
+  } catch {
+    return false;
   }
 }
 

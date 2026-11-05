@@ -127,8 +127,9 @@ export function vendoredKind(path: string, rules: readonly Rule[]): VendoredKind
 }
 
 /** The changed paths the .gitattributes texts leave out of review, each with its reason. Texts apply in
- * order (base first, then head), so the PR's own .gitattributes decides for its head. A change TO a
- * .gitattributes file itself is always reviewed: it is how a PR would hide its own code. */
+ * order, a later line overriding an earlier one (the snapshot passes the head's text alone, so a rule
+ * the PR removes no longer applies). A change TO a .gitattributes file itself is always reviewed: it is
+ * how a PR would hide its own code. */
 export function vendoredPaths(paths: readonly string[], texts: readonly (string | null | undefined)[]): { path: string; kind: VendoredKind }[] {
   const rules = texts.flatMap((t) => (t ? parseGitattributes(t) : []));
   if (!rules.length) return [];

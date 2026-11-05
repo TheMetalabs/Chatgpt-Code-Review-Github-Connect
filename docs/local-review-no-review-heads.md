@@ -39,7 +39,7 @@ There are two ways:
 
 ## 4. Vendored and generated paths (Settings `finding_precision.skip_vendored`, on by default)
 
-Ashlar reads the root `.gitattributes`, at base and then at head. Paths marked `linguist-vendored` or `linguist-generated` are left out before anything is fetched: no diff, no context, no local loop group, and no finding is posted on them. The rules follow gitattributes(5), and a later line or `-attr` unsets an earlier one. A change to a `.gitattributes` file is itself always reviewed, because that is how a PR would hide its own code.
+Ashlar reads the root `.gitattributes` at the PR's head. Base rules are never inherited, so a rule the PR removes or narrows no longer applies. Paths marked `linguist-vendored` or `linguist-generated` are left out before anything is fetched: no diff, no context, no local loop group, and no finding is posted on them. The rules follow gitattributes(5), and a later line or `-attr` unsets an earlier one. A change to a `.gitattributes` file is itself always reviewed, because that is how a PR would hide its own code.
 
 - The ops comment lists how many paths were left out.
 - A PR whose changed paths are all vendored or generated starts no reviewer. Its job is skipped with that reason; this is not a failed attempt.

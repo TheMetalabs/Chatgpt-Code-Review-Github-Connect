@@ -141,3 +141,16 @@ test('linguist-vendored paths (.gitattributes) are left out of the snapshot, and
   assert.ok(off.changedPaths.includes(vendored.filename));
   assert.equal(off.vendoredPaths, undefined);
 });
+
+// Codex #179: a vendored rule the PR removes no longer applies (head attributes only, never base's).
+test('a linguist-vendored rule the PR removes from .gitattributes no longer leaves its paths out', async () => {
+  const lib = { filename: 'lib/core.c', status: 'modified', patch: '@@ -1 +1 @@\n-int a;\n+int b;' };
+  const compare = { files: [lib, { filename: '.gitattributes', status: 'modified', patch: '@@ -1 +1 @@\n-lib/** linguist-vendored\n+* text=auto' }] };
+  const contents = {
+    [BASE]: { ...CONTENTS[BASE], '.gitattributes': 'lib/** linguist-vendored\n' },
+    [HEAD]: { ...CONTENTS[HEAD], '.gitattributes': '* text=auto\n', 'lib/core.c': 'int b;' },
+  };
+  const sample = await fakeGithub(contents, compare).api.fetchPullSnapshot('token', target, { skipVendored: true });
+  assert.ok(sample.changedPaths.includes('lib/core.c'), 'the now-maintained file is reviewed');
+  assert.equal(sample.vendoredPaths, undefined);
+});

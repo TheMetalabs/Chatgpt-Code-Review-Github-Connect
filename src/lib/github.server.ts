@@ -598,14 +598,13 @@ export async function fetchPullSnapshot(
     rows = filesOut.data;
   }
   const allChanged = rows.map((f) => f.filename).filter((p): p is string => Boolean(p));
-  // Settings skipVendoredPaths: what the repository's root .gitattributes (base, then head) marks
+  // Settings skipVendoredPaths: what the repository's root .gitattributes AT HEAD marks
   // linguist-vendored / linguist-generated is not its code and is left out before anything is fetched,
-  // so it neither crowds real files out of the file cap nor holds a local reviewer (live #523).
+  // so it neither crowds real files out of the file cap nor holds a local reviewer (live #523). Head
+  // only: a rule the PR removes or narrows no longer applies (base rules are never inherited), and a
+  // .gitattributes change is itself always reviewed.
   const vendored = opts?.skipVendored
-    ? vendoredPaths(allChanged, [
-      await getFile(token, target.owner, target.repo, ".gitattributes", target.baseSha).catch(() => null),
-      await getFile(token, target.owner, target.repo, ".gitattributes", target.headSha).catch(() => null),
-    ])
+    ? vendoredPaths(allChanged, [await getFile(token, target.owner, target.repo, ".gitattributes", target.headSha).catch(() => null)])
     : [];
   const vendoredSet = new Set(vendored.map((v) => v.path));
   const changedPaths = allChanged.filter((p) => !vendoredSet.has(p)).slice(0, MAX_FILES);

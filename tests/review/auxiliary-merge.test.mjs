@@ -114,6 +114,26 @@ test('valid auxiliary Grok findings remain visible beside a canonical ChatGPT cl
   assert.deepEqual(job.auxiliaryProviderFailures ?? {}, {});
 });
 
+const recoveredChatgptClean = '{"merge_recommendation":"APPROVE","findings":[],"investigated_safe":["a.ts: reviewed"],"coverage":[{"file":"a.ts","status":"cleared","reason":"constant"},{"file":"b.ts"';
+const recoveredGrokClean = 'Grok\n```json\n{"merge_recommendation":"APPROVE","findings":[],"investigated_safe":["a.ts: reviewed"],"coverage":[{"file":"a.ts","status":"cleared","reason":"constant"},{"file":"b.ts"';
+
+test('recovered clean ChatGPT and Grok legs converge to one clean comment', async (t) => {
+  const app = await appFixture({reviewLocal: false, reviewGrok: true});
+  t.after(() => app.close());
+  const out = await app.mention('auxiliary-recovered-clean');
+  await eventually(() => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId)?.status === 'awaiting_chat', 'snapshot not ready');
+  await app.harbor.submitHarborChat(out.jobId, recoveredChatgptClean, [
+    {provider: 'chatgpt', raw: recoveredChatgptClean, originalText: recoveredChatgptClean},
+    {provider: 'grok', raw: recoveredGrokClean, originalText: recoveredGrokClean},
+  ], {force: true});
+  const body = await posted(app, out);
+  const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
+  assert.equal(body.split('\n')[0], CLEAN_REVIEW_BODY);
+  assert.equal(isZeroFindings(body, {authoredByBot: true}), true);
+  assert.deepEqual([...(job.coverageCutProviders ?? [])].sort(), ['chatgpt', 'grok']);
+  assert.deepEqual([...(job.incompleteProviders ?? [])], []);
+});
+
 test('logged-out canonical ChatGPT can be replaced by a clean structured Grok reply', async (t) => {
   const app = await appFixture({reviewLocal: false, reviewGrok: true});
   t.after(() => app.close());

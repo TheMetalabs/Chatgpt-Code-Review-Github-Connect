@@ -159,7 +159,7 @@ code, so a future skill or change can find the rule instead of re-learning it.
   `cause=edited` cleanup follows a captured source; it does not end the leg. Fixes: a Grok bubble that
   holds only UI labels ("Grok", "×N", "JSON") is not an answer and those leading labels are stripped; an
   incomplete structured answer is handed on as truncated only after standing still 45 s with the stream
-  gone; the review JSON is read from the code block literally (a folded block's hidden tail included)
+  gone; review JSON is read from either provider's code block literally (a folded block's hidden tail included)
   before the rendered text; a close is held back (`cause: generating`) while Grok's stop control is up;
   and a review string with invalid escapes (`\ldots`, `\(`, a raw newline) is read again with those made
   literal after the strict parse failed (`repairJsonEscapes`, extension and server).

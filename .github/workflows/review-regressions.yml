@@ -1,9 +1,9 @@
 name: Review regressions
 
+# Manual only: run it once on the PR branch as the final check before merging
+# (Actions → Review regressions → Run workflow, or `gh workflow run review-regressions.yml --ref <branch>`).
+# Pushes and PR updates do not start it.
 on:
-  pull_request:
-  push:
-    branches: [fix/review-wait-parse-heartbeat]
   workflow_dispatch:
 
 permissions:

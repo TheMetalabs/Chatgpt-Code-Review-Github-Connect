@@ -92,6 +92,7 @@ const MAX_INLINE_ATTRS = formAttrs(SETTINGS_INT_FIELDS.maxInlineComments);
 const LEASE_CAPACITY_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localLeaseCapacity);
 const PIPELINE_MAX_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localPipelineMaxFindings);
 const PIPELINE_VOTES_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localPipelineVerifyVotes);
+const PIPELINE_LENSES_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localPipelineLenses);
 
 /** A numeric draft value as an input value: an emptied input (NaN) stays empty, not "NaN". */
 function formValue(v: number): number | "" {
@@ -150,6 +151,8 @@ export function Settings() {
     saved.localReviewPipeline,
     saved.localPipelineMaxFindings,
     saved.localPipelineVerifyVotes,
+    saved.localPipelineLenses,
+    saved.localPipelineKeepUncertain,
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
@@ -302,7 +305,7 @@ export function Settings() {
             Off: the grouped tool loop.
           </p>
         </Field>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-3">
           <Field label="local_review.pipeline_max_findings">
             <input
               type="number"
@@ -325,7 +328,30 @@ export function Settings() {
               className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
             />
           </Field>
+          <Field label="local_review.pipeline_lenses">
+            <input
+              type="number"
+              min={PIPELINE_LENSES_ATTRS.min}
+              max={PIPELINE_LENSES_ATTRS.max}
+              step={PIPELINE_LENSES_ATTRS.step}
+              value={formValue(draft.localPipelineLenses)}
+              onChange={(e) => patch({ localPipelineLenses: fromForm(PIPELINE_LENSES_ATTRS.unit, e.target.valueAsNumber) })}
+              className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+            />
+          </Field>
         </div>
+        <Field label="local_review.pipeline_keep_uncertain">
+          <Toggle
+            label="post an undecided candidate at P2 when its own quote is real code"
+            checked={draft.localPipelineKeepUncertain}
+            onChange={(v) => patch({ localPipelineKeepUncertain: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Candidate passes (lenses) look at failure paths, data invariants and contracts; every candidate is then
+            checked by its own verifier turn. A candidate the verifier neither proves nor refutes with a quote is posted
+            at P2 when this is on.
+          </p>
+        </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="chatgpt_reasoning">
             <select
@@ -585,6 +611,8 @@ review:
   local_pipeline: ${draft.localReviewPipeline}
   local_pipeline_max_findings: ${draft.localPipelineMaxFindings}
   local_pipeline_verify_votes: ${draft.localPipelineVerifyVotes}
+  local_pipeline_lenses: ${draft.localPipelineLenses}
+  local_pipeline_keep_uncertain: ${draft.localPipelineKeepUncertain}
   chatgpt_reasoning: ${draft.chatgptReasoning}
   grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]

@@ -70,6 +70,15 @@ export interface GateContext {
   /** The bot's earlier findings on this PR (other heads or earlier reviews). */
   priorFindings?: PriorFinding[];
   headSha?: string;
+  /** Findings the local pipeline's refute stage verified against the code (verifiedKey). Trusted input
+   * from Ashlar's own pipeline, never from a reviewer's JSON: the hedge, evidence and P1 closed-path
+   * rules do not run again on them (the verifier already judged that), the hard drops still do. */
+  verifiedKeys?: ReadonlySet<string>;
+}
+
+/** The key a verified finding is known by: file, line and its normalized title. */
+export function verifiedKey(f: { file: string; line: number; title: string }): string {
+  return `${f.file}|${f.line}|${String(f.title ?? "").slice(0, 160).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()}`;
 }
 
 export interface GateOptions {
@@ -786,6 +795,13 @@ function noteCategory(f: Finding, provenOnChanged: boolean): GateNoteCategory | 
   return undefined;
 }
 
+/** The note category of a remark the gate has not proven (no verified quote on a changed line), or
+ * undefined for a defect claim: the local pipeline routes a rescued soft drop with one to notes, not to
+ * its verifier. */
+export function unprovenNoteCategory(f: Finding): GateNoteCategory | undefined {
+  return noteCategory(f, false);
+}
+
 // ── D dedupe against the bot's earlier findings ───────────────────────────────────────────────────
 
 /** The prior finding this one repeats, in the same file: a near-identical title (token Jaccard >= 0.8);
@@ -874,6 +890,14 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (contradicted) return drop("contradicted_by_diff", `${contradicted} is changed in this PR`);
   const ownReply = ownReplyContradiction(f, ctx, ev.onChanged);
   if (ownReply) return drop("contradicted_by_own_reply", ownReply);
+  // Verified by the local pipeline's refute stage against the code: kept as the verifier judged it.
+  // Its hedges and evidence are not re-judged, but a note-category remark (style / docs / i18n / log /
+  // test advice) is still a note: verifying that a remark quotes real code does not make it a defect.
+  if (ctx.verifiedKeys?.has(verifiedKey(f))) {
+    const category = opts.notes ? noteCategory(f, ev.onChanged) : undefined;
+    if (category) return { finding: f, action: "note", reasons: [`note:${category}`, "verified_by_refute"], severityBefore: before };
+    return { finding: f, action: "keep", reasons: ["verified_by_refute"], severityBefore: before };
+  }
 
   const claim = claimText(f);
   if (titleAdmitsUnverified(f.title)) return drop("speculative", "title: unverified");

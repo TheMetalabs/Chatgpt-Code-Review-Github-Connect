@@ -290,6 +290,9 @@ export type FindingGateExtras = {
   /** More files at the reviewed head (path → content) the leg read beyond the snapshot — the local
    * loop's file_read reads. The snapshot's own copy wins for a path in both. */
   headFiles?: ReadonlyMap<string, string>;
+  /** Findings the local pipeline's refute stage verified (finding-gate verifiedKey). Set only by Ashlar
+   * for its own local leg, never from reviewer JSON. */
+  verifiedKeys?: ReadonlySet<string>;
 };
 
 const stringList = (v: unknown, max: number, cut: number) =>
@@ -315,6 +318,7 @@ export function findingGateContext(snapshot: SamplePr, submitted: Record<string,
     coverage: parseCoverage(submitted?.coverage).map((c) => ({ path: c.file, reason: c.reason, status: c.status })),
     priorFindings: extras?.priorFindings ?? snapshot.priorFindings,
     headSha: snapshot.headSha,
+    ...(extras?.verifiedKeys?.size ? { verifiedKeys: extras.verifiedKeys } : {}),
   };
 }
 

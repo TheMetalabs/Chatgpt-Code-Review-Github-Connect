@@ -329,6 +329,7 @@ export const SETTINGS_INT_FIELDS = {
   localReviewSingleTurnMaxTokens: { label: "local_review.single_turn_max_tokens", min: 1, max: MAX_INT, unit: "count" },
   localPipelineMaxFindings: { label: "local_review.pipeline_max_findings", min: 1, max: 8, unit: "count" },
   localPipelineVerifyVotes: { label: "local_review.pipeline_verify_votes", min: 1, max: 3, unit: "count" },
+  localPipelineLenses: { label: "local_review.pipeline_lenses", min: 1, max: 3, unit: "count" },
   localLeaseCapacity: { label: "local_llm.lease_capacity", min: 1, max: 8, unit: "count" },
   promptDiffMaxChars: { label: "prompt.diff_max_chars", min: 0, max: MAX_INT, unit: "chars" },
   promptContextMaxChars: { label: "prompt.context_max_chars", min: 0, max: MAX_INT, unit: "chars" },
@@ -385,6 +386,8 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   localReviewPipeline: bool("local_review.pipeline"),
   localPipelineMaxFindings: int("localPipelineMaxFindings"),
   localPipelineVerifyVotes: int("localPipelineVerifyVotes"),
+  localPipelineLenses: int("localPipelineLenses"),
+  localPipelineKeepUncertain: bool("local_review.pipeline_keep_uncertain"),
   localLeaseCapacity: int("localLeaseCapacity"),
   reviewOrder: (v) =>
     Array.isArray(v) && v.length === DEFAULT_REVIEW_ORDER.length && DEFAULT_REVIEW_ORDER.every((p) => v.includes(p))

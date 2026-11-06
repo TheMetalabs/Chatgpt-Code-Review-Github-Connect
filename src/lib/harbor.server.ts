@@ -24,7 +24,7 @@ import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode, type LocalReviewDeps } from "./local-review-loop.server";
-import { runLocalReviewPipeline, verifySingleTurn } from "./local-pipeline.server";
+import { runLocalReviewPipeline } from "./local-pipeline.server";
 import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
@@ -98,6 +98,8 @@ const localSamples = new Map<string, SamplePr>();
 // quotes against these too: a quote from a helper the loop read is real head code, not a fabrication.
 // Kept until the job is terminal (the merge gates the local leg after the leg itself has finished).
 const localHeadReads = new Map<string, Map<string, string>>();
+/** Per job: the local pipeline's verified finding keys (finding-gate verifiedKey), for its leg's gate. */
+const localVerifiedKeys = new Map<string, Set<string>>();
 // In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
 // the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
 // (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
@@ -283,6 +285,7 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
   }
   // No merge follows a terminal edge: an in-flight leg's later reads are not kept either.
   localHeadReads.delete(job.id);
+  localVerifiedKeys.delete(job.id);
   if (!stop) return;
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
@@ -1094,7 +1097,7 @@ async function generateLocalLeg(
   jobId: string,
   prompt: string,
   lease?: LocalModelLeaseHandle,
-): Promise<LocalLegResult & { pipelineSummary?: string }> {
+): Promise<LocalLegResult & { pipelineSummary?: string; verifiedKeys?: string[] }> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
@@ -1140,6 +1143,9 @@ async function generateLocalLeg(
   const pipelineOn = state.settings.localReviewPipeline !== false;
   const runLoop = (loopSample: SamplePr): Promise<LocalLegResult & { pipelineSummary?: string }> =>
     pipelineOn ? runLocalReviewPipeline(loopSample, state.settings, deps) : runLocalReviewLoop(loopSample, state.settings, deps);
+  // With the pipeline on, every local review with a snapshot runs it: a PR whose diff fits one turn is one
+  // whole-PR feature there, so the single-turn path below is only the pipeline-off (or no-snapshot) one.
+  if (pipelineOn && sample) return runLocalReviewPipeline(sample, state.settings, deps);
   if (mode === "multiturn" && sample) return runLoop(sample);
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
   // after a restart). Falling back to single-turn would send the whole large prompt in one completion
@@ -1156,20 +1162,7 @@ async function generateLocalLeg(
   // even after its correction) escalates once to the multi-turn loop under the same lease instead of
   // ending the head unreviewed (live WalkieBoard #524, 2026-11-05).
   const why = sample ? escalateSingleTurn(first, { changedPaths: sample.changedPaths.length, aborted: Boolean(signal?.aborted) }) : undefined;
-  if (!why || !sample) {
-    // Stages 3-4 of the pipeline for a single-turn reply: each finding is refuted or confirmed against
-    // the code, then the confirmed ones are ranked and capped. A verification that cannot run keeps the
-    // reply as it was (never a clean result made of a failure).
-    if (!first.ok || !sample || !pipelineOn) return first;
-    try {
-      const verified = await verifySingleTurn(first.raw, sample, state.settings, deps);
-      return { ...first, raw: verified.raw, ...(verified.summary ? { pipelineSummary: verified.summary } : {}) };
-    } catch (e) {
-      if (signal?.aborted) throw e;
-      console.warn(`[local] ${jobId} single-turn verification failed; the reply stands as it was: ${e instanceof Error ? e.message : String(e)}`);
-      return first;
-    }
-  }
+  if (!why || !sample) return first;
   console.info(`[local] ${jobId} single-turn ${why === "empty" ? "returned no review (empty findings without investigated_safe)" : "returned no review JSON"}; escalating to the multi-turn loop`);
   const loop = await runLoop(sample);
   // Every completed reply either tier set aside is evidence whatever the loop finds (it may name a
@@ -1287,6 +1280,10 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       // reach the accepted JSON is evidence, so that JSON is never the leg's complete verdict.
       const evidence = { unparsedText: local.unparsedText, residualReplies: local.residualReplies };
       const summary = local.pipelineSummary;
+      // The findings the pipeline's refute stage verified: trusted (Ashlar's own code, not model JSON),
+      // handed to this leg's gate only (legGateExtras).
+      if (local.verifiedKeys?.length) localVerifiedKeys.set(jobId, new Set(local.verifiedKeys));
+      else localVerifiedKeys.delete(jobId);
       transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : {
         ...collectLocalLeg(j, local.raw, local.originalText, evidence),
         ...(summary ? { localPipelineSummary: summary } : {}),
@@ -1490,8 +1487,14 @@ export async function submitHarborChat(
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(configuredCanonicalProvider && provider !== configuredCanonicalProvider && isChatProvider(provider));
   // The local leg's quotes also verify against the files its loop read at this head.
   const legGateExtras = (leg: ChatLeg): FindingGateExtras | undefined => {
-    const reads = leg.provider === "local" ? localHeadReads.get(job.id) : undefined;
-    return reads?.size ? { headFiles: reads } : undefined;
+    if (leg.provider !== "local") return undefined;
+    const reads = localHeadReads.get(job.id);
+    const verified = localVerifiedKeys.get(job.id);
+    const extras: FindingGateExtras = {
+      ...(reads?.size ? { headFiles: reads } : {}),
+      ...(verified?.size ? { verifiedKeys: verified } : {}),
+    };
+    return Object.keys(extras).length ? extras : undefined;
   };
   const preserveSchemaRejectedEvidence = (leg: ChatLeg) =>
     !job.localVerifyStartedAt && !job.localFallbackAt && isAuxiliaryChat(leg.provider);

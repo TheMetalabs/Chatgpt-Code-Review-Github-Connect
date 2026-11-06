@@ -478,3 +478,46 @@ test("recall: a confirmed finding's evidence gains the verifier's proof quote wh
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.match(JSON.parse(out.raw).findings[0].evidence, /Verified against the code: `return charge\(req\.body\.amount\);`/);
 });
+
+test("codex #181: a fuzzy quote never matches code with a different operator, identifier or case", () => {
+  const code = "--- a.ts (L1-L3)\n1| export function g(user, a) {\n2|   if (isAdmin(user)) return denyAccess();\n3|   return charge(a);";
+  assert.equal(quoteInCode("if (!isAdmin(user)) return denyAccess();", code), false, "an added operator is other code");
+  assert.equal(quoteInCode("return charge(b);  // the amount", code), false, "a one-letter identifier still counts");
+  assert.equal(quoteInCode("if (IsAdmin(user)) return denyAccess()", code), false, "identifier case counts");
+  assert.equal(quoteInCode("if isAdmin(user) return denyAccess()", code), true, "dropped brackets and semicolon are formatting");
+});
+
+test("codex #181: similar titles at two locations stay two candidates unless their evidence quotes the same code", () => {
+  const at = (line, title, quote) => ({ severity: "P2", file: "a.ts", line, title, evidence: `a.ts:${line} \`${quote}\`` });
+  const two = dedupeCandidates([
+    at(10, "Handle a missing billing address before reading city", "const c = order.billing.address.city;"),
+    at(20, "Handle a missing shipping address before reading city", "const s = order.shipping.address.city;"),
+  ]);
+  assert.equal(two.length, 2);
+  const one = dedupeCandidates([
+    at(10, "Handle a missing billing address before reading city", "const c = order.billing.address.city;"),
+    at(11, "Handle missing billing address before reading the city", "const c = order.billing.address.city;"),
+  ]);
+  assert.equal(one.length, 1, "the same quoted code on a neighbouring line is one defect");
+});
+
+test("codex #181: a whole-PR reply that marks a file unreviewed keeps it unreviewed (never a clean result)", async () => {
+  await wholePr(async () => {
+    const review = () => JSON.stringify({ merge_recommendation: "COMMENT", investigated_safe: ["src/mail/mailer.ts: checked"], findings: [], unreviewed_paths: ["src/orders/orders.service.ts"] });
+    const m = model({ review });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    const json = JSON.parse(out.raw);
+    assert.deepEqual(json.unreviewed_paths, ["src/orders/orders.service.ts"]);
+    assert.deepEqual(json.investigated_safe, [], "a partial review with no finding claims nothing clean");
+    assert.ok(json.coverage.some((c) => c.file === "src/orders/orders.service.ts" && c.status === "not_cleared"));
+  });
+});
+
+test("codex #181: a hedged style remark is not rescued to the verifier; it stays a note", async () => {
+  const style = F({ severity: "P2", title: "Variable naming might be misleading", failure_scenario: "Readers might misread it.", root_cause: "The name might be unclear.", recommended_fix: "Rename the variable." });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [style] }), verify: () => JSON.stringify({ verdict: "uncertain", reason: "cannot tell" }) });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 0);
+  assert.equal(m.count.verify ?? 0, 0);
+  assert.equal(out.verifiedKeys, undefined);
+});

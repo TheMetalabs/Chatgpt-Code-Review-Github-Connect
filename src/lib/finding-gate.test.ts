@@ -759,4 +759,15 @@ describe("verified keys (local pipeline refute stage)", () => {
     const retracted = { ...f, title: "create charges a negative amount", failureScenario: "No change needed: this path is safe and cannot fail." };
     assert.equal(gateFindings([retracted], { ...ctx, verifiedKeys: new Set([verifiedKey(retracted)]) }, opts).dropped.length, 1, "a self-retracted finding is still dropped");
   });
+
+  it("a verified note-category remark is still a note, not a finding (codex #181)", async () => {
+    const { gateFindings, verifiedKey } = await import("./finding-gate.ts");
+    const f = { id: "v2", status: "accepted" as const, severity: "P2" as const, file: "a.ts", line: 1, side: "RIGHT" as const,
+      title: "Variable naming might be misleading", failureScenario: "Readers might misread it.", rootCause: "The name might be unclear.",
+      evidence: "a.ts:1 `export const a = 1;`", recommendedFix: "Rename the variable.", recommendedTest: "None." };
+    const ctx = { headFiles: new Map([["a.ts", "export const a = 1;\n"]]), changedPaths: ["a.ts"], diff: "--- a.ts\n@@ -0,0 +1 @@\n+export const a = 1;", verifiedKeys: new Set([verifiedKey(f)]) };
+    const out = gateFindings([f], ctx, { mode: "rules" as const, p1ClosedPath: true, notes: true, dedupePrior: true });
+    assert.equal(out.kept.length, 0);
+    assert.equal(out.notes.length, 1);
+  });
 });

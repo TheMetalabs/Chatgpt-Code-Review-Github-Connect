@@ -39,7 +39,7 @@ import {
   type LoopTuning,
 } from "./local-review-loop.server.ts";
 import { applyFindingGate, gateLiveSubmission } from "./poster.ts";
-import { verifiedKey } from "./finding-gate.ts";
+import { unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, Finding, SamplePr, Severity } from "./types.ts";
 
@@ -575,43 +575,29 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
 }
 
 const norm = (s: string) => s.replace(/^\s*\d+\|\s?/gm, "").replace(/[`'"]/g, "").replace(/\s+/g, " ").trim();
-const tokens = (s: string) => norm(s).toLowerCase().match(/[a-z0-9_$]+|[^\sa-z0-9_$]/g) ?? [];
+/** A line's meaning-bearing tokens, in order: identifiers and literals with their case, and operator
+ * characters. Brackets, separators, string quotes and whitespace are formatting a model often drops. */
+const semantic = (s: string) => norm(s).match(/[A-Za-z0-9_$]+|[!=<>&|+\-*\/%?^~.]/g) ?? [];
 
 /**
  * Whether a quote is real text of `hay` (the evidence's code, or for a counter-quote also its docs):
  * one of its lines with 8+ visible chars — line-number gutters, quotes and whitespace ignored — appears
- * in it verbatim, or matches one of its lines token for token at 80% or more (a model rarely copies a
- * long line perfectly: a dropped semicolon or a reordered argument is still that line, a different
- * identifier is not).
+ * in it verbatim, or its meaning-bearing tokens (`semantic`) appear in one of hay's lines as one
+ * contiguous run. A dropped semicolon, bracket or quote is still that line; a different identifier, a
+ * changed case, or an added or removed operator (`!isAdmin` for `isAdmin`, `charge(b)` for `charge(a)`)
+ * is not.
  */
 export function quoteInCode(quote: string, hay: string): boolean {
   const hayNorm = norm(hay);
   const lines = String(quote ?? "").split("\n").map(norm).filter((l) => l.replace(/[^\w]/g, "").length >= 8);
   if (!lines.length) return false;
   if (lines.some((l) => hayNorm.includes(l))) return true;
-  const hayLines = hay.split("\n").map(tokens).filter((t) => t.length >= 3);
-  const ids = (t: string[]) => t.filter((x) => /^[a-z0-9_$]{2,}$/.test(x));
+  const hayLines = hay.split("\n").map((h) => semantic(h).join(" "));
   return lines.some((l) => {
-    const q = tokens(l);
-    const qIds = ids(q);
-    if (q.length < 3 || qIds.length < 2) return false;
-    return hayLines.some((h) => {
-      // Every identifier of the quote must be on the line (a different identifier is a different line);
-      // punctuation may differ, and most of the quote must match.
-      const have = new Map<string, number>();
-      for (const t of h) have.set(t, (have.get(t) ?? 0) + 1);
-      let hit = 0;
-      let idsHit = 0;
-      for (const t of q) {
-        const n = have.get(t) ?? 0;
-        if (n > 0) {
-          hit += 1;
-          if (/^[a-z0-9_$]{2,}$/.test(t)) idsHit += 1;
-          have.set(t, n - 1);
-        }
-      }
-      return idsHit === qIds.length && hit / q.length >= 0.8 && hit / Math.max(q.length, h.length) >= 0.6;
-    });
+    const q = semantic(l);
+    if (q.length < 3 || q.filter((x) => /\w/.test(x)).length < 2) return false;
+    const run = ` ${q.join(" ")} `;
+    return hayLines.some((h) => ` ${h} `.includes(run));
   });
 }
 
@@ -869,11 +855,11 @@ const SOFT_DROPS = new Set(["speculative", "evidence_unverified", "evidence_unav
  * Every row is inspected: rows go through in chunks of the gate's row cap. `truncated` carries the
  * reply's own cut-off mark.
  */
-function gateCandidates(raw: string, scope: SamplePr, settings: BotSettings, group: number, next: () => string): { candidates: Candidate[]; soft: number; safe: string[]; assumptions: string[]; coverage: unknown[]; found: number; truncated: boolean } {
+function gateCandidates(raw: string, scope: SamplePr, settings: BotSettings, group: number, next: () => string): { candidates: Candidate[]; soft: number; safe: string[]; assumptions: string[]; coverage: unknown[]; unreviewed: string[]; found: number; truncated: boolean } {
   const parsed = parseChatSubmission(raw);
   const rows = Array.isArray(parsed?.findings) ? (parsed?.findings as unknown[]) : [];
   const truncated = parsed?.truncated === true;
-  const out = { candidates: [] as Candidate[], soft: 0, safe: [] as string[], assumptions: [] as string[], coverage: [] as unknown[], found: rows.length, truncated };
+  const out = { candidates: [] as Candidate[], soft: 0, safe: [] as string[], assumptions: [] as string[], coverage: [] as unknown[], unreviewed: [] as string[], found: rows.length, truncated };
   const chunks = rows.length ? Array.from({ length: Math.ceil(rows.length / GATE_ROWS) }, (_, i) => rows.slice(i * GATE_ROWS, (i + 1) * GATE_ROWS)) : [[]];
   chunks.forEach((chunk, i) => {
     const submitted = { ...parsed, findings: chunk };
@@ -884,12 +870,16 @@ function gateCandidates(raw: string, scope: SamplePr, settings: BotSettings, gro
       out.safe.push(...shaped.investigatedSafe);
       out.assumptions.push(...shaped.assumptions);
       out.coverage.push(...(shaped.coverage ?? []));
+      // The reply's own "I did not review these" stays: an explicitly partial review is never clean.
+      out.unreviewed.push(...(shaped.unreviewed ?? []).filter((p) => scope.changedPaths.includes(p)));
     }
     // …then the precision rules, read decision by decision.
     const judged = applyFindingGate(shaped.findings, scope, settings, submitted);
     for (const d of judged.decisions) {
       if (d.action === "keep" || d.action === "demote") out.candidates.push({ ...d.finding, cid: next(), group });
-      else if (d.action === "drop" && SOFT_DROPS.has(d.reasons[0] ?? "")) {
+      // A soft drop that is a note-category remark (style / docs / i18n / log / test advice) is a note,
+      // not a defect for the verifier: the gate dropped it before it reached note routing.
+      else if (d.action === "drop" && SOFT_DROPS.has(d.reasons[0] ?? "") && !unprovenNoteCategory(d.finding)) {
         out.soft += 1;
         out.candidates.push({ ...d.finding, cid: next(), group });
       }
@@ -906,13 +896,25 @@ function titleJaccard(a: string, b: string): number {
   return inter / Math.max(1, new Set([...x, ...y]).size);
 }
 
-/** One candidate per defect across lenses and features: on the same file, a similar title on the same
- * line (word Jaccard ≥ 0.4) or a near-identical title anywhere (≥ 0.6) is the same candidate; the most
- * severe is kept. */
-export function dedupeCandidates<T extends Pick<Finding, "file" | "line" | "title" | "severity">>(rows: T[]): T[] {
+/** The code a candidate's evidence quotes (its backtick spans, whitespace-normalized), its anchor. */
+function anchorQuotes(evidence: unknown): Set<string> {
+  const spans = String(evidence ?? "").match(/`([^`\n]{8,})`/g) ?? [];
+  return new Set(spans.map((q) => q.slice(1, -1).replace(/\s+/g, " ").trim()));
+}
+
+/** One candidate per defect across lenses and features, on the same file: a similar title on the same
+ * line (word Jaccard ≥ 0.4), or a near-identical title (≥ 0.6) whose evidence quotes the same code (a
+ * lens may anchor one defect on a neighbouring line). A similar title alone never merges: "missing
+ * billing address" and "missing shipping address" at two dereferences are two defects. The most severe
+ * is kept. */
+export function dedupeCandidates<T extends Pick<Finding, "file" | "line" | "title" | "severity"> & { evidence?: string }>(rows: T[]): T[] {
   const kept: T[] = [];
+  const sameAnchor = (a: T, b: T) => {
+    const x = anchorQuotes(a.evidence);
+    return [...anchorQuotes(b.evidence)].some((q) => x.has(q));
+  };
   for (const c of [...rows].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])) {
-    if (kept.some((k) => k.file === c.file && ((k.line === c.line && titleJaccard(k.title, c.title) >= 0.4) || titleJaccard(k.title, c.title) >= 0.6))) continue;
+    if (kept.some((k) => k.file === c.file && ((k.line === c.line && titleJaccard(k.title, c.title) >= 0.4) || (titleJaccard(k.title, c.title) >= 0.6 && sameAnchor(k, c))))) continue;
     kept.push(c);
   }
   return kept;
@@ -976,6 +978,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     const assumptions: string[] = [];
     const coverage: unknown[] = [];
     const failed: string[] = [];
+    const reportedUnreviewed: string[] = [];
     let truncated = false;
     for (let g = 0; g < groups.length; g += 1) {
       const files = groups[g];
@@ -996,6 +999,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
         stats.softGated += gated.soft;
         truncated ||= gated.truncated;
         candidates.push(...gated.candidates);
+        reportedUnreviewed.push(...gated.unreviewed);
         if (!anyOk) {
           safe.push(...gated.safe);
           coverage.push(...gated.coverage);
@@ -1016,8 +1020,11 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     stats.gated = unique.length;
     const { findings, assumptions: verifyNotes, verifiedKeys } = await refuteAndSelect(ctx, sample, unique, map, stats);
     stats.turns = ctx.turns;
-    const unreviewed = [...new Set([...failed, ...unreviewablePaths(sample)])];
-    for (const file of unreviewed) coverage.push({ file, status: "not_cleared", reason: failed.includes(file) ? "feature review failed" : "no usable diff" });
+    const unreviewed = [...new Set([...failed, ...reportedUnreviewed, ...unreviewablePaths(sample)])];
+    for (const file of unreviewed) {
+      const reason = failed.includes(file) ? "feature review failed" : reportedUnreviewed.includes(file) ? "the reviewer reported it unreviewed" : "no usable diff";
+      coverage.push({ file, status: "not_cleared", reason });
+    }
     const raw = finalJson({ findings, safe: unreviewed.length && !findings.length ? [] : safe, assumptions: [...assumptions, ...verifyNotes], coverage, unreviewed, refuted: stats.refuted, truncated });
     const summary = pipelineSummary(stats);
     deps.log?.(summary);

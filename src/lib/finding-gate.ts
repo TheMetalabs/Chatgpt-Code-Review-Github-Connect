@@ -795,6 +795,13 @@ function noteCategory(f: Finding, provenOnChanged: boolean): GateNoteCategory | 
   return undefined;
 }
 
+/** The note category of a remark the gate has not proven (no verified quote on a changed line), or
+ * undefined for a defect claim: the local pipeline routes a rescued soft drop with one to notes, not to
+ * its verifier. */
+export function unprovenNoteCategory(f: Finding): GateNoteCategory | undefined {
+  return noteCategory(f, false);
+}
+
 // ── D dedupe against the bot's earlier findings ───────────────────────────────────────────────────
 
 /** The prior finding this one repeats, in the same file: a near-identical title (token Jaccard >= 0.8);
@@ -884,7 +891,13 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   const ownReply = ownReplyContradiction(f, ctx, ev.onChanged);
   if (ownReply) return drop("contradicted_by_own_reply", ownReply);
   // Verified by the local pipeline's refute stage against the code: kept as the verifier judged it.
-  if (ctx.verifiedKeys?.has(verifiedKey(f))) return { finding: f, action: "keep", reasons: ["verified_by_refute"], severityBefore: before };
+  // Its hedges and evidence are not re-judged, but a note-category remark (style / docs / i18n / log /
+  // test advice) is still a note: verifying that a remark quotes real code does not make it a defect.
+  if (ctx.verifiedKeys?.has(verifiedKey(f))) {
+    const category = opts.notes ? noteCategory(f, ev.onChanged) : undefined;
+    if (category) return { finding: f, action: "note", reasons: [`note:${category}`, "verified_by_refute"], severityBefore: before };
+    return { finding: f, action: "keep", reasons: ["verified_by_refute"], severityBefore: before };
+  }
 
   const claim = claimText(f);
   if (titleAdmitsUnverified(f.title)) return drop("speculative", "title: unverified");

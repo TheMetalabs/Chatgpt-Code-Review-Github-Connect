@@ -121,14 +121,16 @@ for (const c of cases) {
   const expect = (c.expect ?? []).filter((e) => !e.pr || Number(String(e.pr).replace(/.*#/, "")) === Number(sample.pr));
   const results = [];
   for (const m of modes) results.push(await runMode(sample, m, expect));
-  report.cases.push({ pr: `${sample.owner}/${sample.repo}#${sample.pr}`, head: sample.headSha, changedPaths: sample.changedPaths.length, results });
+  report.cases.push({ pr: `${sample.owner}/${sample.repo}#${sample.pr}`, head: sample.headSha, changedPaths: sample.changedPaths.length, expected: expect.length, results });
 }
 for (const m of modes) {
   const rows = report.cases.map((c) => c.results.find((r) => r.mode === m)).filter((r) => r?.ok);
   const sum = (k) => rows.reduce((n, r) => n + (r.score[k] ?? 0), 0);
   report.totals[m] = {
     reviews: rows.length, failed: report.cases.length - rows.length, posted: sum("posted"), valid: sum("valid"), false_positive: sum("false_positive"),
-    expected: sum("expected"), caught: sum("caught"), seconds: rows.reduce((n, r) => n + r.seconds, 0),
+    // Recall's denominator is every case's expected defects: a case whose review failed caught none of its own.
+    expected: report.cases.reduce((n, c) => n + c.expected, 0), caught: sum("caught"),
+    seconds: report.cases.reduce((n, c) => n + (c.results.find((r) => r.mode === m)?.seconds ?? 0), 0),
   };
 }
 const text = JSON.stringify(report, null, 2);

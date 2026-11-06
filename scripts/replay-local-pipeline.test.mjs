@@ -65,3 +65,37 @@ test("replay: runs the pipeline on a snapshot with the configured local model an
   assert.match(r.summary, /1 confirmed, 1 refuted, 1 posted/);
   assert.deepEqual(report.totals.pipeline, { reviews: 1, failed: 0, posted: 1, valid: 1, false_positive: 0, expected: 2, caught: 1, seconds: r.seconds });
 });
+
+test("replay: a case whose review fails still counts its expected defects in the recall denominator (codex #181)", async (t) => {
+  // The model answers nothing usable, so the pipeline fails on the case.
+  const server = createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "no json here" } }] }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "replay-"));
+  const snap = join(dir, "snap.json");
+  writeFileSync(snap, JSON.stringify({
+    key: "k", owner: "o", repo: "r", pr: 8, title: "t", body: "", sender: "s", headSha: "h", baseSha: "b", isFork: false, isDraft: false, labels: [],
+    changedPaths: ["a.ts"], files: [{ path: "a.ts", content: "export const answer = 42;\n", language: "ts" }], diff: "--- a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;", diffDroppedPaths: [],
+  }));
+  const expect = join(dir, "expect.json");
+  writeFileSync(expect, JSON.stringify([{ file: "a.ts", keywords: ["off by one"] }]));
+  const { port } = server.address();
+  const out = await new Promise((resolve, reject) => {
+    execFile(process.execPath, ["--experimental-strip-types", "--import", join(root, "scripts/ts-resolve-hook.mjs"), join(root, "scripts/replay-local-pipeline.mjs"), "--snapshot", snap, "--expect", expect, "--mode", "pipeline"], {
+      cwd: dir,
+      env: { ...process.env, ASHLAR_LOCAL_LLM_BASE_URL: `http://127.0.0.1:${port}/v1`, ASHLAR_LOCAL_LLM_MODEL: "fixture", ASHLAR_LOCAL_LLM_STREAM: "false", ASHLAR_REVIEW_LOCAL: "true" },
+      timeout: 60_000,
+    }, (err, stdout, stderr) => (err ? reject(new Error(`${err.message}\n${stderr}`)) : resolve(stdout)));
+  });
+  const report = JSON.parse(out);
+  assert.equal(report.cases[0].results[0].ok, false);
+  assert.equal(report.totals.pipeline.failed, 1);
+  assert.equal(report.totals.pipeline.expected, 1);
+  assert.equal(report.totals.pipeline.caught, 0);
+});

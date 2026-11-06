@@ -233,6 +233,9 @@ export interface Job {
   /** Changed paths left out of this review because .gitattributes marks them linguist-vendored /
    * linguist-generated (SamplePr.vendoredPaths): the count and the first few, for the ops comment. */
   vendoredSkipped?: { count: number; paths: string[] };
+  /** The staged local review's counts (local-pipeline.server.ts pipelineSummary), for the ops comment:
+   * feature groups, candidates, how many the refute stage confirmed or refuted, how many posted. */
+  localPipelineSummary?: string;
   /** Review-coverage: findings dropped by the precision gate. */
   droppedCount?: number;
   /** Findings the finding gate routed to notes (finding-gate.ts C1): rendered under "Notes (not
@@ -348,6 +351,13 @@ export interface BotSettings {
   localReviewRole: LocalReviewRole;
   /** auto-mode cutoff: a single-turn prompt estimated at or below this many tokens stays single-turn. */
   localReviewSingleTurnMaxTokens: number;
+  /** The staged local review (local-pipeline.server.ts): a PR map, feature-unit candidate turns,
+   * one refute turn per candidate and a final selection. Off: the grouped tool loop of before. */
+  localReviewPipeline: boolean;
+  /** At most this many findings a local pipeline review posts (the final selection's cap). */
+  localPipelineMaxFindings: number;
+  /** Refute turns per candidate: a candidate is posted only when every vote confirms it. */
+  localPipelineVerifyVotes: number;
   /** Concurrent holders of the process-wide local-model lease (match the model server, e.g. oMLX concurrent=3). */
   localLeaseCapacity: number;
   reviewOrder: ReviewProvider[];
@@ -525,6 +535,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localReviewMode: "auto",
   localReviewRole: "race",
   localReviewSingleTurnMaxTokens: 30_000,
+  localReviewPipeline: true,
+  localPipelineMaxFindings: 3,
+  localPipelineVerifyVotes: 1,
   localLeaseCapacity: 1,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,

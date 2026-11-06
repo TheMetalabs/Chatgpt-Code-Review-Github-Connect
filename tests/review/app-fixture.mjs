@@ -36,7 +36,7 @@ export async function appFixture(options={}, githubOptions={}) {
  // raw evidence) with placeholder findings whose evidence quotes no fixture code, which the precision
  // gate (finding-gate.ts, default 'rules') would rightly drop. A test of the gate itself passes
  // {findingGate:'rules'} (finding-gate-wiring.test.mjs).
- const settings={...types.DEFAULT_SETTINGS,findingGate:'off',reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ const settings={...types.DEFAULT_SETTINGS,findingGate:'off',localReviewPipeline:false,reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
  // The diff is in the shape fetchPullSnapshot builds: compact `--- path` + patch blocks, no git headers.
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
   changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],

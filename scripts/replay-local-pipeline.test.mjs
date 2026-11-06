@@ -1,0 +1,60 @@
+// scripts/replay-local-pipeline.mjs end to end against a fake local model server and a saved snapshot:
+// it runs the pipeline with the configured model and scores the posted findings against judged labels.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const finding = (title, line) => ({ severity: "P1", file: "a.ts", line, side: "RIGHT", title, failure_scenario: "x fails", root_cause: "rc", evidence: `a.ts:${line} \`export const answer = 42;\``, recommended_fix: "f", recommended_test: "t" });
+
+test("replay: runs the pipeline on a snapshot with the configured local model and scores the posted findings", async (t) => {
+  const server = createServer((req, res) => {
+    let text = "";
+    req.on("data", (c) => (text += c));
+    req.on("end", () => {
+      const body = JSON.parse(text || "{}");
+      const sys = body.messages?.[0]?.content ?? "";
+      const content = sys.startsWith("You summarize")
+        ? JSON.stringify({ files: [{ file: "a.ts", summary: "changes answer", guards: [], effects: [] }] })
+        : sys.startsWith("You are a skeptical")
+          ? (/judged false positive/.test(body.messages[1].content.split("<<<END>>>")[0])
+            ? JSON.stringify({ verdict: "refuted", reason: "documented" })
+            : JSON.stringify({ verdict: "confirmed", reason: "real", proof_quote: "export const answer = 42;", severity: "P1" }))
+          : JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: ["a.ts: read"], findings: [finding("answer judged valid off by one", 1), finding("answer judged false positive rename", 1)] });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content } }] }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "replay-"));
+  const snap = join(dir, "snap.json");
+  writeFileSync(snap, JSON.stringify({
+    key: "k", owner: "o", repo: "r", pr: 7, title: "t", body: "", sender: "s", headSha: "h", baseSha: "b", isFork: false, isDraft: false, labels: [],
+    changedPaths: ["a.ts"], files: [{ path: "a.ts", content: "export const answer = 42;\n", language: "ts" }], diff: "--- a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;", diffDroppedPaths: [],
+  }));
+  const labels = join(dir, "labels.json");
+  writeFileSync(labels, JSON.stringify([
+    { pr: 7, file: "a.ts", title: "answer judged valid off by one", ourLabel: "valid" },
+    { pr: 7, file: "a.ts", title: "answer judged false positive rename", ourLabel: "false_positive" },
+  ]));
+  const { port } = server.address();
+  const out = await new Promise((resolve, reject) => {
+    execFile(process.execPath, ["--experimental-strip-types", "--import", join(root, "scripts/ts-resolve-hook.mjs"), join(root, "scripts/replay-local-pipeline.mjs"), "--snapshot", snap, "--labels", labels, "--mode", "pipeline"], {
+      cwd: dir,
+      env: { ...process.env, ASHLAR_LOCAL_LLM_BASE_URL: `http://127.0.0.1:${port}/v1`, ASHLAR_LOCAL_LLM_MODEL: "fixture", ASHLAR_LOCAL_LLM_STREAM: "false", ASHLAR_REVIEW_LOCAL: "true" },
+      timeout: 60_000,
+    }, (err, stdout, stderr) => (err ? reject(new Error(`${err.message}\n${stderr}`)) : resolve(stdout)));
+  });
+  const report = JSON.parse(out);
+  assert.equal(report.pr, "o/r#7");
+  const [r] = report.results;
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(r.score, { posted: 1, valid: 1, false_positive: 0, unclear: 0, unjudged: 0 });
+  assert.match(r.summary, /1 confirmed, 1 refuted, 1 posted/);
+});

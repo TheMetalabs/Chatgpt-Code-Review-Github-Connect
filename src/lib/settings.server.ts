@@ -100,6 +100,12 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (localRole) o.localReviewRole = localRole;
   const localSingleTurnMax = envNum("ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS");
   if (localSingleTurnMax !== undefined) o.localReviewSingleTurnMaxTokens = localSingleTurnMax;
+  const localPipeline = envFlag("ASHLAR_LOCAL_REVIEW_PIPELINE");
+  if (localPipeline !== undefined) o.localReviewPipeline = localPipeline;
+  const pipelineMax = envNum("ASHLAR_LOCAL_PIPELINE_MAX_FINDINGS");
+  if (pipelineMax !== undefined) o.localPipelineMaxFindings = pipelineMax;
+  const pipelineVotes = envNum("ASHLAR_LOCAL_PIPELINE_VERIFY_VOTES");
+  if (pipelineVotes !== undefined) o.localPipelineVerifyVotes = pipelineVotes;
   const localLease = envNum("ASHLAR_LOCAL_LEASE_CAPACITY");
   if (localLease !== undefined) o.localLeaseCapacity = localLease;
   const order = envStr("ASHLAR_REVIEW_ORDER");
@@ -188,6 +194,9 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_REVIEW_MODE: s.localReviewMode,
     ASHLAR_LOCAL_REVIEW_ROLE: s.localReviewRole,
     ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: String(s.localReviewSingleTurnMaxTokens),
+    ASHLAR_LOCAL_REVIEW_PIPELINE: String(s.localReviewPipeline),
+    ASHLAR_LOCAL_PIPELINE_MAX_FINDINGS: String(s.localPipelineMaxFindings),
+    ASHLAR_LOCAL_PIPELINE_VERIFY_VOTES: String(s.localPipelineVerifyVotes),
     ASHLAR_LOCAL_LEASE_CAPACITY: String(s.localLeaseCapacity),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
@@ -295,6 +304,9 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
       ? (p.localReviewRole as LocalReviewRole)
       : DEFAULT_SETTINGS.localReviewRole,
     localReviewSingleTurnMaxTokens: intField(p, "localReviewSingleTurnMaxTokens"),
+    localReviewPipeline: bool(p.localReviewPipeline, DEFAULT_SETTINGS.localReviewPipeline),
+    localPipelineMaxFindings: intField(p, "localPipelineMaxFindings"),
+    localPipelineVerifyVotes: intField(p, "localPipelineVerifyVotes"),
     localLeaseCapacity: intField(p, "localLeaseCapacity"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),

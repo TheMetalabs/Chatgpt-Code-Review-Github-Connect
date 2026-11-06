@@ -90,6 +90,8 @@ const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
 /** The max_inline_comments input, derived from its shared domain (settings-rules). */
 const MAX_INLINE_ATTRS = formAttrs(SETTINGS_INT_FIELDS.maxInlineComments);
 const LEASE_CAPACITY_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localLeaseCapacity);
+const PIPELINE_MAX_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localPipelineMaxFindings);
+const PIPELINE_VOTES_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localPipelineVerifyVotes);
 
 /** A numeric draft value as an input value: an emptied input (NaN) stays empty, not "NaN". */
 function formValue(v: number): number | "" {
@@ -145,6 +147,9 @@ export function Settings() {
     saved.reviewGrok,
     saved.reviewLocal,
     saved.localReviewRole,
+    saved.localReviewPipeline,
+    saved.localPipelineMaxFindings,
+    saved.localPipelineVerifyVotes,
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
@@ -285,6 +290,42 @@ export function Settings() {
             Off (default): local races the chat reviewers. If chat fails, local still runs as the fallback.
           </p>
         </Field>
+        <Field label="local_review.pipeline">
+          <Toggle
+            label="staged local review (PR map → feature groups → refute → select)"
+            checked={draft.localReviewPipeline}
+            onChange={(v) => patch({ localReviewPipeline: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Each turn starts fresh within the local window: a short summary of every changed file, one review turn per
+            feature (files linked by imports), one refute turn per candidate with the code it cites, then a final pick.
+            Off: the grouped tool loop.
+          </p>
+        </Field>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="local_review.pipeline_max_findings">
+            <input
+              type="number"
+              min={PIPELINE_MAX_ATTRS.min}
+              max={PIPELINE_MAX_ATTRS.max}
+              step={PIPELINE_MAX_ATTRS.step}
+              value={formValue(draft.localPipelineMaxFindings)}
+              onChange={(e) => patch({ localPipelineMaxFindings: fromForm(PIPELINE_MAX_ATTRS.unit, e.target.valueAsNumber) })}
+              className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+            />
+          </Field>
+          <Field label="local_review.pipeline_verify_votes">
+            <input
+              type="number"
+              min={PIPELINE_VOTES_ATTRS.min}
+              max={PIPELINE_VOTES_ATTRS.max}
+              step={PIPELINE_VOTES_ATTRS.step}
+              value={formValue(draft.localPipelineVerifyVotes)}
+              onChange={(e) => patch({ localPipelineVerifyVotes: fromForm(PIPELINE_VOTES_ATTRS.unit, e.target.valueAsNumber) })}
+              className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+            />
+          </Field>
+        </div>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="chatgpt_reasoning">
             <select
@@ -541,6 +582,9 @@ review:
   grok: ${draft.reviewGrok}
   local: ${draft.reviewLocal}
   local_role: ${draft.localReviewRole}
+  local_pipeline: ${draft.localReviewPipeline}
+  local_pipeline_max_findings: ${draft.localPipelineMaxFindings}
+  local_pipeline_verify_votes: ${draft.localPipelineVerifyVotes}
   chatgpt_reasoning: ${draft.chatgptReasoning}
   grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]

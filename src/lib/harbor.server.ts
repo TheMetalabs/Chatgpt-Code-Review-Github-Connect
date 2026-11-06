@@ -23,7 +23,8 @@ import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
-import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
+import { runLocalReviewLoop, chooseLocalReviewMode, type LocalReviewDeps } from "./local-review-loop.server";
+import { runLocalReviewPipeline, verifySingleTurn } from "./local-pipeline.server";
 import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
@@ -1093,7 +1094,7 @@ async function generateLocalLeg(
   jobId: string,
   prompt: string,
   lease?: LocalModelLeaseHandle,
-): Promise<LocalLegResult> {
+): Promise<LocalLegResult & { pipelineSummary?: string }> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
@@ -1105,7 +1106,7 @@ async function generateLocalLeg(
   const ownPrompt = local && local.chatPrompt.trim() === prompt.trim() ? local : undefined;
   const fitted = ownPrompt ? ownPrompt.build(singleMax, false) : bridgePromptText(prompt);
   const mode = chooseLocalReviewMode(configured, fitted.length, singleMax);
-  const runLoop = (loopSample: SamplePr) => runLocalReviewLoop(loopSample, state.settings, {
+  const deps: LocalReviewDeps = {
       signal,
       log: (line) => console.info(`[local] ${jobId} ${line.replace(/\s+/g, " ").slice(0, 300)}`),
       // The multi-turn loop's edge over the one-shot chat legs: it can pull ANY file at the PR head
@@ -1133,7 +1134,12 @@ async function generateLocalLeg(
           finally { localLiveness.get(jobId)?.reset(); }
         },
       } : {}),
-    });
+    };
+  // Settings local_review.pipeline: the staged review (PR map, feature groups, refute, select;
+  // local-pipeline.server.ts) instead of the grouped tool loop.
+  const pipelineOn = state.settings.localReviewPipeline !== false;
+  const runLoop = (loopSample: SamplePr): Promise<LocalLegResult & { pipelineSummary?: string }> =>
+    pipelineOn ? runLocalReviewPipeline(loopSample, state.settings, deps) : runLocalReviewLoop(loopSample, state.settings, deps);
   if (mode === "multiturn" && sample) return runLoop(sample);
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
   // after a restart). Falling back to single-turn would send the whole large prompt in one completion
@@ -1150,7 +1156,20 @@ async function generateLocalLeg(
   // even after its correction) escalates once to the multi-turn loop under the same lease instead of
   // ending the head unreviewed (live WalkieBoard #524, 2026-11-05).
   const why = sample ? escalateSingleTurn(first, { changedPaths: sample.changedPaths.length, aborted: Boolean(signal?.aborted) }) : undefined;
-  if (!why || !sample) return first;
+  if (!why || !sample) {
+    // Stages 3-4 of the pipeline for a single-turn reply: each finding is refuted or confirmed against
+    // the code, then the confirmed ones are ranked and capped. A verification that cannot run keeps the
+    // reply as it was (never a clean result made of a failure).
+    if (!first.ok || !sample || !pipelineOn) return first;
+    try {
+      const verified = await verifySingleTurn(first.raw, sample, state.settings, deps);
+      return { ...first, raw: verified.raw, ...(verified.summary ? { pipelineSummary: verified.summary } : {}) };
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      console.warn(`[local] ${jobId} single-turn verification failed; the reply stands as it was: ${e instanceof Error ? e.message : String(e)}`);
+      return first;
+    }
+  }
   console.info(`[local] ${jobId} single-turn ${why === "empty" ? "returned no review (empty findings without investigated_safe)" : "returned no review JSON"}; escalating to the multi-turn loop`);
   const loop = await runLoop(sample);
   // Every completed reply either tier set aside is evidence whatever the loop finds (it may name a
@@ -1267,7 +1286,11 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       // Every leg's gate reads unparsedText / residualReplies (race or held alike): a reply set aside to
       // reach the accepted JSON is evidence, so that JSON is never the leg's complete verdict.
       const evidence = { unparsedText: local.unparsedText, residualReplies: local.residualReplies };
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, evidence)));
+      const summary = local.pipelineSummary;
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : {
+        ...collectLocalLeg(j, local.raw, local.originalText, evidence),
+        ...(summary ? { localPipelineSummary: summary } : {}),
+      }));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

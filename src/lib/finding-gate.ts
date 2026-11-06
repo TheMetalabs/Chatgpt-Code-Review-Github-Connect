@@ -70,6 +70,15 @@ export interface GateContext {
   /** The bot's earlier findings on this PR (other heads or earlier reviews). */
   priorFindings?: PriorFinding[];
   headSha?: string;
+  /** Findings the local pipeline's refute stage verified against the code (verifiedKey). Trusted input
+   * from Ashlar's own pipeline, never from a reviewer's JSON: the hedge, evidence and P1 closed-path
+   * rules do not run again on them (the verifier already judged that), the hard drops still do. */
+  verifiedKeys?: ReadonlySet<string>;
+}
+
+/** The key a verified finding is known by: file, line and its normalized title. */
+export function verifiedKey(f: { file: string; line: number; title: string }): string {
+  return `${f.file}|${f.line}|${String(f.title ?? "").slice(0, 160).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()}`;
 }
 
 export interface GateOptions {
@@ -874,6 +883,8 @@ function decide(f: Finding, ctx: GateContext, opts: GateOptions, idx: GateIndex)
   if (contradicted) return drop("contradicted_by_diff", `${contradicted} is changed in this PR`);
   const ownReply = ownReplyContradiction(f, ctx, ev.onChanged);
   if (ownReply) return drop("contradicted_by_own_reply", ownReply);
+  // Verified by the local pipeline's refute stage against the code: kept as the verifier judged it.
+  if (ctx.verifiedKeys?.has(verifiedKey(f))) return { finding: f, action: "keep", reasons: ["verified_by_refute"], severityBefore: before };
 
   const claim = claimText(f);
   if (titleAdmitsUnverified(f.title)) return drop("speculative", "title: unverified");

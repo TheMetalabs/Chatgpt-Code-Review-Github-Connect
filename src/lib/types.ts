@@ -358,6 +358,12 @@ export interface BotSettings {
   localPipelineMaxFindings: number;
   /** Refute turns per candidate: a candidate is posted only when every vote confirms it. */
   localPipelineVerifyVotes: number;
+  /** Candidate passes per feature, each with its own focus (failure paths, data invariants, contracts);
+   * 1 = one combined pass. */
+  localPipelineLenses: number;
+  /** A candidate the verifier can neither confirm nor refute (with a quote) is posted at P2 when its own
+   * evidence quotes real code. Off: such a candidate is dropped. */
+  localPipelineKeepUncertain: boolean;
   /** Concurrent holders of the process-wide local-model lease (match the model server, e.g. oMLX concurrent=3). */
   localLeaseCapacity: number;
   reviewOrder: ReviewProvider[];
@@ -536,8 +542,10 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localReviewRole: "race",
   localReviewSingleTurnMaxTokens: 30_000,
   localReviewPipeline: true,
-  localPipelineMaxFindings: 3,
+  localPipelineMaxFindings: 5,
   localPipelineVerifyVotes: 1,
+  localPipelineLenses: 3,
+  localPipelineKeepUncertain: true,
   localLeaseCapacity: 1,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,

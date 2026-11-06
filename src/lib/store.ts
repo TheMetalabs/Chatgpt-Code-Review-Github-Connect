@@ -262,6 +262,8 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       localReviewPipeline: next.localReviewPipeline,
       localPipelineMaxFindings: next.localPipelineMaxFindings,
       localPipelineVerifyVotes: next.localPipelineVerifyVotes,
+      localPipelineLenses: next.localPipelineLenses,
+      localPipelineKeepUncertain: next.localPipelineKeepUncertain,
       localLlmBaseUrl: next.localLlmBaseUrl,
       localLlmModel: next.localLlmModel,
       localLlmModelPriority: next.localLlmModelPriority,

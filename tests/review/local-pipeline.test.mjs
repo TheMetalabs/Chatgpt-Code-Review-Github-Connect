@@ -11,13 +11,19 @@ import {
   renderPrMap,
   deterministicMap,
   runLocalReviewPipeline,
-  verifySingleTurn,
+  dedupeCandidates,
+  HUNT_INSTRUCTIONS,
+  LENSES,
+  lensesFor,
 } from "../../src/lib/local-pipeline.server.ts";
+import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
+import { verifiedKey } from "../../src/lib/finding-gate.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
 import { gateLiveSubmission } from "../../src/lib/poster.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
 
-const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k", findingGate: "rules" };
+// One lens pass per feature unless a test is about lenses (it sets localPipelineLenses itself).
+const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k", findingGate: "rules", localPipelineLenses: 1 };
 
 // A PR with two features: orders (controller → service, + its spec) and an unrelated mailer.
 const FILES = {
@@ -39,6 +45,17 @@ function sample(files = FILES, extra = {}) {
     ...extra,
   };
 }
+// The group budget sits between the orders feature and the whole PR, so the PR is reviewed as two
+// features (orders, mailer) with a PR map; tests of the whole-PR path drop it (wholePr()).
+const sizeOf = (paths) => paths.reduce((n, p) => n + `--- ${p}\n${patchOf(FILES[p])}`.length + 200, 0);
+const ORDERS = Object.keys(FILES).filter((p) => p.startsWith("src/orders/"));
+process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = String(sizeOf(ORDERS) + 20);
+assert.ok(sizeOf(Object.keys(FILES)) > sizeOf(ORDERS) + 20);
+async function wholePr(fn) {
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  delete process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  try { return await fn(); } finally { process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before; }
+}
 const F = (o = {}) => ({
   severity: "P1", file: "src/orders/orders.controller.ts", line: 3, side: "RIGHT", title: "create() charges a negative amount",
   failure_scenario: "A request with amount -5 is charged.", root_cause: "create passes req.body.amount to charge unchecked.",
@@ -48,7 +65,7 @@ const msg = (content, finish = "stop") => ({ choices: [{ finish_reason: finish, 
 const stageOf = (body) => {
   const sys = body.messages[0].content;
   if (sys.startsWith("You summarize")) return "map";
-  if (sys.startsWith("You are a skeptical")) return "verify";
+  if (/You verify ONE defect/.test(sys)) return "verify";
   if (sys.startsWith("You rank")) return "select";
   return "review";
 };
@@ -70,13 +87,23 @@ const mapReply = (body) => {
   const files = [...body.messages[1].content.matchAll(/=== FILE: (\S+)/g)].map((m) => m[1]);
   return JSON.stringify({ files: files.map((file) => ({ file, summary: `SUMMARY-OF ${file}`, guards: file.includes("service") ? ["charge rejects amount <= 0 (L2)"] : [], effects: [] })) });
 };
+const groupOf = (body) => {
+  const text = body.messages[1].content;
+  const feature = /Review only these files, one feature of this PR: ([^\n]+)\./.exec(text)?.[1].split(", ");
+  return feature ?? (/^Changed: (.+)$/m.exec(text)?.[1].split(", ") ?? []);
+};
 const reviewFor = (findingsByFile) => (body) => {
-  const group = /Review only these files, one feature of this PR: ([^\n]+)\./.exec(body.messages[1].content)?.[1].split(", ") ?? [];
+  const group = groupOf(body);
   const findings = group.flatMap((f) => findingsByFile[f] ?? []);
   return JSON.stringify({ merge_recommendation: findings.length ? "REQUEST_CHANGES" : "COMMENT", investigated_safe: group.map((f) => `${f}: checked`), findings, coverage: group.map((file) => ({ file, status: "cleared", reason: "read" })) });
 };
 const confirm = (quote = "return charge(req.body.amount);", severity = "P1") => JSON.stringify({ verdict: "confirmed", reason: "no validation before charge", proof_quote: quote, severity });
-const refute = JSON.stringify({ verdict: "refuted", reason: "charge() rejects amount <= 0 (orders.service.ts:2)" });
+/** A refutation that quotes a line of the CODE it was shown (a refutation must point at code or docs). */
+const refute = (body) => {
+  const code = /<<<CODE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? "";
+  const line = code.split("\n").find((l) => /^\d+\| .*\w{8}/.test(l))?.replace(/^\d+\| /, "") ?? "";
+  return JSON.stringify({ verdict: "refuted", reason: "a guard in the code shown prevents it", counter_quote: line });
+};
 
 test("features: an import link and a test with its subject form one group; an unrelated file stays apart", () => {
   const groups = featureGroups(sample(), 40_000);
@@ -134,19 +161,19 @@ test("pipeline: a refuted candidate is never posted; a confirmed one is, with th
       "src/orders/orders.controller.ts": [F()],
       "src/mail/mailer.ts": [F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", root_cause: "`queue` is undefined", failure_scenario: "sendMail throws." })],
     }),
-    verify: (body) => (/sendMail/.test(body.messages[1].content.split("<<<END>>>")[0]) ? refute : confirm()),
+    verify: (body) => (/sendMail/.test(body.messages[1].content.split("<<<END>>>")[0]) ? refute(body) : confirm()),
   });
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.equal(out.ok, true, out.error);
   const review = JSON.parse(out.raw);
   assert.deepEqual(review.findings.map((f) => f.title), ["create() charges a negative amount"]);
-  assert.match(out.pipelineSummary, /2 feature group\(s\), 2 candidate\(s\), 2 past the gate, 1 confirmed, 1 refuted, 1 posted/);
+  assert.match(out.pipelineSummary, /2 feature group\(s\) × 1 lens\(es\), 2 candidate\(s\), 2 to verify, 1 confirmed, 1 refuted, 1 posted/);
   assert.equal(m.count.verify, 2);
   assert.ok(gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings).ok);
 });
 
 test("pipeline: a feature turn sees what the OTHER features do (PR map), so a guard elsewhere is known", async () => {
-  const m = model({ map: mapReply, review: reviewFor({}), verify: () => refute });
+  const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
   await runLocalReviewPipeline(sample(), settings, { request: m.request });
   const mailTurn = m.bodies.find((b) => stageOf(b) === "review" && /one feature of this PR: src\/mail\/mailer\.ts\./.test(b.messages[1].content));
   assert.ok(mailTurn, "the mailer feature had its own turn");
@@ -155,18 +182,37 @@ test("pipeline: a feature turn sees what the OTHER features do (PR map), so a gu
   assert.doesNotMatch(mailTurn.messages[1].content, /if \(amount <= 0\) throw/, "the other feature's code itself is not in this turn");
 });
 
-test("pipeline: a confirmation that quotes no code from the evidence counts as refuted", async () => {
+test("pipeline: a confirmation that quotes no code is only uncertain — posted at P2 when the candidate's own quote is real code", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm("chargeEverything(amount) // not in the code") });
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   const review = JSON.parse(out.raw);
-  assert.equal(review.findings.length, 0);
-  assert.ok(gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings).ok, "all refuted is a reviewed, clean result");
+  assert.deepEqual(review.findings.map((f) => [f.title, f.severity]), [["create() charges a negative amount", "P2"]]);
+  assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted, 1 posted/);
+  // Settings off: an uncertain candidate is dropped.
+  const off = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: false }, { request: m.request });
+  assert.equal(JSON.parse(off.raw).findings.length, 0);
+});
+
+test("pipeline: an uncertain candidate whose own quote is not real code is dropped", async () => {
+  const bogus = F({ evidence: "src/orders/orders.controller.ts:3 `return chargeTwice(req.body.amount, true);`" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [bogus] }), verify: () => JSON.stringify({ verdict: "uncertain", reason: "cannot tell" }) });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 0);
+});
+
+test("pipeline: a refutation without a counter-quote from the evidence is not accepted (it becomes uncertain)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => JSON.stringify({ verdict: "refuted", reason: "probably fine" }) });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const review = JSON.parse(out.raw);
+  assert.equal(review.findings.length, 1);
+  assert.equal(review.findings[0].severity, "P2");
+  assert.match(out.pipelineSummary, /1 uncertain/);
 });
 
 test("pipeline: when every candidate is refuted and no group listed investigated_safe, the result still says it was reviewed", async () => {
   const noSafe = (body) => JSON.parse(reviewFor({ "src/orders/orders.controller.ts": [F()] })(body));
   // The feature with a finding lists no investigated_safe; the finding-free one must (or it is no review).
-  const m = model({ map: mapReply, review: (b) => { const r = noSafe(b); return JSON.stringify(r.findings.length ? { ...r, investigated_safe: [] } : r); }, verify: () => refute });
+  const m = model({ map: mapReply, review: (b) => { const r = noSafe(b); return JSON.stringify(r.findings.length ? { ...r, investigated_safe: [] } : r); }, verify: refute });
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.equal(review.findings.length, 0);
@@ -191,14 +237,14 @@ test("pipeline: the verifier may lower a severity, never raise it", async () => 
 });
 
 test("pipeline: two votes — a candidate the second vote refutes is not posted", async () => {
-  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: (_b, n) => (n === 1 ? confirm() : refute) });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: (_b, n) => (n === 1 ? confirm() : refute(_b)) });
   const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineVerifyVotes: 2 }, { request: m.request });
   assert.equal(JSON.parse(out.raw).findings.length, 0);
   assert.equal(m.count.verify, 2);
 });
 
 test("pipeline: at most localPipelineMaxFindings are posted, in the selector's order", async () => {
-  const many = [1, 2, 3, 4, 5].map((i) => F({ line: 3, title: `distinct defect number ${i}`, severity: i === 5 ? "P1" : "P2" }));
+  const many = ["alpha", "bravo", "charlie", "delta", "echo"].map((w, i) => F({ line: 1 + i, title: `${w} ${w}z`, severity: i === 4 ? "P1" : "P2" }));
   const m = model({
     map: mapReply,
     review: reviewFor({ "src/orders/orders.controller.ts": many.slice(0, 4), "src/mail/mailer.ts": [] }),
@@ -206,7 +252,7 @@ test("pipeline: at most localPipelineMaxFindings are posted, in the selector's o
     select: () => JSON.stringify({ selected: [{ id: "c4" }, { id: "c2" }, { id: "c1" }, { id: "c3" }] }),
   });
   const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 2 }, { request: m.request });
-  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["distinct defect number 4", "distinct defect number 2"]);
+  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["delta deltaz", "bravo bravoz"]);
 });
 
 test("pipeline: a selection that is unusable or drops every proven P1 falls back to severity order", async () => {
@@ -239,10 +285,10 @@ test("pipeline: a map turn whose request throws leaves the deterministic map; th
 });
 
 test("pipeline: a selection that repeats an id cannot take a second slot from another verified finding (Codex #180)", async () => {
-  const rows = [F({ title: "first distinct defect", line: 2 }), F({ title: "second distinct defect", line: 3 })];
+  const rows = [F({ title: "first firstly", line: 2 }), F({ title: "second secondly", line: 3 })];
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": rows }), verify: () => confirm(), select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c1" }, { id: "c2" }] }) });
   const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 2 }, { request: m.request });
-  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["first distinct defect", "second distinct defect"]);
+  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["first firstly", "second secondly"]);
 });
 
 test("pipeline: a feature whose reply is never review JSON is unreviewed, kept as evidence; the others still post", async () => {
@@ -279,7 +325,7 @@ test("pipeline: a map turn that fails leaves the deterministic map; the review s
 test("pipeline: every request fits the local window, and the stage turns run at low temperature", async () => {
   const big = {};
   for (let i = 0; i < 30; i += 1) big[`src/mod${i % 5}/file${i}.ts`] = `export function f${i}(x) {\n${"  x = x + 1; // padding line\n".repeat(120)}  return x;\n}\n`;
-  const m = model({ map: mapReply, review: reviewFor({}), verify: () => refute });
+  const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
   const out = await runLocalReviewPipeline(sample(big), settings, { request: m.request });
   assert.equal(out.ok, true, out.error);
   for (const b of m.bodies) {
@@ -298,50 +344,137 @@ test("pipeline: a cancelled review stops at the next turn and fails the leg", as
   assert.match(out.error, /aborted/);
 });
 
-test("single-turn: each finding is verified, the refuted ones dropped, the reply's other fields kept", async () => {
-  const raw = JSON.stringify({
-    merge_recommendation: "REQUEST_CHANGES", investigated_safe: ["src/mail/mailer.ts: unchanged behaviour"], assumptions: ["A1"],
-    findings: [F(), F({ title: "charge ignores currency", line: 2 })], coverage: [{ file: "src/orders/orders.controller.ts", status: "cleared", reason: "r" }],
+test("whole PR: a PR that fits one turn is reviewed in one turn per lens with no map, and the other fields are kept", async () => {
+  await wholePr(async () => {
+    const m = model({
+      review: (body) => JSON.stringify({
+        merge_recommendation: "REQUEST_CHANGES", investigated_safe: ["src/mail/mailer.ts: unchanged behaviour"], assumptions: ["A1"],
+        findings: [F(), F({ title: "charge ignores currency", line: 2 })], coverage: [{ file: "src/orders/orders.controller.ts", status: "cleared", reason: "r" }],
+      }),
+      verify: (b) => (/currency/.test(b.messages[1].content.split("<<<END>>>")[0]) ? refute(b) : confirm()),
+    });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    assert.equal(m.count.map, undefined, "no PR map for a PR the turn sees whole");
+    assert.equal(m.count.review, 1);
+    assert.match(m.bodies.find((b) => stageOf(b) === "review").messages[1].content, /Review the whole change of this pull request\./);
+    const review = JSON.parse(out.raw);
+    assert.deepEqual(review.findings.map((f) => f.title), ["create() charges a negative amount"]);
+    assert.deepEqual(review.investigated_safe, ["src/mail/mailer.ts: unchanged behaviour"]);
+    assert.deepEqual(review.assumptions, ["A1"]);
+    assert.match(out.pipelineSummary, /^Local pipeline: 1 feature group\(s\) × 1 lens\(es\), 2 candidate\(s\), 2 to verify, 1 confirmed, 1 refuted, 1 posted/);
   });
-  const m = model({ verify: (b) => (/currency/.test(b.messages[1].content) ? refute : confirm()) });
-  const out = await verifySingleTurn(raw, sample(), settings, { request: m.request });
-  const review = JSON.parse(out.raw);
-  assert.deepEqual(review.findings.map((f) => f.title), ["create() charges a negative amount"]);
-  assert.deepEqual(review.investigated_safe, ["src/mail/mailer.ts: unchanged behaviour"]);
-  assert.deepEqual(review.assumptions, ["A1"]);
-  assert.equal(review.coverage.length, 1);
-  assert.match(out.summary, /^Local verification: 2 candidate\(s\), 2 past the gate, 1 confirmed, 1 refuted, 1 posted/);
 });
 
-test("single-turn: a reply with no finding (or one the gate rejects) is returned unchanged, with no request", async () => {
-  const m = model({});
-  for (const raw of [JSON.stringify({ findings: [], investigated_safe: ["ok"] }), "{\"findings\":[]}"]) {
-    assert.equal((await verifySingleTurn(raw, sample(), settings, { request: m.request })).raw, raw);
-  }
-  assert.equal(m.bodies.length, 0);
-});
-
-test("single-turn: every reported row is inspected (more than the gate's 8-row cap), and a cut-off reply stays marked (Codex #180)", async () => {
-  const rows = Array.from({ length: 10 }, (_, i) => F({ title: `distinct defect ${i + 1}`, line: 1 + (i % 4) }));
-  const raw = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: rows, truncated: true });
-  const m = model({ verify: () => refute });
-  const out = await verifySingleTurn(raw, sample(), settings, { request: m.request });
-  assert.equal(m.count.verify, 10, "rows 9 and 10 were verified too, not dropped unread");
-  const review = JSON.parse(out.raw);
-  assert.equal(review.truncated, true, "the cut-off mark survives the rebuild");
-  assert.deepEqual(review.findings, []);
-  assert.deepEqual(review.investigated_safe, [], "no 'all refuted' clean line for a cut-off reply");
-  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings);
-  assert.ok(!gate.ok || gate.truncated, "never a complete clean verdict");
+test("whole PR: every reported row is inspected (more than the gate's 8-row cap), and a cut-off reply stays marked (Codex #180)", async () => {
+  await wholePr(async () => {
+    const rows = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"].map((w, i) => F({ title: `${w} ${w}q`, line: 1 + i }));
+    const m = model({ review: () => JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: rows, truncated: true }), verify: refute });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    assert.equal(m.count.verify, 10, "rows 9 and 10 were verified too, not dropped unread");
+    const review = JSON.parse(out.raw);
+    assert.equal(review.truncated, true, "the cut-off mark survives the rebuild");
+    assert.deepEqual(review.findings, []);
+    assert.deepEqual(review.investigated_safe, [], "no 'all refuted' clean line for a cut-off reply");
+    const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings);
+    assert.ok(!gate.ok || gate.truncated, "never a complete clean verdict");
+  });
 });
 
 test("pipeline: candidates past the verify cap stay as reported, never dropped into a clean result", async () => {
-  const many = Array.from({ length: 14 }, (_, i) => F({ title: `cap defect ${i + 1}`, line: 1 + (i % 4), severity: "P2" }));
-  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": many }), verify: () => refute });
+  const names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo"];
+  const many = names.map((w, i) => F({ title: `${w} ${w}q`, line: 1 + i, severity: "P2" }));
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": many }), verify: refute });
   const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 8 }, { request: m.request });
-  assert.equal(m.count.verify, 12);
+  assert.equal(m.count.verify, 16);
   const review = JSON.parse(out.raw);
   assert.equal(review.findings.length, 2, "the two over the cap are kept, unverified");
   assert.match(review.assumptions.join("\n"), /2 local candidate finding\(s\) could not be verified/);
   assert.match(out.pipelineSummary, /2 over the verify cap/);
+});
+
+// ── Recall (2026-11-06: after the pipeline shipped, three real defects Codex caught on the same commit came
+// back findings:[] from the local reviewer — the candidate prompt's precision rules silenced it) ──
+
+test("recall: candidate turns get the hunt instructions, not the chat precision rules", async () => {
+  const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const turn = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+  assert.ok(turn.includes(HUNT_INSTRUCTIONS));
+  assert.ok(!turn.includes(REVIEW_INSTRUCTIONS));
+  assert.doesNotMatch(turn, /Never report anything unverified/);
+  assert.match(turn, /do not hold back a defect because you could not fully prove it here/);
+});
+
+test("recall: three lens passes per feature, each with its own focus; the same defect from two lenses is verified once", async () => {
+  assert.deepEqual(lensesFor(3), ["failure", "data", "contract"]);
+  assert.deepEqual(lensesFor(1), ["general"]);
+  const m = model({
+    map: mapReply,
+    review: (body) => {
+      const text = body.messages[1].content;
+      const lens = text.includes(LENSES.failure) ? "failure" : text.includes(LENSES.data) ? "data" : "contract";
+      const files = groupOf(body);
+      if (!files.includes("src/orders/orders.controller.ts")) return reviewFor({})(body);
+      const rows = lens === "data" ? [F({ title: "negative amount charged by create" }), F({ title: "currency mismatch currencyq", line: 2 })] : [F()];
+      return JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: files.map((f) => `${f}: read`), findings: rows });
+    },
+    verify: () => confirm(),
+  });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineLenses: 3 }, { request: m.request });
+  const reviews = m.bodies.filter((b) => stageOf(b) === "review");
+  assert.equal(reviews.length, 6, "2 features × 3 lenses");
+  for (const focus of Object.values(LENSES).slice(0, 3)) assert.ok(reviews.some((b) => b.messages[1].content.includes(focus)));
+  assert.equal(m.count.verify, 2, "the charge defect from three lenses is one candidate, the currency one another");
+  assert.match(out.pipelineSummary, /× 3 lens\(es\)/);
+});
+
+test("recall: a hedged candidate the gate would drop goes to the verifier, and a confirmed one survives the downstream gate", async () => {
+  const hedged = F({ title: "create may charge a negative amount", failure_scenario: "If amount is -5 it could be charged." });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [hedged] }), verify: () => confirm() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(m.count.verify, 1, "verified, not dropped unread");
+  assert.match(out.pipelineSummary, /\(1 the gate would have dropped\)/);
+  const review = JSON.parse(out.raw);
+  assert.equal(review.findings.length, 1);
+  assert.match(review.findings[0].evidence, /`return charge\(req\.body\.amount\);`/);
+  assert.equal(out.verifiedKeys.length, 1);
+  // Downstream (harbor's leg gate): with the trusted verified keys it posts; without them the hedge drops it.
+  const parsed = parseChatSubmission(out.raw);
+  const withKeys = gateLiveSubmission(parsed, sample(), settings, { verifiedKeys: new Set(out.verifiedKeys) });
+  assert.equal(withKeys.findings.length, 1);
+  const without = gateLiveSubmission(parsed, sample(), settings);
+  assert.equal(without.findings.length, 0, "the plain gate still drops a hedged claim");
+});
+
+test("recall: only verified findings carry a verified key (an unverifiable one is kept but re-gated as before)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => { throw new Error("HTTP 500"); } });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 1);
+  assert.equal(out.verifiedKeys, undefined);
+});
+
+test("recall: a near-identical quote still proves (dropped semicolon, quotes); a different identifier never does", () => {
+  const code = "--- a.ts (L1-L2)\n1| export function f(x) {\n2|   return charge(x.amount, 'KRW');";
+  assert.equal(quoteInCode('return charge(x.amount, "KRW")', code), true);
+  assert.equal(quoteInCode("return charge(x.amount, KRW);", code), true);
+  assert.equal(quoteInCode("return charge(x.total, 'KRW');", code), false);
+  assert.equal(quoteInCode("return refund(x.amount, 'KRW');", code), false);
+});
+
+test("recall: the same defect from different passes is one candidate; distinct defects on one line stay apart", () => {
+  const rows = [
+    { severity: "P2", file: "a.ts", line: 3, title: "negative amount is charged" },
+    { severity: "P1", file: "a.ts", line: 3, title: "charged amount can be negative" },
+    { severity: "P2", file: "a.ts", line: 3, title: "currency code ignored" },
+    { severity: "P2", file: "b.ts", line: 3, title: "negative amount is charged" },
+  ];
+  const kept = dedupeCandidates(rows);
+  assert.deepEqual(kept.map((r) => `${r.file}:${r.title}`), ["a.ts:charged amount can be negative", "a.ts:currency code ignored", "b.ts:negative amount is charged"]);
+});
+
+test("recall: a confirmed finding's evidence gains the verifier's proof quote when it did not already carry it", async () => {
+  const thin = F({ evidence: "src/orders/orders.controller.ts:3 the amount goes straight to `charge`" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [thin] }), verify: () => confirm() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(JSON.parse(out.raw).findings[0].evidence, /Verified against the code: `return charge\(req\.body\.amount\);`/);
 });

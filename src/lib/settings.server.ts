@@ -106,6 +106,10 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (pipelineMax !== undefined) o.localPipelineMaxFindings = pipelineMax;
   const pipelineVotes = envNum("ASHLAR_LOCAL_PIPELINE_VERIFY_VOTES");
   if (pipelineVotes !== undefined) o.localPipelineVerifyVotes = pipelineVotes;
+  const pipelineLenses = envNum("ASHLAR_LOCAL_PIPELINE_LENSES");
+  if (pipelineLenses !== undefined) o.localPipelineLenses = pipelineLenses;
+  const keepUncertain = envFlag("ASHLAR_LOCAL_PIPELINE_KEEP_UNCERTAIN");
+  if (keepUncertain !== undefined) o.localPipelineKeepUncertain = keepUncertain;
   const localLease = envNum("ASHLAR_LOCAL_LEASE_CAPACITY");
   if (localLease !== undefined) o.localLeaseCapacity = localLease;
   const order = envStr("ASHLAR_REVIEW_ORDER");
@@ -197,6 +201,8 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_REVIEW_PIPELINE: String(s.localReviewPipeline),
     ASHLAR_LOCAL_PIPELINE_MAX_FINDINGS: String(s.localPipelineMaxFindings),
     ASHLAR_LOCAL_PIPELINE_VERIFY_VOTES: String(s.localPipelineVerifyVotes),
+    ASHLAR_LOCAL_PIPELINE_LENSES: String(s.localPipelineLenses),
+    ASHLAR_LOCAL_PIPELINE_KEEP_UNCERTAIN: String(s.localPipelineKeepUncertain),
     ASHLAR_LOCAL_LEASE_CAPACITY: String(s.localLeaseCapacity),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
@@ -307,6 +313,8 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localReviewPipeline: bool(p.localReviewPipeline, DEFAULT_SETTINGS.localReviewPipeline),
     localPipelineMaxFindings: intField(p, "localPipelineMaxFindings"),
     localPipelineVerifyVotes: intField(p, "localPipelineVerifyVotes"),
+    localPipelineLenses: intField(p, "localPipelineLenses"),
+    localPipelineKeepUncertain: bool(p.localPipelineKeepUncertain, DEFAULT_SETTINGS.localPipelineKeepUncertain),
     localLeaseCapacity: intField(p, "localLeaseCapacity"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),

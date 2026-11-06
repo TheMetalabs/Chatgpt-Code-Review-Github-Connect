@@ -57,13 +57,48 @@ Every turn is a **fresh request**; nothing accumulates across turns. Each turn's
 
 **Ops comment.** The comment adds one line, for example `Local pipeline: 5 feature group(s), 14 candidate(s), 9 past the gate, 2 confirmed, 7 refuted, 2 posted (31 turns)`.
 
+## Recall (2026-11-06)
+
+After the pipeline shipped, precision was in hand but the local reviewer found almost nothing. On the same commit, Codex caught three defects that were later fixed: aicc-center #1473, #1462 and #1468. All three were small PRs, and each local review came back `findings: []`. No candidate reached the refute stage, so the loss happened at generation. Generation used the chat precision rules ("never report anything unverified, conditional or possible…", "delete a finding that…"), and with those rules a small model reports nothing.
+
+Precision is enforced by the refute stage, so generation is now tuned for recall:
+
+**Candidate generation**
+- Candidate turns use `HUNT_INSTRUCTIONS` instead of `REVIEW_INSTRUCTIONS`. They are told to report every defect they can tie to a changed line, with that line quoted, because a verifier checks each candidate. Style, docs, naming, log wording and test advice are still not findings.
+- Each feature gets one candidate pass per lens (`local_review.pipeline_lenses`, default 3):
+  - failure paths (catch / retry / async / partial failure, e.g. #1462's stale profile after a failed refresh);
+  - data identity and invariants (key collisions, null, boundaries, e.g. #1468's same-name rows);
+  - contracts (callers, callees, status codes, a test's expectation versus the implementation, e.g. #1473).
+- The candidates from all passes are merged, and duplicates are removed (`dedupeCandidates`).
+- A PR whose diff fits one turn is reviewed as **one whole-PR feature** with no map, so the turn sees the whole change, as ChatGPT does.
+
+**Gate**
+- The gate's soft drops (`speculative`, `evidence_unverified`, `evidence_unavailable`) go to the refute stage instead of being dropped unread.
+- Its hard drops still apply: already reported, self-retracted, contradicted by the diff or by the reply itself.
+- Its note routing (docs, style, i18n, log, test advice) still applies.
+
+**Refute stage**
+- A verdict is `confirmed`, `refuted` or `uncertain`.
+- A refutation must quote the code or doc text that prevents the defect. One without such a quote counts as uncertain.
+- Quotes match token by token when not verbatim: every identifier must be on the line, but punctuation may differ.
+- An uncertain candidate is posted at P2 only when its own evidence quotes real code (`local_review.pipeline_keep_uncertain`, default on).
+
+**Downstream gate**
+- The posted findings the verifier confirmed, or kept as uncertain, are handed to the leg gate as **trusted verified keys** (`FindingGateExtras.verifiedKeys`), and the gate does not re-judge their hedges and evidence.
+- The keys are set only by Ashlar for its own local leg, never from model JSON.
+- The hard drops still run.
+
+**Posting cap.** The posting cap default is now 5.
+
 ## Settings
 
 | Field | Default | Meaning |
 |---|---|---|
 | `local_review.pipeline` | on | Off restores the grouped tool loop. |
-| `local_review.pipeline_max_findings` | 3 | 1–8: the selection's cap. |
+| `local_review.pipeline_max_findings` | 5 | 1–8: the selection's cap. |
 | `local_review.pipeline_verify_votes` | 1 | 1–3: refute turns per candidate. All must confirm. |
+| `local_review.pipeline_lenses` | 3 | 1–3: candidate passes per feature (1 = one combined pass). |
+| `local_review.pipeline_keep_uncertain` | on | Post an undecided candidate at P2 when its own quote is real code. |
 
 ## Measuring it with the real model
 
@@ -74,7 +109,8 @@ GITHUB_TOKEN=… npm run replay:local -- --pr TheMetalabs/aicc-center#1251 --hea
   --mode all --labels /path/to/fp-eval/index.json --save-snapshot /tmp/1251.json --out /tmp/1251-report.json
 ```
 
-- `--mode all` runs the pipeline, the old loop and single-turn+verify on the same snapshot.
+- `--mode all` runs the pipeline and the old loop on the same snapshot.
+- `--expect` takes the defects a review must catch (`[{file, keywords}]`) and scores recall. `--cases` runs many heads in one go (`[{pr, head, expect?}]`) and prints totals.
 - Each run scores the posted findings against the judged eval labels (valid / false_positive / unclear / unjudged).
 - Later runs can use `--snapshot /tmp/1251.json` and skip GitHub.
 

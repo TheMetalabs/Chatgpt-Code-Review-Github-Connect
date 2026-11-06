@@ -114,6 +114,8 @@ const TOP_LEVEL = {
   localReviewPipeline: {bad: ['false', 0, null], good: false},
   localPipelineMaxFindings: {bad: [0, 9, '3', 1.5, null], good: 5},
   localPipelineVerifyVotes: {bad: [0, 4, '1', null], good: 2},
+  localPipelineLenses: {bad: [0, 4, '2', null], good: 1},
+  localPipelineKeepUncertain: {bad: ['true', 1, null], good: false},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {

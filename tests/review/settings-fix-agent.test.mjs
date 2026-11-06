@@ -111,6 +111,9 @@ const TOP_LEVEL = {
   findingDedupePrior: {bad: ['yes', 1, null], good: false},
   postLatestHeadOnly: {bad: ['true', 0, null], good: false},
   skipVendoredPaths: {bad: ['true', 0, null], good: false},
+  localReviewPipeline: {bad: ['false', 0, null], good: false},
+  localPipelineMaxFindings: {bad: [0, 9, '3', 1.5, null], good: 5},
+  localPipelineVerifyVotes: {bad: [0, 4, '1', null], good: 2},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {

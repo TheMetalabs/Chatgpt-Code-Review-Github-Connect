@@ -279,7 +279,7 @@ function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines:
 // A policy path the PR changes is policy only in its BASE text (basePolicyFiles); its `files` entry is
 // the PR's HEAD text and is never read as policy. `prChangedPaths` is the whole PR's changed list (a
 // local-loop group's changedPaths is only its own files).
-function buildPolicyAttachment(sample: SamplePr, maxChars: number, prChangedPaths: readonly string[]): string {
+export function buildPolicyAttachment(sample: SamplePr, maxChars: number, prChangedPaths: readonly string[]): string {
   const policyPaths = new Set(policyPathsFor(sample.changedPaths));
   const changed = new Set(prChangedPaths);
   const byPath = new Map<string, SnapshotFile>();

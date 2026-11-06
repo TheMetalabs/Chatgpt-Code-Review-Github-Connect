@@ -70,7 +70,7 @@ export type LocalReviewDeps = {
   now?: () => number;
 };
 
-type LoopTuning = {
+export type LoopTuning = {
   groupMaxChars: number;
   toolIterCap: number;
   ctxCapTokens: number;
@@ -86,7 +86,7 @@ function envNum(key: string, dflt: number): number {
   return Number.isFinite(n) ? n : dflt;
 }
 
-function tuning(): LoopTuning {
+export function tuning(): LoopTuning {
   return {
     groupMaxChars: envNum("ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS", 40_000),
     toolIterCap: envNum("ASHLAR_LOCAL_REVIEW_TOOL_ITERS", 8),
@@ -105,7 +105,7 @@ function tuning(): LoopTuning {
 // as "--- x" and, if it sits immediately before the next hunk header, is misread as a boundary. Left
 // as-is deliberately — hardening only this copy would diverge from chat-prompt's identical parser;
 // any fix should change both together.
-function patchesByPath(diff: string): Map<string, string> {
+export function patchesByPath(diff: string): Map<string, string> {
   const lines = String(diff || "").split("\n");
   const out = new Map<string, string>();
   let path: string | null = null;
@@ -135,7 +135,7 @@ function patchesByPath(diff: string): Map<string, string> {
 
 // Changed paths with no usable patch (budget-dropped, binary, rename-only, unparsed). They cannot be
 // reviewed from a diff, so grouping excludes them and the merge marks them not_cleared.
-function unreviewablePaths(sample: SamplePr): string[] {
+export function unreviewablePaths(sample: SamplePr): string[] {
   const patchMap = patchesByPath(sample.diff);
   return sample.changedPaths.filter((p) => !patchMap.has(p));
 }
@@ -189,7 +189,7 @@ export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   return groups.length ? groups : [sample.changedPaths.slice(0, 1)];
 }
 
-function subsetSample(sample: SamplePr, groupPaths: Set<string>): SamplePr {
+export function subsetSample(sample: SamplePr, groupPaths: Set<string>): SamplePr {
   const patchMap = patchesByPath(sample.diff);
   return {
     ...sample,
@@ -222,7 +222,7 @@ const FORCE_FINAL_MSG =
 // One last turn for a group whose final reply is not a usable review (live WalkieBoard #530/#531: the
 // whole leg failed as "local loop produced no review JSON"; #524: a group answered findings:[] with no
 // investigated_safe). No tools; the message names what was wrong with the reply.
-const GROUP_RETRY_MSG = {
+export const GROUP_RETRY_MSG = {
   not_json:
     "Your last reply was not the review JSON. Using only what you have already read, reply again with ONLY the final review JSON object for this group (findings, investigated_safe, coverage, merge_recommendation). No prose, no markdown fences, no tool calls.",
   cut_off:
@@ -494,7 +494,7 @@ async function reviewGroup(
 }
 
 /** Whether a review JSON carries any finding rows at all (usable or not). */
-function hasFindingRows(raw: string | null): boolean {
+export function hasFindingRows(raw: string | null): boolean {
   if (!raw) return false;
   try {
     const o = JSON.parse(raw) as { findings?: unknown };
@@ -576,7 +576,7 @@ function gatePasses(f: unknown): boolean {
 // it here (rather than a hand-rolled proxy like "findings.length > 0") means a group whose findings
 // would all be dropped, or that is empty with no safe justification, is treated as not reviewed —
 // one authoritative check, so no weaker predicate can let an unreviewed group pass as clean.
-function groupReviewValid(raw: string, groupPaths: string[], sample: SamplePr, settings: BotSettings): boolean {
+export function groupReviewValid(raw: string, groupPaths: string[], sample: SamplePr, settings: BotSettings): boolean {
   // Validate against THIS group's subset (a finding in another group's file must not count here) and
   // with publishMinSeverity forced to P2 (a group that found only lower-severity issues still did
   // review them — the publish threshold governs posting, not whether the group was reviewed).

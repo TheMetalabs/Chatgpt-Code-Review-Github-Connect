@@ -95,7 +95,7 @@ const GATE_PREFIX = "Gate: ";
 // reviewed sha (+ whether HEAD moved), prompt sizes, deterministic + model
 // coverage, and precision-dropped count. Pure/read-only; never affects the verdict.
 export function reviewPostedNotes(
-  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount"> & Partial<Pick<Job, "gateStats" | "vendoredSkipped">>,
+  job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount"> & Partial<Pick<Job, "gateStats" | "vendoredSkipped" | "localPipelineSummary">>,
   returnedFindings: number,
   unanchoredInBody = 0,
 ): string[] {
@@ -111,6 +111,7 @@ export function reviewPostedNotes(
     notes.push(`Prompt: diff ${ps.diffChars} chars (${ps.diffFilesFull}/${ps.diffFilesTotal} files full), context ${ps.contextChars} chars${inContext.length ? ` (${inContext.join(", ")})` : ""}, policy ${ps.policyChars} chars${description}`);
   }
   if (job.vendoredSkipped?.count) notes.push(vendoredSkippedNote(job.vendoredSkipped));
+  if (job.localPipelineSummary) notes.push(job.localPipelineSummary);
   const det = job.coverageDeterministic ?? [];
   if (det.length) {
     const full = det.filter((d) => d.inDiff).length;

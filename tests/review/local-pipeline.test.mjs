@@ -219,13 +219,30 @@ test("pipeline: a selection that is unusable or drops every proven P1 falls back
   assert.deepEqual(rankSurvivors([{ severity: "P2", file: "a", title: "x" }, { severity: "P1", file: "a", title: "y" }, { severity: "P1", file: "a", title: "Y!" }], 5).map((r) => r.title), ["y", "x"]);
 });
 
-test("pipeline: a verification that cannot run keeps the candidate at P2 and says so (never a clean result from a failure)", async () => {
+test("pipeline: a verification that cannot run keeps the candidate as reported and says so (never a clean result from a failure)", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => { throw new Error("HTTP 500"); } });
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.equal(review.findings.length, 1);
-  assert.equal(review.findings[0].severity, "P2");
-  assert.match(review.assumptions.join("\n"), /could not be verified/);
+  // Codex #180: demoting it to P2 let a P1 publish threshold filter it away into a clean result.
+  assert.equal(review.findings[0].severity, "P1");
+  assert.match(review.assumptions.join("\n"), /could not be verified and are kept as reported/);
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), { ...settings, publishMinSeverity: "P1" });
+  assert.equal(gate.findings.length, 1, "still posted under a P1 publish threshold");
+});
+
+test("pipeline: a map turn whose request throws leaves the deterministic map; the review still runs (Codex #180)", async () => {
+  const m = model({ map: () => { throw new Error("HTTP 500"); }, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(JSON.parse(out.raw).findings.length, 1);
+});
+
+test("pipeline: a selection that repeats an id cannot take a second slot from another verified finding (Codex #180)", async () => {
+  const rows = [F({ title: "first distinct defect", line: 2 }), F({ title: "second distinct defect", line: 3 })];
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": rows }), verify: () => confirm(), select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c1" }, { id: "c2" }] }) });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 2 }, { request: m.request });
+  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["first distinct defect", "second distinct defect"]);
 });
 
 test("pipeline: a feature whose reply is never review JSON is unreviewed, kept as evidence; the others still post", async () => {
@@ -302,4 +319,29 @@ test("single-turn: a reply with no finding (or one the gate rejects) is returned
     assert.equal((await verifySingleTurn(raw, sample(), settings, { request: m.request })).raw, raw);
   }
   assert.equal(m.bodies.length, 0);
+});
+
+test("single-turn: every reported row is inspected (more than the gate's 8-row cap), and a cut-off reply stays marked (Codex #180)", async () => {
+  const rows = Array.from({ length: 10 }, (_, i) => F({ title: `distinct defect ${i + 1}`, line: 1 + (i % 4) }));
+  const raw = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: rows, truncated: true });
+  const m = model({ verify: () => refute });
+  const out = await verifySingleTurn(raw, sample(), settings, { request: m.request });
+  assert.equal(m.count.verify, 10, "rows 9 and 10 were verified too, not dropped unread");
+  const review = JSON.parse(out.raw);
+  assert.equal(review.truncated, true, "the cut-off mark survives the rebuild");
+  assert.deepEqual(review.findings, []);
+  assert.deepEqual(review.investigated_safe, [], "no 'all refuted' clean line for a cut-off reply");
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings);
+  assert.ok(!gate.ok || gate.truncated, "never a complete clean verdict");
+});
+
+test("pipeline: candidates past the verify cap stay as reported, never dropped into a clean result", async () => {
+  const many = Array.from({ length: 14 }, (_, i) => F({ title: `cap defect ${i + 1}`, line: 1 + (i % 4), severity: "P2" }));
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": many }), verify: () => refute });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 8 }, { request: m.request });
+  assert.equal(m.count.verify, 12);
+  const review = JSON.parse(out.raw);
+  assert.equal(review.findings.length, 2, "the two over the cap are kept, unverified");
+  assert.match(review.assumptions.join("\n"), /2 local candidate finding\(s\) could not be verified/);
+  assert.match(out.pipelineSummary, /2 over the verify cap/);
 });

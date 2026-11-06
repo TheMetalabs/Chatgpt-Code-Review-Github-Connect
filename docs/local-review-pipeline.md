@@ -41,7 +41,7 @@ Every turn is a **fresh request**; nothing accumulates across turns. Each turn's
 - A confirmation counts only when its proof quote is real code from the evidence's CODE section (`quoteInCode`). The PR description and the docs do not count as proof.
 - The verifier may lower a severity, never raise it.
 - With `local_review.pipeline_verify_votes` = 2 or 3, every vote must confirm.
-- A verification that cannot run (transport error, or no verdict after one retry) keeps the candidate at P2 and says so in assumptions. A failure never becomes a clean result.
+- A verification that cannot run (transport error, or no verdict after one retry) keeps the candidate as reported, severity unchanged, and says so in assumptions. Candidates past the verify cap are kept the same way. A failure never becomes a clean result.
 
 **Sampling.**
 - Feature turns use the configured local sampling.

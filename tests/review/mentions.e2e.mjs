@@ -342,7 +342,9 @@ test('a loop stop whose first attempt failed is retried when GitHub redelivers i
 // (an Instant-tier skip) and the job ended skipped, but its ops comment stayed "running / Waiting for
 // provider response": that skip path never updated it, so a lane tool read the job as in progress for
 // hours. Every terminal status now reaches the ops comment.
-test('a job that ends skipped on a reply with no valid review JSON leaves its ops comment terminal, never running',async t=>{
+// A reply with no valid review JSON leaves the head with no review: a failed attempt (live WalkieBoard
+// #524), so the terminal ops comment reads failed and carries the attempt marker, never "skipped".
+test('a job that ends skipped on a reply with no valid review JSON leaves its ops comment terminal (a failed attempt), never running',async t=>{
   const app=await fixture(t,{pull:{draft:false}});
   const out=await deliver(app,'issue_comment',comment());
   const job=await settled(app,out.jobId);
@@ -354,10 +356,12 @@ test('a job that ends skipped on a reply with no valid review JSON leaves its op
     body:JSON.stringify({action:'complete',jobId:job.id,leaseId:lease.leaseId,raw,results:[{provider:'chatgpt',raw}]})});
   const reply=await res.json();
   await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status==='skipped',`job not skipped: ${res.status} ${JSON.stringify(reply)} ${app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status}`);
-  await eventually(()=>{const last=app.ops.filter(b=>b.includes(job.id)).at(-1)||'';return /Status:\*\* skipped/.test(last);},
+  await eventually(()=>{const last=app.ops.filter(b=>b.includes(job.id)).at(-1)||'';return /Status:\*\* failed/.test(last);},
     `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
   const last=app.ops.filter(b=>b.includes(job.id)).at(-1);
   assert.match(last,/Instant-tier skip/,'names why nothing was posted');
+  assert.match(last,/This attempt failed; it is not a review of this head/);
+  assert.match(last,/<!-- ashlar-attempt failed head=[0-9a-f]+ -->/);
 });
 
 test('an operator (lane stop) cancel leaves the ops comment terminal, never running',async t=>{

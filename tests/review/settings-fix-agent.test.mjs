@@ -110,6 +110,7 @@ const TOP_LEVEL = {
   findingNotes: {bad: ['false', 0, null], good: false},
   findingDedupePrior: {bad: ['yes', 1, null], good: false},
   postLatestHeadOnly: {bad: ['true', 0, null], good: false},
+  skipVendoredPaths: {bad: ['true', 0, null], good: false},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {

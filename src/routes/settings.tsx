@@ -55,7 +55,7 @@ const GATE_MODE_LABEL: Record<GateMode, string> = {
 };
 
 /** The finding-precision fields the section edits (types.ts BotSettings, validated by settings-rules). */
-type FindingPrecision = Pick<BotSettings, "findingGate" | "findingP1ClosedPath" | "findingNotes" | "findingDedupePrior" | "postLatestHeadOnly">;
+type FindingPrecision = Pick<BotSettings, "findingGate" | "findingP1ClosedPath" | "findingNotes" | "findingDedupePrior" | "postLatestHeadOnly" | "skipVendoredPaths">;
 
 function hydrateDraft(saved: BotSettings): BotSettings {
   return {
@@ -161,6 +161,7 @@ export function Settings() {
     saved.findingNotes,
     saved.findingDedupePrior,
     saved.postLatestHeadOnly,
+    saved.skipVendoredPaths,
     savedFixKey,
   ]);
 
@@ -531,6 +532,7 @@ finding_precision:
   notes: ${draft.findingNotes}
   dedupe_prior: ${draft.findingDedupePrior}
   post_latest_head_only: ${draft.postLatestHeadOnly}
+  skip_vendored: ${draft.skipVendoredPaths}
 github:
   skip_forks: ${draft.skipForks}
   skip_drafts: ${draft.skipDrafts}
@@ -983,6 +985,17 @@ function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision;
           />
           <p className="mt-2 text-[12px] text-fg-subtle">
             A review of a head the PR has already moved past is not posted.
+          </p>
+        </Field>
+        <Field label="finding_precision.skip_vendored">
+          <Toggle
+            label="skip vendored / generated paths (.gitattributes)"
+            checked={value.skipVendoredPaths}
+            onChange={(v) => onChange({ skipVendoredPaths: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Paths the repository&apos;s .gitattributes marks linguist-vendored or linguist-generated are left out of the
+            review (diff, context, local groups) and never get a finding. The ops comment lists how many were left out.
           </p>
         </Field>
       </div>

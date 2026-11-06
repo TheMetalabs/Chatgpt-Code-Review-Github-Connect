@@ -1,4 +1,5 @@
 import { createPrivateKey } from "node:crypto";
+import { vendoredPaths } from "./gitattributes";
 import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
@@ -575,7 +576,7 @@ export async function fetchPullSnapshot(
     isFork: ForkStatus;
     isDraft: boolean;
   },
-  opts?: { diffMaxChars?: number },
+  opts?: { diffMaxChars?: number; skipVendored?: boolean },
 ): Promise<SamplePr> {
   type DiffRow = { filename?: string; status?: string; patch?: string };
   // Pin the diff to base...head so patches match the file contents fetched at headSha.
@@ -596,10 +597,17 @@ export async function fetchPullSnapshot(
     if (!filesOut.ok) throw new Error(`could not load pull files (${filesOut.status}): ${filesOut.text}`);
     rows = filesOut.data;
   }
-  const changedPaths = rows
-    .map((f) => f.filename)
-    .filter((p): p is string => Boolean(p))
-    .slice(0, MAX_FILES);
+  const allChanged = rows.map((f) => f.filename).filter((p): p is string => Boolean(p));
+  // Settings skipVendoredPaths: what the repository's root .gitattributes AT HEAD marks
+  // linguist-vendored / linguist-generated is not its code and is left out before anything is fetched,
+  // so it neither crowds real files out of the file cap nor holds a local reviewer (live #523). Head
+  // only: a rule the PR removes or narrows no longer applies (base rules are never inherited), and a
+  // .gitattributes change is itself always reviewed.
+  const vendored = opts?.skipVendored
+    ? vendoredPaths(allChanged, [await getFile(token, target.owner, target.repo, ".gitattributes", target.headSha).catch(() => null)])
+    : [];
+  const vendoredSet = new Set(vendored.map((v) => v.path));
+  const changedPaths = allChanged.filter((p) => !vendoredSet.has(p)).slice(0, MAX_FILES);
   const policyPaths = policyPathsFor(changedPaths);
   const toFetch = [...new Set([...changedPaths, ...policyPaths])];
   const files: SnapshotFile[] = [];
@@ -666,6 +674,7 @@ export async function fetchPullSnapshot(
     diffDroppedPaths,
     referenceFiles,
     ...(basePolicyFiles.length ? { basePolicyFiles } : {}),
+    ...(vendored.length ? { vendoredPaths: vendored } : {}),
   };
 }
 

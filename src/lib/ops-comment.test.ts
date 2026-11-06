@@ -156,3 +156,24 @@ describe("reviewPostedNotes", () => {
     assert.deepEqual(m[1].trim().split(",").map((p) => p.trim()).filter(Boolean), files);
   });
 });
+
+describe("failed attempt marker (live WalkieBoard #524/#530/#531)", () => {
+  it("a failed phase with a head carries the machine-readable attempt marker", async () => {
+    const { attemptFailedMarker, attemptFailedNote } = await import("./ops-comment.ts");
+    const body = buildOpsComment({ phase: "failed", providers: ["local"], notes: [attemptFailedNote("1c8aac02ffff", "empty findings", "@ashlar-bot")], attemptFailedHead: "1c8aac02ffff" });
+    assert.match(body, /\*\*Status:\*\* failed/);
+    assert.ok(body.includes(attemptFailedMarker("1c8aac02ffff")));
+    assert.match(body, /<!-- ashlar-attempt failed head=1c8aac02ffff -->/);
+    assert.match(body, /No review was produced for 1c8aac0: empty findings\. This attempt failed/);
+  });
+  it("no marker on a skipped or posted comment, nor on a failed one without a head", () => {
+    for (const phase of ["skipped", "posted"] as const) {
+      assert.doesNotMatch(buildOpsComment({ phase, providers: ["local"], notes: [], attemptFailedHead: "abc" }), /ashlar-attempt/);
+    }
+    assert.doesNotMatch(buildOpsComment({ phase: "failed", providers: ["local"], notes: [] }), /ashlar-attempt/);
+  });
+  it("the marker never carries anything but hex from the head", async () => {
+    const { attemptFailedMarker } = await import("./ops-comment.ts");
+    assert.equal(attemptFailedMarker("ab -->x<!--cd"), "<!-- ashlar-attempt failed head=abcd -->");
+  });
+});

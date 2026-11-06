@@ -156,6 +156,7 @@ const FINDING_PRECISION_FLAGS = [
   ["findingNotes", "ASHLAR_FINDING_NOTES"],
   ["findingDedupePrior", "ASHLAR_FINDING_DEDUPE_PRIOR"],
   ["postLatestHeadOnly", "ASHLAR_POST_LATEST_HEAD_ONLY"],
+  ["skipVendoredPaths", "ASHLAR_SKIP_VENDORED_PATHS"],
 ] as const satisfies readonly (readonly [keyof BotSettings, string])[];
 
 const FINDING_PRECISION_FIELDS = ["findingGate", ...FINDING_PRECISION_FLAGS.map(([key]) => key)] as const;
@@ -200,6 +201,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_FINDING_NOTES: String(s.findingNotes),
     ASHLAR_FINDING_DEDUPE_PRIOR: String(s.findingDedupePrior),
     ASHLAR_POST_LATEST_HEAD_ONLY: String(s.postLatestHeadOnly),
+    ASHLAR_SKIP_VENDORED_PATHS: String(s.skipVendoredPaths),
     // fixAgent is deliberately NOT mirrored (no field of it): the settings JSON is its only
     // durable store, and a saved fixAgent wins over env at load (diskFixAgentWins). An env
     // ASHLAR_FIX_* var only seeds a field that was never saved; no env var can switch the loop on.
@@ -307,6 +309,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     findingNotes: bool(p.findingNotes, DEFAULT_SETTINGS.findingNotes),
     findingDedupePrior: bool(p.findingDedupePrior, DEFAULT_SETTINGS.findingDedupePrior),
     postLatestHeadOnly: bool(p.postLatestHeadOnly, DEFAULT_SETTINGS.postLatestHeadOnly),
+    skipVendoredPaths: bool(p.skipVendoredPaths, DEFAULT_SETTINGS.skipVendoredPaths),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;

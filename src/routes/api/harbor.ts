@@ -12,6 +12,7 @@ import {
   publicJobs,
   publicReviews,
   publicSettings,
+  rerunHarborJob,
   resetHarbor,
   submitHarborChat,
 } from "@/lib/harbor.server";
@@ -144,6 +145,16 @@ export const Route = createFileRoute("/api/harbor")({
           }
           const probe = await probeGithub(lastGithubInstallationId());
           return Response.json({ ok: probe.ok, probe, github: githubStatus() }, { status: probe.ok ? 200 : 400 });
+        }
+        if (body.action === "rerun" && body.jobId) {
+          // Operator re-review at the live head (no new commit): it spends reviewer time, so same-origin
+          // only, like the settings write.
+          if (!sameOrigin(request)) {
+            return Response.json({ ok: false, error: "bad origin" }, { status: 401 });
+          }
+          const out = rerunHarborJob(body.jobId);
+          const ok = out.httpStatus === 202 && Boolean(out.jobId);
+          return Response.json({ ok, ...out }, { status: ok ? 200 : out.httpStatus === 202 ? 409 : out.httpStatus });
         }
         if (body.action === "cancel" && body.jobId) {
           cancelHarborJob(body.jobId);

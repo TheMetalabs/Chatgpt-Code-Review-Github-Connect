@@ -396,6 +396,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   findingNotes: bool("finding_precision.notes"),
   findingDedupePrior: bool("finding_precision.dedupe_prior"),
   postLatestHeadOnly: bool("finding_precision.post_latest_head_only"),
+  skipVendoredPaths: bool("finding_precision.skip_vendored"),
 };
 
 export const SETTINGS_FIELDS = Object.keys(SETTINGS_FIELD_RULES) as SettingsField[];

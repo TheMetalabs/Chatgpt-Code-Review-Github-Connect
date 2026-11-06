@@ -219,6 +219,19 @@ const LOOP_DONE_LINE = "When finished, call task_done and return the final revie
 const FORCE_FINAL_MSG =
   "Tool access has ended. Using only what you have read, return the final review JSON object now (raw JSON only).";
 
+// One last turn for a group whose final reply is not a usable review (live WalkieBoard #530/#531: the
+// whole leg failed as "local loop produced no review JSON"; #524: a group answered findings:[] with no
+// investigated_safe). No tools; the message names what was wrong with the reply.
+const GROUP_RETRY_MSG = {
+  not_json:
+    "Your last reply was not the review JSON. Using only what you have already read, reply again with ONLY the final review JSON object for this group (findings, investigated_safe, coverage, merge_recommendation). No prose, no markdown fences, no tool calls.",
+  cut_off:
+    "Your last reply was cut off at the output limit. Using only what you have already read, reply again with ONLY the final review JSON object for this group, kept short: at most 5 findings, one or two sentences per field. No prose, no markdown fences, no tool calls.",
+  not_reviewed:
+    "Your review JSON does not show this group was reviewed: it has no complete finding and no investigated_safe entry. Reply again with ONLY the final review JSON object: report each defect you confirmed as a finding with every required field (title, file, line, severity, failure_scenario, root_cause, evidence, recommended_fix, recommended_test), or list in investigated_safe each file of this group you checked and what makes it safe. No prose, no markdown fences, no tool calls.",
+} as const;
+export type GroupRetryKind = keyof typeof GROUP_RETRY_MSG;
+
 function toolDefs() {
   return [
     { type: "function", function: { name: "file_read", description: "Read a file at the PR head. Use hunk headers (@@ -x,y +m,n @@) to pick ranges; at most 400 lines per call.", parameters: { type: "object", properties: { file_path: { type: "string" }, start_line: { type: "integer" }, end_line: { type: "integer" } }, required: ["file_path"] } } },
@@ -334,6 +347,10 @@ async function reviewGroup(
   let reply: string | undefined;
   let residual = false;
   let lastPromptTokens = 0;
+  // How the last turn ended: a cut-off reply and a model that called task_done FAILED are told apart
+  // from a completed non-JSON reply for the one retry below.
+  let lastFinish: string | undefined;
+  let taskFailedOut = false;
   // Measure the cap from the ACTUAL current messages (after peer injection and every prior tool
   // output). Count tool-call arguments too (they are not in `content`), and floor the estimate at the
   // real prompt_tokens the server last reported — token-dense source can pack more than 3.5 chars/
@@ -372,6 +389,7 @@ async function reviewGroup(
     };
     const choice = res.choices?.[0];
     const msg = choice?.message ?? {};
+    lastFinish = choice?.finish_reason;
     lastPromptTokens = Number(res.usage?.prompt_tokens) || lastPromptTokens;
     const calls = msg.tool_calls ?? [];
     deps.log?.(`group[${groupPaths[0]}] iter ${iter}: finish=${choice?.finish_reason} tools=${calls.length} promptTokens=${lastPromptTokens}`);
@@ -418,16 +436,89 @@ async function reviewGroup(
     deps.onProgress?.({ ...groupMeta, iter, stage: "tool" });
     // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
     // accepting whatever JSON is around as a completed review.
-    if (taskFailed) return { raw: null };
+    if (taskFailed) { taskFailedOut = true; break; }
     if (done && finalRaw) break;
     if (done && !finalRaw) messages.push({ role: "user", content: "Now return the final review JSON object only." });
   }
-  return { raw: finalRaw, reply, residual };
+  // The model said it could not finish this group (task_done FAILED): fail it (→ not_cleared) rather
+  // than accepting whatever JSON is around as a completed review, and never ask it again.
+  if (taskFailedOut) return { raw: null };
+  const valid = finalRaw !== null && groupReviewValid(finalRaw, groupPaths, sample, settings);
+  const kind = groupRetryKind({ valid, raw: finalRaw, finish: lastFinish });
+  if (!kind) return { raw: finalRaw, reply, residual };
+
+  // Exactly one retry turn, no tools. A cut-off reply is dropped from the conversation (it is partial
+  // and would only crowd the window); so is any reply that would push the conversation past the
+  // context cap, so the retry is never larger than the turn it repeats (the 30K local window).
+  const last = messages[messages.length - 1];
+  if (last?.role === "assistant" && (kind === "cut_off" || (t.ctxCapTokens > 0 && contextTokens() > t.ctxCapTokens))) messages.pop();
+  messages.push({ role: "user", content: GROUP_RETRY_MSG[kind] });
+  deps.log?.(`group[${groupPaths[0]}] retry (${kind})`);
+  try {
+    if (deps.checkpoint) {
+      await deps.checkpoint();
+      if (deps.signal?.aborted) throw deps.signal.reason ?? new Error("local review cancelled at a turn boundary");
+    }
+    deps.onProgress?.({ ...groupMeta, iter: t.toolIterCap + 2, stage: "generating" });
+    const res = (await deps.request(settings.localLlmBaseUrl.trim().replace(/\/$/, ""), settings.localLlmApiKey.trim() || "local", "chat/completions", {
+      model: settings.localLlmModel.trim(),
+      messages,
+      ...samplingRequestFields(params),
+    }, deps.signal)) as { choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: unknown[] } }[] };
+    const choice = res.choices?.[0];
+    const content = choice?.message?.content ?? "";
+    const partial = choice?.finish_reason === "length" || choice?.finish_reason === "content_filter";
+    const toolCalls = choice?.message?.tool_calls;
+    const calls = Array.isArray(toolCalls) ? toolCalls.length : 0;
+    const json = !partial && calls === 0 ? extractChatJsonParts(content) : null;
+    deps.log?.(`group[${groupPaths[0]}] retry (${kind}): finish=${choice?.finish_reason} json=${json ? "yes" : "no"}`);
+    if (json && groupReviewValid(json.json, groupPaths, sample, settings)) {
+      // The completed reply the retry replaced may itself name a defect: a non-JSON reply, or unusable
+      // JSON with prose around it or with finding rows the gate could not use. It stays evidence
+      // (setAside), as the single-turn JSON correction keeps its first reply. Only a bare empty JSON
+      // object carries nothing to keep.
+      const keep = kind === "not_json" || (kind === "not_reviewed" && (residual || hasFindingRows(finalRaw)));
+      return { raw: json.json, reply: content.trim(), residual: Boolean(json.residual), ...(keep && reply ? { setAside: reply } : {}) };
+    }
+    // Still not a usable review: keep the first outcome (its reply stays the group's evidence), and any
+    // completed reply the retry produced as well.
+    const retryReply = !partial && calls === 0 ? content.trim() : "";
+    return { raw: finalRaw, reply: [reply, retryReply].filter(Boolean).join("\n\n---\n\n") || undefined, residual };
+  } catch (e) {
+    // An abort (deadline, cancel) is the caller's to record; any other retry failure keeps the first
+    // outcome, so the retry can never lose evidence the group already had.
+    if (deps.signal?.aborted) throw e;
+    deps.log?.(`group[${groupPaths[0]}] retry (${kind}) failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
+    return { raw: finalRaw, reply, residual };
+  }
+}
+
+/** Whether a review JSON carries any finding rows at all (usable or not). */
+function hasFindingRows(raw: string | null): boolean {
+  if (!raw) return false;
+  try {
+    const o = JSON.parse(raw) as { findings?: unknown };
+    return Array.isArray(o.findings) ? o.findings.length > 0 : Boolean(o.findings);
+  } catch {
+    return false;
+  }
+}
+
+/** Which retry, if any, a group's final outcome earns: a completed reply with no review JSON
+ * (`not_json`), a reply cut off at the output limit (`cut_off`), or review JSON that does not show the
+ * group was reviewed — no complete finding and no investigated_safe (`not_reviewed`). A content-filtered
+ * reply is not retried (the same prompt would be filtered again). */
+export function groupRetryKind(input: { valid: boolean; raw: string | null; finish?: string }): GroupRetryKind | undefined {
+  if (input.valid) return undefined;
+  if (input.finish === "content_filter") return undefined;
+  if (input.finish === "length") return "cut_off";
+  return input.raw === null ? "not_json" : "not_reviewed";
 }
 
 /** One group's review JSON (null when none completed), its last completed terminal reply, and
- * whether that reply carried text outside the review JSON taken from it. */
-type GroupReview = { raw: string | null; reply?: string; residual?: boolean };
+ * whether that reply carried text outside the review JSON taken from it. `setAside`: a completed reply
+ * the group's retry replaced — evidence, so the leg's JSON is not its complete verdict. */
+type GroupReview = { raw: string | null; reply?: string; residual?: boolean; setAside?: string };
 
 function injectNewPeers(messages: Msg[], deps: LocalReviewDeps, injected: Set<string>): void {
   const peers = deps.peerReported?.() ?? [];
@@ -639,7 +730,7 @@ export async function runLocalReviewLoop(
       // a transient request/tool failure late in a long multi-group run must not discard the groups
       // already reviewed. Keep their findings and move on; track failed groups for coverage reporting.
       try {
-        const { raw, reply, residual } = await reviewGroup(sample, group, settings, { ...deps, request }, t, { group: i + 1, groups: groups.length });
+        const { raw, reply, residual, setAside } = await reviewGroup(sample, group, settings, { ...deps, request }, t, { group: i + 1, groups: groups.length });
         // A group counts as reviewed only if its result is a valid review — it must actually say
         // something (findings, or investigated_safe for its files), the same rule the downstream gate
         // applies. A null return (prose/truncated) or an empty `{"findings":[]}` with no
@@ -647,6 +738,7 @@ export async function runLocalReviewLoop(
         // can never make the leg look like a clean full pass. One authoritative check, not per-shape.
         if (raw && groupReviewValid(raw, group, sample, settings)) {
           raws.push(raw);
+          if (setAside) unparsed.push(`Review group (${group.join(", ")}):\n${setAside}`);
           // Text the model wrote around the group's JSON is not in the merged result: kept verbatim.
           if (residual && reply) residualReplies.push(`Review group (${group.join(", ")}):\n${reply}`);
         } else {

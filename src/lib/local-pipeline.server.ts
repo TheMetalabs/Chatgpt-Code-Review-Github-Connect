@@ -50,7 +50,12 @@ const SEVERITY_RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2 };
 /** Candidates verified per review, most severe first. More are left unverified and never posted. */
 export const MAX_VERIFIED_CANDIDATES = 16;
 /** Findings one candidate turn (one feature, one lens) may report. */
+/** Candidates a feature turn may report: a whole-PR turn gets the full cap; one feature of a larger PR a
+ * smaller one, so a PR with many features does not produce far more candidates than can be verified
+ * (each one costs output tokens and a verify turn). */
 const FEATURE_FINDINGS_CAP = 6;
+const PART_FINDINGS_CAP = 3;
+export const featureFindingsCap = (whole: boolean) => (whole ? FEATURE_FINDINGS_CAP : PART_FINDINGS_CAP);
 
 function envNum(key: string, dflt: number): number {
   const raw = typeof process !== "undefined" ? process.env?.[key] : undefined;
@@ -390,6 +395,8 @@ export const HUNT_INSTRUCTIONS = [
   "Your job is to FIND defects in this change. Every candidate you report is checked afterwards by a separate verifier against the code, so do not hold back a defect because you could not fully prove it here: report each one you can tie to a changed line, with that line quoted verbatim.",
   "A defect is code in this change that behaves wrongly: wrong or lost data, a crash or unhandled error, a security or permission hole, a broken contract with its callers, its callee or its tests, or a failure path that leaves bad state.",
   "For each finding: file is a changed file; line is a RIGHT-side changed line (or the nearest one); failure_scenario is a concrete input or sequence and what goes wrong; evidence quotes the code (path:line `code`) of the cause and of where it fails.",
+  "Tie each finding to a line this diff adds or changes (a '+' line) and quote it. Never say what a line was or that it changed from something unless that '-' line is in the diff.",
+  "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
   "coverage: one entry per changed code file you read. If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
@@ -398,9 +405,9 @@ export const HUNT_INSTRUCTIONS = [
 /** What each candidate pass looks at hardest (Settings local_review.pipeline_lenses). A small model finds
  * more with a narrow question than with "review everything"; the passes' candidates are merged. */
 export const LENSES = {
-  failure: "Focus: failure paths. Follow every error, rejection, catch, early return, retry and async step the change adds or touches: what state is left behind when it fails half way (a stale or partly updated record, a cache or profile that is reused after a failed refresh, an unawaited promise, a missing rollback)?",
+  failure: "Focus: failure paths. Follow every error, rejection, catch, early return, retry and async step the change adds or touches: what state is left behind when it fails half way (a stale or partly updated record, a cache or profile that is reused after a failed refresh, an async task or callback whose failure is never observed, a missing rollback)?",
   data: "Focus: data identity and invariants. Keys and uniqueness (two different items that collide on the same key or display value), null/undefined/empty values, boundaries and off-by-one, units, time zones and dates, type coercion, ordering assumptions.",
-  contract: "Focus: contracts. Does each changed piece agree with what calls it and what it calls: argument and return shapes, HTTP status codes and response bodies, a test's expected values versus the implementation, schema/migration versus entity, permission and validation checks, flags and config?",
+  contract: "Focus: contracts. Does each changed piece agree with what calls it and what it calls: argument and return shapes, status codes, error values and response bodies, a test's expected values versus the implementation, schema/migration versus entity, permission and validation checks, flags and config?",
   general: "Look at failure paths, data identity and invariants, and the contracts between the changed code, its callers and its tests.",
 } as const;
 export type LensName = keyof typeof LENSES;
@@ -409,6 +416,42 @@ export type LensName = keyof typeof LENSES;
 export function lensesFor(n: number): LensName[] {
   const k = Math.max(1, Math.min(3, Math.floor(Number(n) || 3)));
   return k === 1 ? ["general"] : (["failure", "data", "contract"] as LensName[]).slice(0, k);
+}
+
+/** Per-language semantics a small model gets wrong when it carries over another language's habits
+ * (for example a TypeScript "TaskCancelledError" in Swift). Keyed by file extension. */
+const LANGUAGE_NOTES: { exts: string[]; name: string; note: string }[] = [
+  {
+    exts: ["swift"], name: "Swift",
+    note: "Swift: only a `throws` function or a `Task<_, Error>` can throw, and only at a `try`; `Task<_, Never>.value` never throws, and a cancelled task still runs to its end (cancellation is cooperative: `Task.isCancelled`, `CancellationError`). `try?` deliberately turns an error into nil. `defer` runs on every exit. Structs and enums are values (copied); classes and actors are references; actor and @MainActor code runs isolated. Optionals are checked with `if let` / `guard let` / `?.`; `!` force-unwraps.",
+  },
+  {
+    exts: ["kt", "kts"], name: "Kotlin",
+    note: "Kotlin: exceptions are unchecked; a nullable type (T?) must be checked before use, `!!` throws. Coroutine cancellation is cooperative and throws CancellationException at suspension points; `runCatching` and `?.let` swallow or skip deliberately.",
+  },
+  {
+    exts: ["ts", "tsx", "js", "jsx", "mjs", "cjs"], name: "TypeScript/JavaScript",
+    note: "TypeScript/JavaScript: a promise that is not awaited or returned loses its rejection; `?.` and `??` already handle null/undefined; `async` functions return promises; array methods do not mutate unless named so (push, splice, sort).",
+  },
+  {
+    exts: ["py"], name: "Python",
+    note: "Python: exceptions propagate unless caught; mutable default arguments are shared; `with` closes resources on every exit; `is` compares identity, `==` equality.",
+  },
+  {
+    exts: ["go"], name: "Go",
+    note: "Go: errors are returned values and are lost only when ignored (`_`); `defer` runs at function exit; a nil map read is safe but a write panics; goroutines need explicit synchronization.",
+  },
+  {
+    exts: ["rs"], name: "Rust",
+    note: "Rust: `?` returns the error to the caller; `unwrap`/`expect` panic; the borrow checker already rules out data races in safe code.",
+  },
+];
+
+/** The LANGUAGE_NOTES for the languages of `paths`, as one block (empty when none applies). */
+export function languageNotes(paths: string[]): string {
+  const exts = new Set(paths.map((p) => /\.([A-Za-z0-9]+)$/.exec(p)?.[1]?.toLowerCase() ?? ""));
+  const notes = LANGUAGE_NOTES.filter((l) => l.exts.some((e) => exts.has(e))).map((l) => l.note);
+  return notes.length ? `<<<LANGUAGE_NOTES>>>\n${notes.join("\n")}\n<<<END>>>` : "";
 }
 
 type GroupOutcome = { files: string[]; raw: string | null; replies: string[] };
@@ -433,9 +476,10 @@ async function reviewFeature(
       ? "Review the whole change of this pull request."
       : `Review only these files, one feature of this PR: ${files.join(", ")}.\nPR_MAP summarizes every other changed file of this PR; their code is not shown here. Use it to know what the rest of the change does (for example a guard or migration added in another file).`,
     LENSES[lens],
-    `Report at most ${FEATURE_FINDINGS_CAP} findings${whole ? "" : " for these files"}, the most severe first.`,
+    `Report at most ${featureFindingsCap(whole)} findings${whole ? "" : " for these files"}, the most severe first.`,
     "<<<END>>>",
-  ].join("\n");
+    languageNotes(files),
+  ].filter(Boolean).join("\n");
   const built = buildChatParts({
     sample: sub,
     extra,
@@ -491,7 +535,27 @@ async function reviewFeature(
 export type Candidate = Finding & { cid: string; group: number };
 
 const VERIFY_SYSTEM =
-  "You are a senior code reviewer. You verify ONE defect another reviewer reported, against the code and docs shown. Reply with the raw JSON object only — no markdown fences, no prose.";
+  "You are a senior code reviewer who checks another reviewer's reports for mistakes. You judge ONE reported defect against the code and docs shown. Reply with the raw JSON object only — no markdown fences, no prose.";
+
+/** The verifier's fixed instructions. They come first in the request, before the candidate and its
+ * evidence, so every verify turn starts with the same text (a server that caches a shared prompt
+ * prefix reuses it). The reply puts the trace before the verdict: a model without a thinking phase
+ * decides as it writes, so it must follow the code before it commits to an answer. */
+export const VERIFY_RULES = [
+  "Your task: find out whether the reported defect is REAL. Most reported candidates are false: the reviewer misread the code, assumed another language's behaviour, missed a guard or a handler, or described a change this PR does not make. Look for the reason the report is wrong before you accept it.",
+  "Before you answer, check each of these against the evidence:",
+  "1. Is the cited line changed by this PR? Read DIFF. A claim about what a line \"was\" or that it \"changed from\" something must match a '-' line there; if DIFF says the line is not changed, a defect said to be introduced there is refuted.",
+  "2. Does the declared type or signature allow the failure? A non-throwing function or task cannot throw; a non-optional value cannot be nil; follow LANGUAGE_NOTES.",
+  "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing.",
+  "4. Does a doc comment next to the code, MODULE_DOCS or the PR description state this behaviour as intended? Intended behaviour is not a defect.",
+  "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
+  "Verdicts:",
+  "- refuted: something shown prevents or explains it (one of the checks above), or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
+  "- confirmed: you followed the failure scenario through the code shown, step by step, from the changed code to an observable failure, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE.",
+  "- uncertain: the deciding code is not shown, or you could not follow the scenario through the code. When in doubt, answer uncertain, never confirmed.",
+  "Severity (confirmed only): P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
+  'Reply with ONLY this JSON, fields in this order: {"trace":"2-3 sentences: what the code shown does on the reported scenario, step by step","blocking_code":"for refuted: the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: the failing code, verbatim; else empty","severity":"P0"|"P1"|"P2"}',
+].join("\n");
 
 function gutter(path: string, lines: string[], from: number, to: number): string {
   const a = Math.max(1, from);
@@ -515,12 +579,30 @@ export function namedSymbols(f: Pick<Finding, "title" | "rootCause" | "evidence"
 }
 
 const DEF_RE = (name: string) =>
-  new RegExp(`(?:\\b(?:function|class|interface|type|enum|const|let|var|def)\\s+${name}\\b)|(?:^\\s*(?:(?:public|private|protected|static|async|readonly|override|export|get|set)\\s+)*${name}\\s*[(<:=])`);
+  new RegExp(`(?:\\b(?:function|func|fun|fn|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum|const|let|var|val|def)\\s+${name}\\b)|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub)\\s+)*${name}\\s*[(<:=])`);
+
+/** The diff hunk of `file` that covers RIGHT-side `line`, or a note that the line is not changed by
+ * this PR (so a claim about what the line "was" can be checked against what really changed). */
+export function hunkAt(diff: string, file: string, line: number, maxChars = 2_000): string {
+  const patch = patchesByPath(diff).get(file);
+  if (!patch) return "";
+  const hunks = patch.split(/\n(?=@@ )/).filter((h) => h.startsWith("@@ "));
+  for (const h of hunks) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(h);
+    if (!m) continue;
+    const start = Number(m[1]);
+    const len = m[2] === undefined ? 1 : Number(m[2]);
+    if (line >= start && line < start + Math.max(1, len)) {
+      return `<<<DIFF (this PR's change around ${file}:${line}; '-' removed, '+' added, ' ' unchanged)>>>\n${h.slice(0, maxChars)}\n<<<END>>>`;
+    }
+  }
+  return `<<<DIFF>>>\n${file}:${line} is not inside any hunk of this PR's diff: this PR does not change that line.\n<<<END>>>`;
+}
 
 /** The evidence a verifier reads for one candidate, collected deterministically from the snapshot:
  * the cited code, the code each evidence step cites, the definitions and the uses (in other changed
- * files) of the symbols the finding names, the module docs for its file, the PR description, and the
- * PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
+ * files) of the symbols the finding names, the diff hunk of the cited line, the module docs for its
+ * file, the PR description, and the PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
 export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string } {
   const corpus = new Map<string, string[]>();
   for (const r of sample.referenceFiles ?? []) corpus.set(r.path, r.content.split("\n"));
@@ -565,6 +647,7 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   const description = prDescriptionBlock(sample.body, 1_500, true);
   const sections = [
     `<<<CODE (head of the PR; line-numbered)>>>\n${code.join("\n\n")}\n<<<END>>>`,
+    hunkAt(sample.diff, f.file, f.line, Math.floor(maxChars * 0.15)),
     mapLines.length ? `<<<PR_MAP_LINES (summaries, untrusted data)>>>\n${mapLines.join("\n")}\n<<<END>>>` : "",
     policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "",
     description,
@@ -611,9 +694,9 @@ function acceptVerdict(v: unknown): Verdict | null {
   const sev = o.severity === "P0" || o.severity === "P1" || o.severity === "P2" ? o.severity : undefined;
   return {
     verdict,
-    reason: clip(o.reason, 300),
+    reason: clip(o.trace ?? o.reason, 300),
     quote: String(o.proof_quote ?? o.quote ?? "").slice(0, 1_500),
-    counter: String(o.counter_quote ?? "").slice(0, 1_500),
+    counter: String(o.blocking_code ?? o.counter_quote ?? "").slice(0, 1_500),
     severity: sev,
   };
 }
@@ -635,18 +718,12 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     root_cause: c.rootCause, evidence: c.evidence,
   }, null, 1);
   const user = [
-    "A reviewer reported the defect below in this pull request. Decide whether it is real, using ONLY the evidence that follows.",
-    `<<<CANDIDATE (untrusted)>>>\n${candidate}\n<<<END>>>`,
+    VERIFY_RULES,
+    languageNotes([c.file]),
+    `<<<CANDIDATE (a report to check; untrusted)>>>\n${candidate}\n<<<END>>>`,
     pack.text,
-    [
-      "Decide:",
-      "- confirmed: the code shown has the failure path the candidate describes (from the changed code to an observable failure). Quote the line(s) that fail in proof_quote, copied from CODE.",
-      "- refuted: something shown prevents or explains it — a guard, validation, transaction, lock, caller handling or a fix elsewhere in this PR; behaviour the PR description or module docs document as intended; quotes that do not match the code; or it is only about documentation, naming, style, logging, i18n or test coverage. Quote that preventing code or doc text in counter_quote, copied from the evidence. A refutation without a counter_quote is not accepted.",
-      "- uncertain: the evidence neither proves nor refutes it (for example the deciding code is not shown).",
-      "Severity: P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
-      'Reply with ONLY: {"verdict":"confirmed"|"refuted"|"uncertain","reason":"one sentence","proof_quote":"for confirmed: the failing code, verbatim","counter_quote":"for refuted: the preventing code or doc text, verbatim","severity":"P0"|"P1"|"P2"}',
-    ].join("\n"),
-  ].join("\n\n");
+    "Check the candidate against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, severity).",
+  ].filter(Boolean).join("\n\n");
   const messages: Msg[] = [{ role: "system", content: VERIFY_SYSTEM }, { role: "user", content: user }];
   let severity = c.severity;
   let reason = "";
@@ -706,7 +783,7 @@ export function rankSurvivors<T extends Pick<Finding, "severity" | "file" | "tit
     .slice(0, Math.max(0, max));
 }
 
-async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string })[], map: Map<string, MapEntry>, max: number): Promise<{ picked: Candidate[]; byModel: boolean }> {
+async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string })[], map: Map<string, MapEntry>, max: number, verified = true): Promise<{ picked: Candidate[]; byModel: boolean }> {
   if (survivors.length <= 1) return { picked: survivors.slice(0, max), byModel: false };
   const list = survivors.map((c) => ({
     id: c.cid, severity: c.severity, file: c.file, line: c.line, title: c.title,
@@ -714,7 +791,9 @@ async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: 
   }));
   const user = [
     renderPrMap(map, Math.floor(ctx.promptChars * 0.4), new Set(survivors.map((c) => c.file))),
-    `<<<CONFIRMED_FINDINGS (each one verified against the code)>>>\n${JSON.stringify(list, null, 1)}\n<<<END>>>`,
+    verified
+      ? `<<<CONFIRMED_FINDINGS (each one verified against the code)>>>\n${JSON.stringify(list, null, 1)}\n<<<END>>>`
+      : `<<<CANDIDATE_FINDINGS (NOT verified: the verifier could not judge them)>>>\n${JSON.stringify(list, null, 1)}\n<<<END>>>`,
     `Choose the findings a senior reviewer would ask the author to fix in this PR: at most ${max}, most important first. Two findings with the same root cause are duplicates: keep the clearer one only. You may lower a severity, never raise it.`,
     'Reply with ONLY: {"selected":[{"id":"c1","severity":"P1"}]}',
   ].join("\n\n");
@@ -757,12 +836,12 @@ function toRow(f: Finding): Record<string, unknown> {
 }
 
 export type PipelineStats = {
-  mapTurns: number; groups: number; lenses: number; failedGroups: number; candidates: number; gated: number; softGated: number;
+  mapTurns: number; groups: number; lenses: number; minutes?: number; failedGroups: number; candidates: number; gated: number; softGated: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
 };
 
 export function pipelineSummary(s: PipelineStats): string {
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${s.failedGroups} failed)` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns)`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${s.failedGroups} failed)` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
 }
 
 function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): Ctx {
@@ -833,10 +912,19 @@ async function refuteAndSelect(
     }
   }
   for (const c of overCap) survivors.push({ ...c, verifyReason: "not verified (over the verify cap)", verified: false });
-  const { picked } = await selectFindings(ctx, survivors, map, max);
+  // A candidate the verifier never judged competes for a posting slot only when nothing was verified:
+  // next to verified findings it is the least reliable kind (on WalkieBoard #566, 40 of 56 candidates
+  // were past the cap). With none verified it is kept as reported (a failure never becomes a clean result).
+  const judged = survivors.filter((c) => c.verified);
+  const pool = judged.length ? judged : survivors;
+  const { picked } = await selectFindings(ctx, pool, map, max, judged.length > 0);
   stats.posted = picked.length;
   const unjudged = unverifiedPosted + overCap.length;
-  const assumptions = unjudged ? [`${unjudged} local candidate finding(s) could not be verified and are kept as reported`] : [];
+  const assumptions = !unjudged
+    ? []
+    : judged.length
+      ? [`${unjudged} local candidate finding(s) could not be verified (verify cap or a failed verify turn) and are not posted next to the verified ones`]
+      : [`${unjudged} local candidate finding(s) could not be verified and are kept as reported`];
   const verifiedIds = new Set(survivors.filter((c) => c.verified).map((c) => c.cid));
   const verifiedKeys = picked.filter((c) => verifiedIds.has(c.cid)).map((c) => verifiedKey(c));
   return { findings: picked, assumptions, verifiedKeys };
@@ -951,7 +1039,8 @@ export type PipelineLegResult = LocalLegResult & { pipelineSummary?: string; ver
 export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSettings, deps: LocalReviewDeps): Promise<PipelineLegResult> {
   const t = tuning();
   const ctx = makeCtx(settings, deps, t);
-  const lenses = lensesFor(settings.localPipelineLenses);
+  const startedAt = Date.now();
+  let lenses = lensesFor(settings.localPipelineLenses);
   const stats: PipelineStats = { mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
@@ -970,6 +1059,10 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
       groups = featureGroups(sample, budget);
     }
     stats.groups = groups.length;
+    // Focused lens passes multiply the candidate turns; they are for a PR reviewed in one turn (where a
+    // small model misses most). A PR split into features gets one combined pass per feature.
+    if (!whole) lenses = ["general"];
+    stats.lenses = lenses.length;
     deps.log?.(`local pipeline: ${groups.length} feature group(s) × ${lenses.length} lens(es) over ${sample.changedPaths.length} changed file(s)${whole ? " (whole PR in one turn)" : ""}`);
     let n = 0;
     const next = () => `c${(n += 1)}`;
@@ -1020,6 +1113,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     stats.gated = unique.length;
     const { findings, assumptions: verifyNotes, verifiedKeys } = await refuteAndSelect(ctx, sample, unique, map, stats);
     stats.turns = ctx.turns;
+    stats.minutes = Math.round((Date.now() - startedAt) / 60_000);
     const unreviewed = [...new Set([...failed, ...reportedUnreviewed, ...unreviewablePaths(sample)])];
     for (const file of unreviewed) {
       const reason = failed.includes(file) ? "feature review failed" : reportedUnreviewed.includes(file) ? "the reviewer reported it unreviewed" : "no usable diff";

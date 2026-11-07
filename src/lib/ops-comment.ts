@@ -78,6 +78,8 @@ ${attempt}`;
 }
 
 const NOTE_MAX_CHARS = 200;
+/** The local pipeline's summary line (local-pipeline.server.ts pipelineSummary). */
+const PIPELINE_PREFIX = "Local pipeline: ";
 
 /** The ops line for paths .gitattributes kept out of the review (Settings skipVendoredPaths). */
 export function vendoredSkippedNote(v: { count: number; paths: string[] }): string {
@@ -128,5 +130,7 @@ export function reviewPostedNotes(
   }
   // The finding gate's per-reason counts (finding-gate.ts): what it kept, routed to notes, and dropped.
   if (job.gateStats) notes.push(gateStatsLine(job.gateStats));
-  return notes.map((n) => (n.startsWith(COVERAGE_MODEL_PREFIX) || n.startsWith(GATE_PREFIX) ? n : n.slice(0, NOTE_MAX_CHARS))).slice(0, MAX_NOTES);
+  // Ashlar's own bounded count lines are shown whole (a cut "(84 tu" loses the turn count).
+  const whole = (n: string) => n.startsWith(COVERAGE_MODEL_PREFIX) || n.startsWith(GATE_PREFIX) || n.startsWith(PIPELINE_PREFIX);
+  return notes.map((n) => (whole(n) ? n : n.slice(0, NOTE_MAX_CHARS))).slice(0, MAX_NOTES);
 }

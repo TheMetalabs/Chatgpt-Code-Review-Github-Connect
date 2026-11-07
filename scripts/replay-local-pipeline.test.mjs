@@ -21,8 +21,8 @@ test("replay: runs the pipeline on a snapshot with the configured local model an
       const sys = body.messages?.[0]?.content ?? "";
       const content = sys.startsWith("You summarize")
         ? JSON.stringify({ files: [{ file: "a.ts", summary: "changes answer", guards: [], effects: [] }] })
-        : /You verify ONE defect/.test(sys)
-          ? (/judged false positive/.test(body.messages[1].content.split("<<<END>>>")[0])
+        : /You judge ONE reported defect/.test(sys)
+          ? (/judged false positive/.test((/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? ""))
             ? JSON.stringify({ verdict: "refuted", reason: "documented", counter_quote: "export const answer = 42;" })
             : JSON.stringify({ verdict: "confirmed", reason: "real", proof_quote: "export const answer = 42;", severity: "P1" }))
           : JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: ["a.ts: read"], findings: [finding("answer judged valid off by one", 1), finding("answer judged false positive rename", 1)] });

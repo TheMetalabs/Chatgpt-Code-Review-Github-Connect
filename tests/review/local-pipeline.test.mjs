@@ -15,6 +15,9 @@ import {
   HUNT_INSTRUCTIONS,
   LENSES,
   lensesFor,
+  hunkAt,
+  languageNotes,
+  VERIFY_RULES,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -65,7 +68,7 @@ const msg = (content, finish = "stop") => ({ choices: [{ finish_reason: finish, 
 const stageOf = (body) => {
   const sys = body.messages[0].content;
   if (sys.startsWith("You summarize")) return "map";
-  if (/You verify ONE defect/.test(sys)) return "verify";
+  if (/You judge ONE reported defect/.test(sys)) return "verify";
   if (sys.startsWith("You rank")) return "select";
   return "review";
 };
@@ -161,7 +164,7 @@ test("pipeline: a refuted candidate is never posted; a confirmed one is, with th
       "src/orders/orders.controller.ts": [F()],
       "src/mail/mailer.ts": [F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", root_cause: "`queue` is undefined", failure_scenario: "sendMail throws." })],
     }),
-    verify: (body) => (/sendMail/.test(body.messages[1].content.split("<<<END>>>")[0]) ? refute(body) : confirm()),
+    verify: (body) => (/sendMail/.test((/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? "")) ? refute(body) : confirm()),
   });
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.equal(out.ok, true, out.error);
@@ -351,7 +354,7 @@ test("whole PR: a PR that fits one turn is reviewed in one turn per lens with no
         merge_recommendation: "REQUEST_CHANGES", investigated_safe: ["src/mail/mailer.ts: unchanged behaviour"], assumptions: ["A1"],
         findings: [F(), F({ title: "charge ignores currency", line: 2 })], coverage: [{ file: "src/orders/orders.controller.ts", status: "cleared", reason: "r" }],
       }),
-      verify: (b) => (/currency/.test(b.messages[1].content.split("<<<END>>>")[0]) ? refute(b) : confirm()),
+      verify: (b) => (/currency/.test((/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")) ? refute(b) : confirm()),
     });
     const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
     assert.equal(m.count.map, undefined, "no PR map for a PR the turn sees whole");
@@ -405,27 +408,37 @@ test("recall: candidate turns get the hunt instructions, not the chat precision 
   assert.match(turn, /do not hold back a defect because you could not fully prove it here/);
 });
 
-test("recall: three lens passes per feature, each with its own focus; the same defect from two lenses is verified once", async () => {
+test("recall: a PR reviewed in one turn gets three lens passes, each with its own focus; the same defect from two lenses is verified once", async () => {
   assert.deepEqual(lensesFor(3), ["failure", "data", "contract"]);
   assert.deepEqual(lensesFor(1), ["general"]);
-  const m = model({
-    map: mapReply,
-    review: (body) => {
-      const text = body.messages[1].content;
-      const lens = text.includes(LENSES.failure) ? "failure" : text.includes(LENSES.data) ? "data" : "contract";
-      const files = groupOf(body);
-      if (!files.includes("src/orders/orders.controller.ts")) return reviewFor({})(body);
-      const rows = lens === "data" ? [F({ title: "negative amount charged by create" }), F({ title: "currency mismatch currencyq", line: 2 })] : [F()];
-      return JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: files.map((f) => `${f}: read`), findings: rows });
-    },
-    verify: () => confirm(),
+  await wholePr(async () => {
+    const m = model({
+      review: (body) => {
+        const text = body.messages[1].content;
+        const lens = text.includes(LENSES.failure) ? "failure" : text.includes(LENSES.data) ? "data" : "contract";
+        const files = groupOf(body);
+        const rows = lens === "data" ? [F({ title: "negative amount charged by create" }), F({ title: "currency mismatch currencyq", line: 2 })] : [F()];
+        return JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: files.map((f) => `${f}: read`), findings: rows });
+      },
+      verify: () => confirm(),
+    });
+    const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineLenses: 3 }, { request: m.request });
+    const reviews = m.bodies.filter((b) => stageOf(b) === "review");
+    assert.equal(reviews.length, 3, "1 whole-PR turn × 3 lenses");
+    for (const focus of Object.values(LENSES).slice(0, 3)) assert.ok(reviews.some((b) => b.messages[1].content.includes(focus)));
+    assert.equal(m.count.verify, 2, "the charge defect from three lenses is one candidate, the currency one another");
+    assert.match(out.pipelineSummary, /× 3 lens\(es\)/);
   });
+});
+
+test("speed: a PR split into features gets one combined pass per feature, whatever the lens setting", async () => {
+  const m = model({ map: mapReply, review: reviewFor({}), verify: () => confirm() });
   const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineLenses: 3 }, { request: m.request });
   const reviews = m.bodies.filter((b) => stageOf(b) === "review");
-  assert.equal(reviews.length, 6, "2 features × 3 lenses");
-  for (const focus of Object.values(LENSES).slice(0, 3)) assert.ok(reviews.some((b) => b.messages[1].content.includes(focus)));
-  assert.equal(m.count.verify, 2, "the charge defect from three lenses is one candidate, the currency one another");
-  assert.match(out.pipelineSummary, /× 3 lens\(es\)/);
+  assert.equal(reviews.length, 2, "2 features × 1 pass, not × 3");
+  assert.ok(reviews.every((b) => b.messages[1].content.includes(LENSES.general)));
+  assert.ok(reviews.every((b) => /Report at most 3 findings for these files/.test(b.messages[1].content)), "a feature of a larger PR asks for at most 3");
+  assert.match(out.pipelineSummary, /2 feature group\(s\) × 1 lens\(es\)/);
 });
 
 test("recall: a hedged candidate the gate would drop goes to the verifier, and a confirmed one survives the downstream gate", async () => {
@@ -521,3 +534,81 @@ test("codex #181: a hedged style remark is not rescued to the verifier; it stays
   assert.equal(m.count.verify ?? 0, 0);
   assert.equal(out.verifiedKeys, undefined);
 });
+
+// ── Speed and precision on a large Swift PR (2026-11-07: WalkieBoard #566 took 2–4.5 h for 84–87 turns and
+// posted 5 false positives of 9; 4 of them carried "Verified against the code") ──
+
+test("precision: next to verified findings, a candidate the verifier never judged is not posted (and is counted)", async () => {
+  const names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo"];
+  const many = names.map((w, i) => F({ title: `${w} ${w}q`, line: 1 + i, severity: "P2" }));
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": many }),
+    verify: (body) => (/alpha alphaq/.test(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? "") ? confirm() : refute(body)),
+  });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: 8 }, { request: m.request });
+  const review = JSON.parse(out.raw);
+  assert.deepEqual(review.findings.map((f) => f.title), ["alpha alphaq"], "the two over the cap are not posted next to the verified one");
+  assert.match(review.assumptions.join("\n"), /2 local candidate finding\(s\) could not be verified .* not posted next to the verified ones/);
+  assert.match(out.pipelineSummary, /2 over the verify cap, 1 posted/);
+});
+
+test("verifier prompt: fixed rules first (a shared prefix), the five checks, and the trace before the verdict", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const turns = m.bodies.filter((b) => stageOf(b) === "verify").map((b) => b.messages[1].content);
+  assert.ok(turns.length >= 1);
+  for (const t of turns) assert.ok(t.startsWith(VERIFY_RULES), "every verify turn starts with the same fixed text");
+  assert.match(VERIFY_RULES, /Most reported candidates are false/);
+  for (const check of [/Is the cited line changed by this PR\?/, /declared type or signature/, /handled elsewhere/, /stated as intended|state this behaviour as intended/, /work it through with concrete values/]) assert.match(VERIFY_RULES, check);
+  assert.ok(VERIFY_RULES.indexOf('"trace"') < VERIFY_RULES.indexOf('"verdict"'), "the reply reasons before it decides");
+  assert.match(VERIFY_RULES, /When in doubt, answer uncertain, never confirmed/);
+});
+
+test("verifier: a refutation in the new shape (trace + blocking_code from the DIFF) is accepted", async () => {
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F()] }),
+    verify: () => JSON.stringify({ trace: "The line is unchanged context; the report describes a change this PR does not make.", blocking_code: "export function create(req) {", verdict: "refuted", proof_quote: "", severity: "P2" }),
+  });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 0);
+  assert.match(out.pipelineSummary, /0 confirmed, 1 refuted/);
+});
+
+test("evidence: the cited line's diff hunk is shown, or that the PR does not change the line", () => {
+  const diff = "--- App/Storage.swift\n@@ -10,3 +10,3 @@\n /// Conversations live under Conversations/.\n-/// was Conversation/\n+/// lives in Conversations/\n static let folderName = \"Conversations\"";
+  assert.match(hunkAt(diff, "App/Storage.swift", 11), /'-' removed, '\+' added[\s\S]*-\/\/\/ was Conversation\//);
+  assert.match(hunkAt(diff, "App/Storage.swift", 40), /App\/Storage\.swift:40 is not inside any hunk of this PR's diff: this PR does not change that line/);
+  assert.equal(hunkAt(diff, "Other.swift", 1), "");
+});
+
+test("evidence: Swift definitions are found (func / var / struct), so the verifier sees the helper a finding names", () => {
+  const files = { "App/ConversationModel.swift": "final class ConversationModel {\n  private var catchUp: Task<Void, Never>?\n  func stopCatchUp() {\n    catchUp?.cancel()\n  }\n}\n" };
+  // The helper is not changed by the PR: only the definition search can find it.
+  const s = sample(files, { referenceFiles: [{ path: "App/AudioSessionUsers.swift", content: "struct AudioSessionUsers {\n  var count = 0\n  mutating func endSession(_ user: User) {\n    deactivateWhenIdle()\n  }\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P1", file: "App/ConversationModel.swift", line: 3, side: "RIGHT", title: "`endSession` leaves the audio session on", failureScenario: "x", rootCause: "`AudioSessionUsers` never deactivates", evidence: "App/ConversationModel.swift:3 `func stopCatchUp() {`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /App\/AudioSessionUsers\.swift[\s\S]*mutating func endSession/);
+  assert.match(pack.text, /<<<DIFF \(this PR's change around App\/ConversationModel\.swift:3;/, "the verifier also sees what the PR changed at the cited line");
+});
+
+test("language notes: a Swift change gets the Swift semantics in its candidate turn and its verify turn", async () => {
+  assert.match(languageNotes(["App/A.swift", "README.md"]), /Task<_, Never>\.value` never throws/);
+  assert.equal(languageNotes(["README.md"]), "");
+  const files = { "App/ConversationModel.swift": "final class ConversationModel {\n  func stop() {\n    catchUp?.cancel()\n  }\n}\n" };
+  const swiftF = F({ file: "App/ConversationModel.swift", line: 3, title: "stop crashes on a cancelled catch-up", evidence: "App/ConversationModel.swift:3 `catchUp?.cancel()`" });
+  await wholePr(async () => {
+    const m = model({ review: () => JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: [swiftF] }), verify: () => confirm("catchUp?.cancel()") });
+    await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    const review = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+    const verify = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+    for (const t of [review, verify]) assert.match(t, /<<<LANGUAGE_NOTES>>>[\s\S]*Swift:/);
+  });
+});
+
+test("candidate prompt: a finding is tied to a '+' line; no claim about what a line was without its '-' line", () => {
+  assert.match(HUNT_INSTRUCTIONS, /a line this diff adds or changes \(a '\+' line\)/);
+  assert.match(HUNT_INSTRUCTIONS, /Never say what a line was or that it changed from something unless that '-' line is in the diff/);
+});
+

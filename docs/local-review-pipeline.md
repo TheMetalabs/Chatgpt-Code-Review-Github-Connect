@@ -118,6 +118,13 @@ Measured on #566's real diff with a mock model (turns and prompt characters; qua
 
 Production adds retry turns on top (84–87 turns before).
 
+**Prompt prefix cache.** The local server (oMLX) reuses the KV cache of a prompt prefix it has already processed; on 2026-11-07 a request reused 8,192 of its 12,512 input tokens. The turns are ordered so that a PR's turns share as long a beginning as possible:
+
+- a verify turn: the fixed `VERIFY_RULES`, then the PR description and the PR's changed docs (the same for every candidate), then the language notes, the candidate and its own evidence;
+- a feature turn of a split PR: the instructions, PR description and reply shape (no per-feature `Changed:` line; FEATURE_GROUP names the files), then the repository rules, then the capped changed non-code files, then the feature's own code context, diff, PR map and feature block.
+
+On #566's diff the prefix a turn shares with an earlier one went from 86K to 325K chars (7% → 28% of all prompt text, before the PR description is counted). A whole-PR turn keeps the usual order.
+
 The verify turn now starts with its fixed rules, so every verify request shares the same prefix; a local server with prompt (prefix) caching reuses it. The ops line adds the elapsed minutes, for example `… 5 posted (41 turns, 52 min)`, and is no longer cut at 200 characters.
 
 ## Settings

@@ -491,16 +491,26 @@ async function reviewFeature(
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
     prChangedPaths: sample.changedPaths,
+    nonCodeFirst: !whole,
     localBudget: {
       maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + 8, shrinkContext: true,
       ...(whole ? {} : { nonCodeMaxChars: PART_NON_CODE_MAX_CHARS }),
     },
   });
   // The hunt instructions replace the chat review rules (shorter, so the fitted budget still holds).
-  const prompt = built.prompt.includes(REVIEW_INSTRUCTIONS)
+  const hunted = built.prompt.includes(REVIEW_INSTRUCTIONS)
     ? built.prompt.replace(REVIEW_INSTRUCTIONS, HUNT_INSTRUCTIONS)
     : `${HUNT_INSTRUCTIONS}\n\n${built.prompt}`;
-  const attach = built.files.map((f) => `<<<ATTACH:${f.name}>>>\n${f.body}\n<<<END_ATTACH>>>`).join("\n\n");
+  // Every feature turn of a PR starts with the same text (instructions, PR description, reply shape,
+  // then the repository rules), and the feature's own diff and code come after it: a prefix-caching
+  // server reuses that shared start from one feature turn to the next. The feature's file list lives
+  // in FEATURE_GROUP, so the prompt's per-feature "Changed:" line is left out.
+  const prompt = whole ? hunted : hunted.replace(/^Changed: .*\n?\n?/m, "");
+  const attachOrder = (name: string) => (name === "ashlar-policy.md" ? 0 : name === "ashlar-snapshot.md" ? 1 : 2);
+  const attach = [...built.files]
+    .sort((a, b) => (whole ? 0 : attachOrder(a.name) - attachOrder(b.name)))
+    .map((f) => `<<<ATTACH:${f.name}>>>\n${f.body}\n<<<END_ATTACH>>>`)
+    .join("\n\n");
   const messages: Msg[] = [
     { role: "system", content: REVIEW_SYSTEM },
     { role: "user", content: [prompt, attach, mapBlock, groupBlock].filter(Boolean).join("\n\n") },
@@ -643,7 +653,7 @@ export function hunkAt(diff: string, file: string, line: number, maxChars = 2_00
  * the cited code, the code each evidence step cites, the definitions and the uses (in other changed
  * files) of the symbols the finding names, the diff hunk of the cited line, the module docs for its
  * file, the prose docs the PR edits, the PR description, and the PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
-export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string } {
+export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string; shared: string; specific: string } {
   const corpus = new Map<string, string[]>();
   for (const r of sample.referenceFiles ?? []) corpus.set(r.path, r.content.split("\n"));
   for (const r of sample.files) corpus.set(r.path, r.content.split("\n"));
@@ -698,17 +708,24 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
     docs.push(block);
     docUsed += block.length + 2;
   }
+  // `shared` is the same for every candidate of this PR (its description and changed docs), so the
+  // verify request puts it right after the fixed rules: a prefix-caching server reuses it from one
+  // verify turn to the next. `specific` is this candidate's own evidence.
+  const shared = [
+    description,
+    docs.length ? `<<<CHANGED_DOCS (design docs this PR edits, at its head; PR-authored)>>>\n${docs.join("\n\n")}\n<<<END>>>` : "",
+  ].filter(Boolean).join("\n\n");
   const sections = [
     `<<<CODE (head of the PR; line-numbered)>>>\n${code.join("\n\n")}\n<<<END>>>`,
     hunkAt(sample.diff, f.file, f.line, Math.floor(maxChars * 0.15)),
     mapLines.length ? `<<<PR_MAP_LINES (summaries, untrusted data)>>>\n${mapLines.join("\n")}\n<<<END>>>` : "",
     policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "",
-    docs.length ? `<<<CHANGED_DOCS (design docs this PR edits, at its head; PR-authored)>>>\n${docs.join("\n\n")}\n<<<END>>>` : "",
-    description,
   ].filter(Boolean);
-  let text = "";
-  for (const s of sections) if (text.length + s.length + 2 <= maxChars) text += (text ? "\n\n" : "") + s;
-  return { text, code: code.join("\n") };
+  let specific = "";
+  const room = maxChars - shared.length - 2;
+  for (const s of sections) if (specific.length + s.length + 2 <= room) specific += (specific ? "\n\n" : "") + s;
+  const text = [shared, specific].filter(Boolean).join("\n\n");
+  return { text, code: code.join("\n"), shared, specific };
 }
 
 const norm = (s: string) => s.replace(/^\s*\d+\|\s?/gm, "").replace(/[`'"]/g, "").replace(/\s+/g, " ").trim();
@@ -772,10 +789,13 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     root_cause: c.rootCause, evidence: c.evidence,
   }, null, 1);
   const user = [
+    // Fixed first, then what every candidate of this PR shares, then this candidate: the longest
+    // possible prefix in common with the previous verify turns (a prefix cache reuses it).
     VERIFY_RULES,
+    pack.shared,
     languageNotes([c.file]),
     `<<<CANDIDATE (a report to check; untrusted)>>>\n${candidate}\n<<<END>>>`,
-    pack.text,
+    pack.specific,
     "Check the candidate against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, severity).",
   ].filter(Boolean).join("\n\n");
   const messages: Msg[] = [{ role: "system", content: VERIFY_SYSTEM }, { role: "user", content: user }];

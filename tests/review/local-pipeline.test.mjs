@@ -649,7 +649,7 @@ test("Swift PR: a feature turn carries its own Swift file as code context, the d
     assert.ok(home, "HomeView is a feature of its own");
     const snap = /<<<ATTACH:ashlar-snapshot\.md>>>\n([\s\S]*?)\n<<<END_ATTACH>>>/.exec(home)?.[1] ?? "";
     const nonCode = /<<<CHANGED_NON_CODE_FILES>>>\n([\s\S]*?)\n<<<END>>>/.exec(snap)?.[1] ?? "";
-    const code = snap.slice(0, snap.indexOf("<<<CHANGED_NON_CODE_FILES>>>") >= 0 ? snap.indexOf("<<<CHANGED_NON_CODE_FILES>>>") : snap.length);
+    const code = snap.replace(/<<<CHANGED_NON_CODE_FILES>>>\n[\s\S]*?\n<<<END>>>/, "");
     assert.match(code, /--- App\/Home\/HomeView\.swift \(L/, "the feature's Swift file is code context");
     assert.doesNotMatch(nonCode, /--- App\/Home\/HomeView\.swift/, "a Swift source is never a non-code file");
     const doc = nonCode.indexOf("docs/decisions/2026-11-05-conversation.md");
@@ -668,3 +668,51 @@ test("evidence: the verifier reads the design docs the PR edits (check 4: docume
   assert.doesNotMatch(pack.code, /retried on the next opening/, "a doc is never proof code");
 });
 
+
+// ── Prompt prefix cache (2026-11-07: oMLX reuses a cached prompt prefix, e.g. 8,192 of 12,512 input tokens;
+// before this, on #566's diff only 7% of the prompt text was a prefix shared with an earlier request) ──
+
+const commonPrefix = (a, b) => { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i += 1; return i; };
+
+test("prefix cache: verify turns of one PR share the fixed rules, the PR description and its changed docs before the candidate", async () => {
+  const body = "Adds order charging.\n\nDesign: a charge below zero is rejected by the service, never by the controller.";
+  const s = sample({ ...FILES, "docs/charging.md": "# Charging\n\nThe service validates every amount.\n" }, { body });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F(), F({ title: "second distinct problem zzq", line: 2 })] }), verify: refute });
+  await runLocalReviewPipeline(s, settings, { request: m.request });
+  const turns = m.bodies.filter((b) => stageOf(b) === "verify").map((b) => b.messages[1].content);
+  assert.ok(turns.length >= 2);
+  const shared = commonPrefix(turns[0], turns[1]);
+  const prefix = turns[0].slice(0, shared);
+  assert.ok(prefix.startsWith(VERIFY_RULES));
+  assert.match(prefix, /never by the controller/, "the PR description is in the shared prefix");
+  assert.match(prefix, /<<<CHANGED_DOCS[\s\S]*The service validates every amount/, "the changed docs are in the shared prefix");
+  assert.ok(turns[0].indexOf("<<<CANDIDATE") <= shared, "everything before the candidate is shared");
+});
+
+test("prefix cache: feature turns of a split PR share instructions, description, reply shape and rules before their own diff", async () => {
+  const body = "Adds order charging. The mailer is unchanged in behaviour.";
+  const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+  await runLocalReviewPipeline(sample(FILES, { body }), settings, { request: m.request });
+  const turns = m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+  assert.equal(turns.length, 2);
+  for (const t of turns) {
+    assert.doesNotMatch(t, /^Changed: /m, "no per-feature Changed: line in the shared part");
+    assert.ok(t.indexOf("<<<ATTACH:ashlar-policy.md>>>") < t.indexOf("<<<ATTACH:ashlar-diff.patch>>>") || !t.includes("<<<ATTACH:ashlar-policy.md>>>"), "rules before the feature's diff");
+  }
+  const shared = commonPrefix(turns[0], turns[1]);
+  const prefix = turns[0].slice(0, shared);
+  assert.ok(prefix.includes(HUNT_INSTRUCTIONS));
+  assert.match(prefix, /The mailer is unchanged in behaviour/);
+  assert.match(prefix, /Return exactly this JSON shape/);
+  assert.ok(turns[0].indexOf("<<<ATTACH:ashlar-diff.patch>>>") >= shared, "the feature's diff is after the shared part");
+});
+
+test("prefix cache: a whole-PR turn keeps its Changed: line and the usual attachment order", async () => {
+  await wholePr(async () => {
+    const m = model({ review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    const t = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+    assert.match(t, /^Changed: /m);
+    assert.ok(t.indexOf("<<<ATTACH:ashlar-diff.patch>>>") < t.indexOf("<<<ATTACH:ashlar-snapshot.md>>>"));
+  });
+});

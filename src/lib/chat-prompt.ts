@@ -475,6 +475,9 @@ type ChatPartsOpts = {
   prChangedPaths?: readonly string[];
   /** A local-model request: fit the sections into this budget (see LocalBudget). Absent: chat sizes. */
   localBudget?: LocalBudget;
+  /** Put the changed non-code files (the same for every group of a PR) before the group's own code
+   * context in the snapshot, so turns about different groups share a longer prompt prefix. */
+  nonCodeFirst?: boolean;
 };
 
 export type ChatParts = { prompt: string; files: ReviewAttach[]; sections: PromptSections };
@@ -643,11 +646,13 @@ function assembleChatParts(opts: ChatPartsOpts, caps: SectionCaps): ChatParts {
       : `Changed in this PR but not attached in full (local context budget); what is not shown is unknown here — make no claim about it: ${listed.join(", ")}`
     : "";
   const nonCodeBody = [...nonCodeBlocks, listNote].filter(Boolean).join("\n\n");
+  const nonCodeBlock = nonCodeBody ? `<<<CHANGED_NON_CODE_FILES>>>\n${nonCodeBody}\n<<<END>>>` : "";
   const contextBody = [
+    opts.nonCodeFirst ? nonCodeBlock : "",
     hunkBody,
     crossBody ? `<<<CROSS_FILE_DEFINITIONS>>>\n${crossBody}\n<<<END>>>` : "",
     callBody ? `<<<CALL_SITES>>>\n${callBody}\n<<<END>>>` : "",
-    nonCodeBody ? `<<<CHANGED_NON_CODE_FILES>>>\n${nonCodeBody}\n<<<END>>>` : "",
+    opts.nonCodeFirst ? "" : nonCodeBlock,
   ]
     .filter(Boolean)
     .join("\n\n");

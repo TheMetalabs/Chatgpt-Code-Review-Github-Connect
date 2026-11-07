@@ -399,7 +399,7 @@ export const HUNT_INSTRUCTIONS = [
   "Your job is to FIND defects in this change. Every candidate you report is checked afterwards by a separate verifier against the code, so do not hold back a defect because you could not fully prove it here: report each one you can tie to a changed line, with that line quoted verbatim.",
   "A defect is code in this change that behaves wrongly: wrong or lost data, a crash or unhandled error, a security or permission hole, a broken contract with its callers, its callee or its tests, or a failure path that leaves bad state.",
   "For each finding: file is a changed file; line is a RIGHT-side changed line (or the nearest one); failure_scenario is a concrete input or sequence and what goes wrong; evidence quotes the code (path:line `code`) of the cause and of where it fails.",
-  "Tie each finding to a line this diff adds or changes (a '+' line) and quote it. Never say what a line was or that it changed from something unless that '-' line is in the diff.",
+  "Tie each finding to a line this diff changes and quote it: the '+' line that causes it, or, when the cause is code this diff removes (a deleted guard or check), the '-' line(s) together with the surviving line where it now fails (that line's RIGHT-side number is the finding's line). Never say what a line was or that it changed from something unless that '-' line is in the diff.",
   "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
@@ -590,6 +590,37 @@ const DEF_RE = (name: string) =>
 
 const PROSE_DOC_RE = /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
 
+/** A hunk cut to `maxChars` around RIGHT-side `line` (the removed lines just before it included), with
+ * its header and a note for each side left out: a large hunk's prefix would miss the cited change. */
+function hunkWindow(hunk: string, start: number, line: number, maxChars: number): string {
+  if (hunk.length <= maxChars) return hunk;
+  const [header, ...rows] = hunk.split("\n");
+  let right = start;
+  let at = rows.length - 1;
+  for (let i = 0; i < rows.length; i += 1) {
+    const r = rows[i];
+    if (r.startsWith("-")) continue;
+    if (right >= line) { at = i; break; }
+    right += 1;
+  }
+  // Start at the run of removed lines right before the cited line, so a replacement shows both sides.
+  while (at > 0 && rows[at - 1].startsWith("-")) at -= 1;
+  let lo = at;
+  let hi = at;
+  let used = header.length + rows[at].length + 80;
+  for (let grow = true; grow; ) {
+    grow = false;
+    if (hi + 1 < rows.length && used + rows[hi + 1].length + 1 <= maxChars) { hi += 1; used += rows[hi].length + 1; grow = true; }
+    if (lo > 0 && used + rows[lo - 1].length + 1 <= maxChars) { lo -= 1; used += rows[lo].length + 1; grow = true; }
+  }
+  return [
+    header,
+    lo > 0 ? `… ${lo} earlier line(s) of this hunk omitted` : "",
+    ...rows.slice(lo, hi + 1),
+    hi < rows.length - 1 ? `… ${rows.length - 1 - hi} later line(s) of this hunk omitted` : "",
+  ].filter((x) => x !== "").join("\n");
+}
+
 /** The diff hunk of `file` that covers RIGHT-side `line`, or a note that the line is not changed by
  * this PR (so a claim about what the line "was" can be checked against what really changed). */
 export function hunkAt(diff: string, file: string, line: number, maxChars = 2_000): string {
@@ -602,7 +633,7 @@ export function hunkAt(diff: string, file: string, line: number, maxChars = 2_00
     const start = Number(m[1]);
     const len = m[2] === undefined ? 1 : Number(m[2]);
     if (line >= start && line < start + Math.max(1, len)) {
-      return `<<<DIFF (this PR's change around ${file}:${line}; '-' removed, '+' added, ' ' unchanged)>>>\n${h.slice(0, maxChars)}\n<<<END>>>`;
+      return `<<<DIFF (this PR's change around ${file}:${line}; '-' removed, '+' added, ' ' unchanged)>>>\n${hunkWindow(h, start, line, maxChars)}\n<<<END>>>`;
     }
   }
   return `<<<DIFF>>>\n${file}:${line} is not inside any hunk of this PR's diff: this PR does not change that line.\n<<<END>>>`;

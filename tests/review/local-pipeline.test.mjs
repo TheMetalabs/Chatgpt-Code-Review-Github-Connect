@@ -608,9 +608,23 @@ test("language notes: a Swift change gets the Swift semantics in its candidate t
   });
 });
 
-test("candidate prompt: a finding is tied to a '+' line; no claim about what a line was without its '-' line", () => {
-  assert.match(HUNT_INSTRUCTIONS, /a line this diff adds or changes \(a '\+' line\)/);
+test("candidate prompt: a finding is tied to a changed line ('+', or for removed code its '-' lines and where it now fails); no claim about what a line was without its '-' line", () => {
+  assert.match(HUNT_INSTRUCTIONS, /the '\+' line that causes it/);
+  assert.match(HUNT_INSTRUCTIONS, /when the cause is code this diff removes \(a deleted guard or check\), the '-' line\(s\) together with the surviving line where it now fails/, "a deletion-only defect can be reported (Codex #182)");
   assert.match(HUNT_INSTRUCTIONS, /Never say what a line was or that it changed from something unless that '-' line is in the diff/);
+});
+
+test("evidence: a long hunk is cut around the cited line, not at its start (Codex #182)", () => {
+  const added = Array.from({ length: 300 }, (_, i) => `+let value${i + 1} = compute(${i + 1}) // padding padding padding`);
+  const diff = `--- App/Big.swift\n@@ -0,0 +1,300 @@\n${added.join("\n")}`;
+  const out = hunkAt(diff, "App/Big.swift", 290, 2_000);
+  assert.ok(out.length <= 2_200, `bounded (${out.length})`);
+  assert.match(out, /let value290 = compute\(290\)/, "the cited line is in the window");
+  assert.match(out, /^@@ -0,0 \+1,300 @@$/m, "the hunk header stays");
+  assert.match(out, /… \d+ earlier line\(s\) of this hunk omitted/);
+  const replaced = `--- a.swift\n@@ -1,203 +1,203 @@\n${Array.from({ length: 200 }, (_, i) => ` let keep${i} = ${i} // context context context`).join("\n")}\n-guard isAdmin(user) else { return }\n+guard true else { return }\n write(user)`;
+  const w = hunkAt(replaced, "a.swift", 201, 600);
+  assert.match(w, /-guard isAdmin\(user\) else \{ return \}\n\+guard true else \{ return \}/, "the removed line right before the cited one is kept");
 });
 
 // ── A Swift PR's context (2026-11-07: on WalkieBoard every .swift file ranked as a doc, so no feature turn

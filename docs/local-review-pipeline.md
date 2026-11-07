@@ -105,6 +105,18 @@ WalkieBoard #566 (26 Swift files, 224K diff chars) took 2 and 4.5 hours for 84 a
 | Swift helpers were never found | The definition search knows `func`, `struct`, `protocol`, `extension`, `actor` (and Kotlin, Go, Rust forms). |
 | TypeScript habits applied to Swift (`TaskCancelledError`) | `LANGUAGE_NOTES` per file extension in candidate and verify turns. |
 | Claims about what a line "was" | Candidate turns tie a finding to a `+` line and may describe an old line only when its `-` line is in the diff. |
+| Swift sources ranked as docs (`review-budget.ts` had no `.swift`) | `.swift`, `.m`, `.mm`, `.h`, `.c`, `.cc`, `.cpp`, `.hpp`, `.kts`, `.scala`, `.dart` are code, and a root `Tests/` folder is tests. A feature turn now carries its own source with line numbers; this also changes the chat reviewers' context for such repositories. |
+| Every feature turn padded with ~24K chars of the PR's other files (tests, `Localizable.xcstrings`) | A feature of a split PR carries at most `PART_NON_CODE_MAX_CHARS` (6,000) of changed non-code files, prose docs (`.md`, `.txt`, …) first. |
+| The verifier could not see the design doc the PR edits | Its evidence adds `CHANGED_DOCS` (the PR's prose docs, up to 10% of its budget). They are never proof code. |
+
+Measured on #566's real diff with a mock model (turns and prompt characters; quality needs the real model):
+
+| | Turns | Prompt chars | Candidate turns |
+|---|---|---|---|
+| Before (#181, 3 lenses) | 62 | 2.60M | 42 × ~53K |
+| This change | 34 | 1.09M | 14 × ~45K, each with its own code context |
+
+Production adds retry turns on top (84–87 turns before).
 
 The verify turn now starts with its fixed rules, so every verify request shares the same prefix; a local server with prompt (prefix) caching reuses it. The ops line adds the elapsed minutes, for example `… 5 posted (41 turns, 52 min)`, and is no longer cut at 200 characters.
 

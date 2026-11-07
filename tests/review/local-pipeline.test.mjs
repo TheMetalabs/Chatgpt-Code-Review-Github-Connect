@@ -18,6 +18,7 @@ import {
   hunkAt,
   languageNotes,
   VERIFY_RULES,
+  PART_NON_CODE_MAX_CHARS,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -610,5 +611,46 @@ test("language notes: a Swift change gets the Swift semantics in its candidate t
 test("candidate prompt: a finding is tied to a '+' line; no claim about what a line was without its '-' line", () => {
   assert.match(HUNT_INSTRUCTIONS, /a line this diff adds or changes \(a '\+' line\)/);
   assert.match(HUNT_INSTRUCTIONS, /Never say what a line was or that it changed from something unless that '-' line is in the diff/);
+});
+
+// ── A Swift PR's context (2026-11-07: on WalkieBoard every .swift file ranked as a doc, so no feature turn
+// carried code context, and each carried ~24K chars of the PR's other files as "changed non-code files") ──
+
+const SWIFT = {
+  "App/Conversation/ConversationModel.swift": "import Foundation\n\nfinal class ConversationModel {\n  private var catchUp: Task<Void, Never>?\n  func stop() {\n    catchUp?.cancel()\n  }\n}\n",
+  "App/Home/HomeView.swift": "import SwiftUI\n\nstruct HomeView: View {\n  var body: some View { Text(\"Home\") }\n}\n",
+  "Tests/ConversationModelTests.swift": "import XCTest\n\nfinal class ConversationModelTests: XCTestCase {\n  func testStop() { XCTAssertTrue(true) }\n}\n",
+  "App/Localizable.xcstrings": `{\n  "strings": {\n${Array.from({ length: 1500 }, (_, i) => `    "key${i}": { "localizations": { "ko": { "value": "값 ${i}" } } },`).join("\n")}\n  }\n}\n`,
+  "docs/decisions/2026-11-05-conversation.md": "# Conversation screen\n\nA failed catch-up is retried on the next opening, for the whole store: nothing is marked ended.\n",
+};
+
+test("Swift PR: a feature turn carries its own Swift file as code context, the design doc before resources, and a capped non-code share", async () => {
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "2000";
+  try {
+    const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(SWIFT), settings, { request: m.request });
+    const turns = m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+    const home = turns.find((t) => /one feature of this PR: App\/Home\/HomeView\.swift/.test(t));
+    assert.ok(home, "HomeView is a feature of its own");
+    const snap = /<<<ATTACH:ashlar-snapshot\.md>>>\n([\s\S]*?)\n<<<END_ATTACH>>>/.exec(home)?.[1] ?? "";
+    const nonCode = /<<<CHANGED_NON_CODE_FILES>>>\n([\s\S]*?)\n<<<END>>>/.exec(snap)?.[1] ?? "";
+    const code = snap.slice(0, snap.indexOf("<<<CHANGED_NON_CODE_FILES>>>") >= 0 ? snap.indexOf("<<<CHANGED_NON_CODE_FILES>>>") : snap.length);
+    assert.match(code, /--- App\/Home\/HomeView\.swift \(L/, "the feature's Swift file is code context");
+    assert.doesNotMatch(nonCode, /--- App\/Home\/HomeView\.swift/, "a Swift source is never a non-code file");
+    const doc = nonCode.indexOf("docs/decisions/2026-11-05-conversation.md");
+    const strings = nonCode.indexOf("App/Localizable.xcstrings");
+    assert.ok(doc >= 0 && (strings < 0 || doc < strings), "the design doc comes before the string catalog");
+    assert.ok(nonCode.length <= PART_NON_CODE_MAX_CHARS + 600, `non-code share ${nonCode.length} stays near the cap`);
+  } finally {
+    process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
+  }
+});
+
+test("evidence: the verifier reads the design docs the PR edits (check 4: documented as intended)", () => {
+  const f = { id: "x", status: "accepted", severity: "P1", file: "App/Conversation/ConversationModel.swift", line: 6, side: "RIGHT", title: "stop() swallows a failed catch-up", failureScenario: "x", rootCause: "y", evidence: "App/Conversation/ConversationModel.swift:6 `catchUp?.cancel()`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(sample(SWIFT), f, new Map(), 20_000);
+  assert.match(pack.text, /<<<CHANGED_DOCS[^\n]*>>>\n--- docs\/decisions\/2026-11-05-conversation\.md\n# Conversation screen[\s\S]*retried on the next opening/);
+  assert.doesNotMatch(pack.code, /retried on the next opening/, "a doc is never proof code");
 });
 

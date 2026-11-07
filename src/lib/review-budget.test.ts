@@ -17,6 +17,15 @@ describe("rankChangedFile", () => {
     assert.equal(rankChangedFile("docs/CHANGELOG"), 3);
   });
 
+  it("ranks Swift, Objective-C, C/C++, Scala and Dart sources as code, and a root Tests/ folder as tests (WalkieBoard)", () => {
+    for (const p of ["App/Conversation/ConversationModel.swift", "Sources/A.m", "Sources/A.mm", "include/a.h", "src/a.c", "src/a.cpp", "src/a.scala", "lib/a.dart", "build.gradle.kts"]) {
+      assert.equal(rankChangedFile(p), 0, p);
+    }
+    assert.equal(rankChangedFile("Tests/ConversationModelTests.swift"), 1);
+    assert.equal(rankChangedFile("Packages/WalkieCore/Tests/WalkieCoreTests/ConversationTests.swift"), 1);
+    assert.equal(rankChangedFile("App/Localizable.xcstrings"), 3);
+  });
+
   it("treats locales/changelog as doc even as .json", () => {
     assert.equal(rankChangedFile("src/locales/en.json"), 3);
     assert.equal(rankChangedFile("app/CHANGELOG.json"), 3);

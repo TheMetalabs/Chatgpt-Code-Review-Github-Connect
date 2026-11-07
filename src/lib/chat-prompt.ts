@@ -315,7 +315,10 @@ type DocItem = { path: string; content: string; patch: string };
 function docTier(path: string): number {
   if (isPolicyDocPath(path) || /(?:^|\/)readme[^/]*$/i.test(path)) return 0;
   const rank = rankChangedFile(path);
-  return rank === 3 ? 1 : rank === 2 ? 2 : 3;
+  // Prose docs before other unranked files: a design doc explains intent, a string catalog or a project
+  // file (.xcstrings, .pbxproj) does not, and is often far larger.
+  if (rank === 3) return /\.(?:md|mdx|markdown|txt|rst|adoc)$/i.test(path) ? 1 : 2;
+  return rank === 2 ? 2 : 3;
 }
 
 function changedNonCodeItems(sample: SamplePr, changedPaths: readonly string[]): DocItem[] {
@@ -423,6 +426,10 @@ export type LocalBudget = {
   shrinkContext?: boolean;
   /** The model can read files on demand (the grouped loop): omitted non-code files are listed to read. */
   toolReads?: boolean;
+  /** At most this much of the room left over goes to the changed non-code files (docs first, then config
+   * and tests). Absent: all of it. A turn about one feature of a larger PR sets it, so it is not padded
+   * with the rest of the PR's tests and resources (each turn costs its length in prompt processing). */
+  nonCodeMaxChars?: number;
 };
 
 /** Sizes of the sections the prompt carries (for the ops "Prompt:" line). */
@@ -504,7 +511,9 @@ function fitLocalParts(opts: ChatPartsOpts, base: SectionCaps, budget: LocalBudg
     const parts = assembleChatParts(opts, caps);
     return { parts, caps, size: localWireText(parts).length + overhead };
   };
-  let cur = build(base);
+  // A non-code cap holds at every size: the chat form, which fits a small feature as is, carries the
+  // whole PR's changed docs, config and tests.
+  let cur = build(budget.nonCodeMaxChars !== undefined ? { ...base, nonCodeMaxChars: budget.nonCodeMaxChars } : base);
   if (cur.size <= max) return cur.parts;
   // The local form of every added section: the description's opening and design-intent paragraphs
   // (≤1,500 chars), the nearest module docs within a local share, the call sites within a local share,
@@ -523,7 +532,11 @@ function fitLocalParts(opts: ChatPartsOpts, base: SectionCaps, budget: LocalBudg
   const raises: ((c: SectionCaps, spare: number) => SectionCaps | null)[] = [
     (c, spare) => (c.policyMaxChars < base.policyMaxChars ? { ...c, policyMaxChars: Math.min(base.policyMaxChars, c.policyMaxChars + spare) } : null),
     (c, spare) => (c.callSitesMaxChars < base.callSitesMaxChars ? { ...c, callSitesMaxChars: Math.min(base.callSitesMaxChars, c.callSitesMaxChars + spare) } : null),
-    (c, spare) => ({ ...c, nonCodeMaxChars: (c.nonCodeMaxChars ?? 0) + spare }),
+    (c, spare) => {
+      const cap = budget.nonCodeMaxChars ?? Infinity;
+      const have = c.nonCodeMaxChars ?? 0;
+      return have >= cap ? null : { ...c, nonCodeMaxChars: Math.min(cap, have + spare) };
+    },
   ];
   const refill = (fit: typeof cur): ChatParts => {
     let best = fit;

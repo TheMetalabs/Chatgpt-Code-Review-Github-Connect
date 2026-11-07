@@ -55,6 +55,10 @@ export const MAX_VERIFIED_CANDIDATES = 16;
  * (each one costs output tokens and a verify turn). */
 const FEATURE_FINDINGS_CAP = 6;
 const PART_FINDINGS_CAP = 3;
+/** The changed non-code files (docs first) one feature of a larger PR may carry: room for a design doc,
+ * not for every test and resource file of the PR (WalkieBoard #566: 24K chars of them in each of 14
+ * feature turns, next to as little as 0.8K of the feature's own diff). */
+export const PART_NON_CODE_MAX_CHARS = 6_000;
 export const featureFindingsCap = (whole: boolean) => (whole ? FEATURE_FINDINGS_CAP : PART_FINDINGS_CAP);
 
 function envNum(key: string, dflt: number): number {
@@ -487,7 +491,10 @@ async function reviewFeature(
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
     prChangedPaths: sample.changedPaths,
-    localBudget: { maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + 8, shrinkContext: true },
+    localBudget: {
+      maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + 8, shrinkContext: true,
+      ...(whole ? {} : { nonCodeMaxChars: PART_NON_CODE_MAX_CHARS }),
+    },
   });
   // The hunt instructions replace the chat review rules (shorter, so the fitted budget still holds).
   const prompt = built.prompt.includes(REVIEW_INSTRUCTIONS)
@@ -581,6 +588,8 @@ export function namedSymbols(f: Pick<Finding, "title" | "rootCause" | "evidence"
 const DEF_RE = (name: string) =>
   new RegExp(`(?:\\b(?:function|func|fun|fn|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum|const|let|var|val|def)\\s+${name}\\b)|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub)\\s+)*${name}\\s*[(<:=])`);
 
+const PROSE_DOC_RE = /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
+
 /** The diff hunk of `file` that covers RIGHT-side `line`, or a note that the line is not changed by
  * this PR (so a claim about what the line "was" can be checked against what really changed). */
 export function hunkAt(diff: string, file: string, line: number, maxChars = 2_000): string {
@@ -602,7 +611,7 @@ export function hunkAt(diff: string, file: string, line: number, maxChars = 2_00
 /** The evidence a verifier reads for one candidate, collected deterministically from the snapshot:
  * the cited code, the code each evidence step cites, the definitions and the uses (in other changed
  * files) of the symbols the finding names, the diff hunk of the cited line, the module docs for its
- * file, the PR description, and the PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
+ * file, the prose docs the PR edits, the PR description, and the PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
 export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string } {
   const corpus = new Map<string, string[]>();
   for (const r of sample.referenceFiles ?? []) corpus.set(r.path, r.content.split("\n"));
@@ -645,11 +654,25 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   const mapLines = [...files].map((p) => map.get(p)).filter((e): e is MapEntry => Boolean(e)).map((e) => mapLine(e, false));
   const policy = buildPolicyAttachment({ ...sample, changedPaths: [f.file] }, Math.floor(maxChars * 0.12), sample.changedPaths);
   const description = prDescriptionBlock(sample.body, 1_500, true);
+  // The prose docs this PR edits (a design or decision doc): check 4 of VERIFY_RULES (documented as
+  // intended) reads them along with the module docs and the description. PR-authored, like the description.
+  const docShare = Math.floor(maxChars * 0.1);
+  let docUsed = 0;
+  const docs: string[] = [];
+  for (const p of sample.changedPaths.filter((x) => PROSE_DOC_RE.test(x))) {
+    const text = sample.files.find((x) => x.path === p)?.content ?? "";
+    const room = docShare - docUsed;
+    if (!text.trim() || room < 400) continue;
+    const block = `--- ${p}\n${text.slice(0, room - p.length - 8)}`;
+    docs.push(block);
+    docUsed += block.length + 2;
+  }
   const sections = [
     `<<<CODE (head of the PR; line-numbered)>>>\n${code.join("\n\n")}\n<<<END>>>`,
     hunkAt(sample.diff, f.file, f.line, Math.floor(maxChars * 0.15)),
     mapLines.length ? `<<<PR_MAP_LINES (summaries, untrusted data)>>>\n${mapLines.join("\n")}\n<<<END>>>` : "",
     policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "",
+    docs.length ? `<<<CHANGED_DOCS (design docs this PR edits, at its head; PR-authored)>>>\n${docs.join("\n\n")}\n<<<END>>>` : "",
     description,
   ].filter(Boolean);
   let text = "";

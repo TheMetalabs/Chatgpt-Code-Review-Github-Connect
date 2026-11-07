@@ -716,3 +716,21 @@ test("prefix cache: a whole-PR turn keeps its Changed: line and the usual attach
     assert.ok(t.indexOf("<<<ATTACH:ashlar-diff.patch>>>") < t.indexOf("<<<ATTACH:ashlar-snapshot.md>>>"));
   });
 });
+
+test("evidence: the cited line's DIFF is never crowded out by a large code excerpt and the shared docs (Codex #182)", () => {
+  const long = (i) => `  let value${i} = compute(${i}, "${"x".repeat(200)}")`;
+  const lines = Array.from({ length: 120 }, (_, i) => long(i + 1));
+  const content = ["func run() {", ...lines, "}"].join("\n");
+  const ctx = (a, b) => lines.slice(a, b).map((l) => ` ${l}`).join("\n");
+  const patch = `@@ -45,21 +45,21 @@\n${ctx(44, 54)}\n-  guard isAdmin(user) else { return }\n+  guard true else { return }\n${ctx(55, 65)}`;
+  const s = {
+    ...sample({ "App/Run.swift": content, "docs/design.md": `# Design\n\n${"Every call is checked by the coordinator. ".repeat(50)}\n` }),
+    body: `Adds the run loop: ${"the guard moved to the coordinator, which checks every caller before it runs, ".repeat(18)}`,
+  };
+  s.diff = `--- App/Run.swift\n${patch}\n\n--- docs/design.md\n@@ -0,0 +1,3 @@\n+# Design`;
+  const f = { id: "x", status: "accepted", severity: "P1", file: "App/Run.swift", line: 56, side: "RIGHT", title: "guard removed", failureScenario: "x", rootCause: "y", evidence: "App/Run.swift:56 `guard true else { return }`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.ok(pack.text.length <= 20_000, `within budget (${pack.text.length})`);
+  assert.match(pack.text, /<<<DIFF \(this PR's change around App\/Run\.swift:56;[\s\S]*-  guard isAdmin\(user\) else \{ return \}/);
+  assert.match(pack.code, /56\| /, "the cited line's code window is kept, shrunk to fit");
+});

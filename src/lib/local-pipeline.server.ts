@@ -657,6 +657,25 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   const corpus = new Map<string, string[]>();
   for (const r of sample.referenceFiles ?? []) corpus.set(r.path, r.content.split("\n"));
   for (const r of sample.files) corpus.set(r.path, r.content.split("\n"));
+  const description = prDescriptionBlock(sample.body, 1_500, true);
+  // The prose docs this PR edits (a design or decision doc): check 4 of VERIFY_RULES (documented as
+  // intended) reads them along with the module docs and the description. PR-authored, like the description.
+  const docShare = Math.floor(maxChars * 0.1);
+  let docUsed = 0;
+  const docs: string[] = [];
+  for (const p of sample.changedPaths.filter((x) => PROSE_DOC_RE.test(x))) {
+    const text = sample.files.find((x) => x.path === p)?.content ?? "";
+    const room = docShare - docUsed;
+    if (!text.trim() || room < 400) continue;
+    const block = `--- ${p}\n${text.slice(0, room - p.length - 8)}`;
+    docs.push(block);
+    docUsed += block.length + 2;
+  }
+  const diffBlock = hunkAt(sample.diff, f.file, f.line, Math.floor(maxChars * 0.15));
+  const sharedChars = description.length + (docs.length ? docs.join("\n\n").length + 120 : 0);
+  // The cited line's diff is required evidence (VERIFY_RULES check 1): its room and the shared part's
+  // are reserved before the optional code windows are packed, so a large code excerpt cannot crowd it out.
+  const codeCap = Math.max(0, Math.min(maxChars * 0.75, maxChars - sharedChars - diffBlock.length - 200));
   const code: string[] = [];
   const seen = new Set<string>();
   let used = 0;
@@ -665,8 +684,13 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
     if (!lines) return;
     const key = `${path}:${Math.floor(center / 10)}`;
     if (seen.has(key)) return;
-    const w = gutter(path, lines, center - before, center + after);
-    if (!w || used + w.length > maxChars * 0.75) return;
+    // A window that does not fit shrinks (±30 → ±15 → ±7 lines) rather than vanish: the cited code
+    // is the first thing a verifier needs.
+    let w = gutter(path, lines, center - before, center + after);
+    for (let k = 2; w && used + w.length > codeCap && k <= 4; k *= 2) {
+      w = gutter(path, lines, center - Math.ceil(before / k), center + Math.ceil(after / k));
+    }
+    if (!w || used + w.length > codeCap) return;
     seen.add(key);
     code.push(w);
     used += w.length;
@@ -694,20 +718,6 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   const files = new Set([f.file, ...[...f.evidence.matchAll(/([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+):\d+/g)].map((m) => m[1])]);
   const mapLines = [...files].map((p) => map.get(p)).filter((e): e is MapEntry => Boolean(e)).map((e) => mapLine(e, false));
   const policy = buildPolicyAttachment({ ...sample, changedPaths: [f.file] }, Math.floor(maxChars * 0.12), sample.changedPaths);
-  const description = prDescriptionBlock(sample.body, 1_500, true);
-  // The prose docs this PR edits (a design or decision doc): check 4 of VERIFY_RULES (documented as
-  // intended) reads them along with the module docs and the description. PR-authored, like the description.
-  const docShare = Math.floor(maxChars * 0.1);
-  let docUsed = 0;
-  const docs: string[] = [];
-  for (const p of sample.changedPaths.filter((x) => PROSE_DOC_RE.test(x))) {
-    const text = sample.files.find((x) => x.path === p)?.content ?? "";
-    const room = docShare - docUsed;
-    if (!text.trim() || room < 400) continue;
-    const block = `--- ${p}\n${text.slice(0, room - p.length - 8)}`;
-    docs.push(block);
-    docUsed += block.length + 2;
-  }
   // `shared` is the same for every candidate of this PR (its description and changed docs), so the
   // verify request puts it right after the fixed rules: a prefix-caching server reuses it from one
   // verify turn to the next. `specific` is this candidate's own evidence.
@@ -717,7 +727,7 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   ].filter(Boolean).join("\n\n");
   const sections = [
     `<<<CODE (head of the PR; line-numbered)>>>\n${code.join("\n\n")}\n<<<END>>>`,
-    hunkAt(sample.diff, f.file, f.line, Math.floor(maxChars * 0.15)),
+    diffBlock,
     mapLines.length ? `<<<PR_MAP_LINES (summaries, untrusted data)>>>\n${mapLines.join("\n")}\n<<<END>>>` : "",
     policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "",
   ].filter(Boolean);

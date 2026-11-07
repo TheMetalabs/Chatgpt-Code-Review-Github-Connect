@@ -127,6 +127,14 @@ On #566's diff the prefix a turn shares with an earlier one went from 86K to 325
 
 The verify turn now starts with its fixed rules, so every verify request shares the same prefix; a local server with prompt (prefix) caching reuses it. The ops line adds the elapsed minutes, for example `… 5 posted (41 turns, 52 min)`, and is no longer cut at 200 characters.
 
+## Timing defects and failed feature turns (2026-11-07)
+
+On WalkieBoard #569 Codex found one valid defect: `roomToRun` checks its deadline before each sleep but never after waking, so a late wake starts work past the deadline. The local review (#182 code, 27 turns, 37 min) never raised it. Its feature turn for that file succeeded and looked at the same line, but asked which errors `sleep` throws, and the verifier rightly refuted that. In the same run, 3 of 9 feature turns returned no usable review, leaving 12 files unreviewed.
+
+- The general and failure lenses now ask for a deadline, timeout, cancellation or other state checked before an await, sleep, lock or retry and relied on after it without being checked again.
+- `VERIFY_RULES` check 3: a guard prevents a failure only if it runs on the failing path after the state it checks could change; a check before a wait does not cover what happens during it.
+- A multi-file feature group that returns no usable review (after its own retry) is retried one file at a time, up to `MAX_SPLIT_RETRY_FILES` (8) files per review. Files that still fail are unreviewed, and the ops line names them, for example `(1 failed, 3 file(s) retried alone, unreviewed: A.swift, B.swift)`.
+
 ## Settings
 
 | Field | Default | Meaning |

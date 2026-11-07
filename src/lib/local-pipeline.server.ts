@@ -409,10 +409,10 @@ export const HUNT_INSTRUCTIONS = [
 /** What each candidate pass looks at hardest (Settings local_review.pipeline_lenses). A small model finds
  * more with a narrow question than with "review everything"; the passes' candidates are merged. */
 export const LENSES = {
-  failure: "Focus: failure paths. Follow every error, rejection, catch, early return, retry and async step the change adds or touches: what state is left behind when it fails half way (a stale or partly updated record, a cache or profile that is reused after a failed refresh, an async task or callback whose failure is never observed, a missing rollback)?",
+  failure: "Focus: failure paths. Follow every error, rejection, catch, early return, retry and async step the change adds or touches: what state is left behind when it fails half way (a stale or partly updated record, a cache or profile that is reused after a failed refresh, an async task or callback whose failure is never observed, a missing rollback)? Check the timing too: a deadline, timeout, cancellation or other state checked before an await, sleep, lock or retry and relied on after it without being checked again (a wait can wake past its deadline; the state can change meanwhile).",
   data: "Focus: data identity and invariants. Keys and uniqueness (two different items that collide on the same key or display value), null/undefined/empty values, boundaries and off-by-one, units, time zones and dates, type coercion, ordering assumptions.",
   contract: "Focus: contracts. Does each changed piece agree with what calls it and what it calls: argument and return shapes, status codes, error values and response bodies, a test's expected values versus the implementation, schema/migration versus entity, permission and validation checks, flags and config?",
-  general: "Look at failure paths, data identity and invariants, and the contracts between the changed code, its callers and its tests.",
+  general: "Look at failure paths, data identity and invariants, and the contracts between the changed code, its callers and its tests. Check the timing too: a deadline, timeout, cancellation or other state checked before an await, sleep, lock or retry and relied on after it without being checked again.",
 } as const;
 export type LensName = keyof typeof LENSES;
 
@@ -563,7 +563,7 @@ export const VERIFY_RULES = [
   "Before you answer, check each of these against the evidence:",
   "1. Is the cited line changed by this PR? Read DIFF. A claim about what a line \"was\" or that it \"changed from\" something must match a '-' line there; if DIFF says the line is not changed, a defect said to be introduced there is refuted.",
   "2. Does the declared type or signature allow the failure? A non-throwing function or task cannot throw; a non-optional value cannot be nil; follow LANGUAGE_NOTES.",
-  "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing.",
+  "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing. A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait.",
   "4. Does a doc comment next to the code, MODULE_DOCS or the PR description state this behaviour as intended? Intended behaviour is not a defect.",
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
   "Verdicts:",
@@ -919,13 +919,26 @@ function toRow(f: Finding): Record<string, unknown> {
   };
 }
 
+/** Files of a failed group retried alone, at most this many per review (each is one more turn). */
+export const MAX_SPLIT_RETRY_FILES = 8;
+
+const failedNote = (s: Pick<PipelineStats, "failedGroups" | "splitRetried" | "unreviewedFiles">) => {
+  const left = s.unreviewedFiles;
+  const names = left.slice(0, 3).map((p) => p.split("/").pop()).join(", ");
+  return [
+    `${s.failedGroups} failed`,
+    s.splitRetried ? `${s.splitRetried} file(s) retried alone` : "",
+    left.length ? `unreviewed: ${names}${left.length > 3 ? ` +${left.length - 3}` : ""}` : "all reviewed on retry",
+  ].filter(Boolean).join(", ");
+};
+
 export type PipelineStats = {
-  mapTurns: number; groups: number; lenses: number; minutes?: number; failedGroups: number; candidates: number; gated: number; softGated: number;
+  mapTurns: number; groups: number; lenses: number; minutes?: number; splitRetried: number; unreviewedFiles: string[]; failedGroups: number; candidates: number; gated: number; softGated: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
 };
 
 export function pipelineSummary(s: PipelineStats): string {
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${s.failedGroups} failed)` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
 }
 
 function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): Ctx {
@@ -1125,7 +1138,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const ctx = makeCtx(settings, deps, t);
   const startedAt = Date.now();
   let lenses = lensesFor(settings.localPipelineLenses);
-  const stats: PipelineStats = { mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
+  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
     const budget = Math.min(t.groupMaxChars, Math.floor(ctx.promptChars * 0.5));
@@ -1157,13 +1170,13 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     const failed: string[] = [];
     const reportedUnreviewed: string[] = [];
     let truncated = false;
-    for (let g = 0; g < groups.length; g += 1) {
-      const files = groups[g];
+    // One feature turn per lens; true when at least one pass returned a usable review.
+    const runFeature = async (files: string[], g: number, passes: LensName[], scopeWhole: boolean): Promise<boolean> => {
       let anyOk = false;
-      for (const lens of lenses) {
+      for (const lens of passes) {
         let out: GroupOutcome;
         try {
-          out = await reviewFeature(ctx, sample, files, whole ? null : map, t, deps.extra ?? "", lens);
+          out = await reviewFeature(ctx, sample, files, scopeWhole ? null : map, t, deps.extra ?? "", lens);
         } catch (e) {
           if (deps.signal?.aborted) throw e;
           deps.log?.(`${lens} pass on ${files[0]} failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
@@ -1171,7 +1184,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
         }
         for (const r of out.replies) evidence.push(`Review group (${files.join(", ")}), ${lens} pass:\n${r}`);
         if (!out.raw) continue;
-        const gated = gateCandidates(out.raw, whole ? sample : subsetSample(sample, new Set(files)), settings, g, next);
+        const gated = gateCandidates(out.raw, scopeWhole ? sample : subsetSample(sample, new Set(files)), settings, g, next);
         stats.candidates += gated.found;
         stats.softGated += gated.soft;
         truncated ||= gated.truncated;
@@ -1184,12 +1197,33 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
         assumptions.push(...gated.assumptions);
         anyOk = true;
       }
-      if (!anyOk) {
-        stats.failedGroups += 1;
-        failed.push(...files);
+      return anyOk;
+    };
+    let reviewedAny = false;
+    let splitLeft = MAX_SPLIT_RETRY_FILES;
+    for (let g = 0; g < groups.length; g += 1) {
+      const files = groups[g];
+      if (await runFeature(files, g, lenses, whole)) {
+        reviewedAny = true;
+        continue;
+      }
+      stats.failedGroups += 1;
+      // A group that returned no usable review is retried one file at a time (a smaller, simpler turn)
+      // before its files are left unreviewed (WalkieBoard #569: 3 of 9 feature turns failed, 12 files).
+      for (const file of files) {
+        if (files.length > 1 && splitLeft > 0) {
+          splitLeft -= 1;
+          stats.splitRetried += 1;
+          if (await runFeature([file], g, ["general"], false)) {
+            reviewedAny = true;
+            continue;
+          }
+        }
+        failed.push(file);
       }
     }
-    if (stats.failedGroups === groups.length) {
+    stats.unreviewedFiles = [...failed];
+    if (!reviewedAny) {
       const unparsedText = evidence.length ? evidence.join("\n\n---\n\n") : undefined;
       return { ok: false, error: `local pipeline produced no review JSON (${groups.length} feature group(s) failed)`, ...(unparsedText ? { unparsedText } : {}) };
     }

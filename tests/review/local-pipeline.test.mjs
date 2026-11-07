@@ -734,3 +734,50 @@ test("evidence: the cited line's DIFF is never crowded out by a large code excer
   assert.match(pack.text, /<<<DIFF \(this PR's change around App\/Run\.swift:56;[\s\S]*-  guard isAdmin\(user\) else \{ return \}/);
   assert.match(pack.code, /56\| /, "the cited line's code window is kept, shrunk to fit");
 });
+
+// ── WalkieBoard #569 (2026-11-07): the local reviewer looked at roomToRun's line 145 for which errors sleep
+// throws and never raised Codex's finding (the deadline is not re-checked after the wait); and 3 of its 9
+// feature turns returned no usable review, leaving 12 files unreviewed ──
+
+test("candidate prompt: the general and failure lenses ask for a state checked before a wait and used after it", () => {
+  for (const lens of [LENSES.general, LENSES.failure]) {
+    assert.match(lens, /checked before an await, sleep, lock or retry and relied on after it without being checked again/);
+  }
+  assert.match(LENSES.failure, /a wait can wake past its deadline/);
+});
+
+test("verifier: a guard that runs only before the wait does not refute a failure that arises during it", () => {
+  assert.match(VERIFY_RULES, /A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait/);
+});
+
+test("failed feature turn: a multi-file group that returns no usable review is retried one file at a time", async () => {
+  const m = model({
+    map: mapReply,
+    review: (body) => {
+      const group = groupOf(body);
+      if (group.length > 1) return "I could not produce JSON for this group.";
+      return reviewFor({ "src/orders/orders.controller.ts": [F()] })(body);
+    },
+    verify: () => confirm(),
+  });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const review = JSON.parse(out.raw);
+  assert.deepEqual(review.findings.map((f) => f.title), ["create() charges a negative amount"], "the finding from the file retried alone is posted");
+  assert.equal(review.unreviewed_paths, undefined, "every file was reviewed on retry");
+  assert.match(out.pipelineSummary, /\(1 failed, 3 file\(s\) retried alone, all reviewed on retry\)/);
+  const singles = m.bodies.filter((b) => stageOf(b) === "review" && groupOf(b).length === 1).map((b) => groupOf(b)[0]);
+  for (const f of ORDERS) assert.ok(singles.includes(f), `${f} retried alone`);
+});
+
+test("failed feature turn: files still failing alone are unreviewed and named in the ops line", async () => {
+  const m = model({
+    map: mapReply,
+    review: (body) => (groupOf(body).some((f) => f.startsWith("src/orders/")) ? "no json" : reviewFor({})(body)),
+    verify: () => confirm(),
+  });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const review = JSON.parse(out.raw);
+  assert.deepEqual([...review.unreviewed_paths].sort(), [...ORDERS].sort());
+  assert.match(out.pipelineSummary, /\(1 failed, 3 file\(s\) retried alone, unreviewed: orders\.(controller|service)\.ts, /);
+  assert.ok(review.coverage.filter((c) => c.reason === "feature review failed").length === 3);
+});

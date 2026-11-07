@@ -86,6 +86,13 @@ describe("reviewPostedNotes", () => {
     assert.ok(old.includes("Prompt: diff 1 chars (1/1 files full), context 2 chars, policy 3 chars"));
   });
 
+  it("shows the local pipeline line whole: its turn count and minutes are never cut off (WalkieBoard #566)", () => {
+    const line = "Local pipeline: 15 feature group(s) × 1 lens(es) (1 failed), 59 candidate(s), 56 to verify (3 the gate would have dropped), 8 confirmed, 2 uncertain, 6 refuted, 40 over the verify cap, 5 posted (84 turns, 120 min)";
+    assert.ok(line.length > 200);
+    const notes = reviewPostedNotes({ headSha: "abcdef012345", localPipelineSummary: line }, 0);
+    assert.ok(notes.includes(line));
+  });
+
   it("notes when HEAD moved and stays minimal without stats", () => {
     const moved = reviewPostedNotes({ headSha: "abcdef012345", headMovedTo: "999888777666" }, 0);
     assert.match(moved[0], /Reviewed abcdef0 \(HEAD moved to 9998887\)/);

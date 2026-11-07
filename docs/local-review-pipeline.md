@@ -41,7 +41,7 @@ Every turn is a **fresh request**; nothing accumulates across turns. Each turn's
 - A confirmation counts only when its proof quote is real code from the evidence's CODE section (`quoteInCode`). The PR description and the docs do not count as proof.
 - The verifier may lower a severity, never raise it.
 - With `local_review.pipeline_verify_votes` = 2 or 3, every vote must confirm.
-- A verification that cannot run (transport error, or no verdict after one retry) keeps the candidate as reported, severity unchanged, and says so in assumptions. Candidates past the verify cap are kept the same way. A failure never becomes a clean result.
+- A verification that cannot run (transport error, or no verdict after one retry) and a candidate past the verify cap are counted in assumptions. When verified findings exist, these unjudged ones are not posted next to them; when none exist, they are kept as reported, severity unchanged. A failure never becomes a clean result.
 
 **Sampling.**
 - Feature turns use the configured local sampling.
@@ -65,7 +65,7 @@ Precision is enforced by the refute stage, so generation is now tuned for recall
 
 **Candidate generation**
 - Candidate turns use `HUNT_INSTRUCTIONS` instead of `REVIEW_INSTRUCTIONS`. They are told to report every defect they can tie to a changed line, with that line quoted, because a verifier checks each candidate. Style, docs, naming, log wording and test advice are still not findings.
-- Each feature gets one candidate pass per lens (`local_review.pipeline_lenses`, default 3):
+- A PR reviewed in one turn gets one candidate pass per lens (`local_review.pipeline_lenses`, default 3). A PR split into features gets one combined pass per feature (see Speed and precision below):
   - failure paths (catch / retry / async / partial failure, e.g. #1462's stale profile after a failed refresh);
   - data identity and invariants (key collisions, null, boundaries, e.g. #1468's same-name rows);
   - contracts (callers, callees, status codes, a test's expectation versus the implementation, e.g. #1473).
@@ -91,6 +91,42 @@ Precision is enforced by the refute stage, so generation is now tuned for recall
 
 **Posting cap.** The posting cap default is now 5.
 
+## Speed and precision (2026-11-07)
+
+WalkieBoard #566 (26 Swift files, 224K diff chars) took 2 and 4.5 hours for 84 and 87 turns, against 9–25 minutes for PRs of a similar size before the pipeline. It posted 5 false positives out of 9 findings, and 4 of the 5 carried "Verified against the code".
+
+| Cause | Change |
+|---|---|
+| 15 features × 3 lenses = 45 candidate turns | Lenses only for a PR reviewed in one turn; one combined pass per feature otherwise. |
+| 59 candidates for 16 verify slots | A feature of a larger PR asks for at most 3 candidates (a whole-PR turn: 6). |
+| 40 unverified candidates reached the selection, listed as verified | Next to verified findings, an unverified one is not posted; the assumptions say how many. With none verified they are kept as reported, and labelled as not verified. |
+| The verifier confirmed on a real quote alone | `VERIFY_RULES`: the report is presumed wrong until the code says otherwise; five checks (is the line changed, does the type allow it, is it handled, is it documented as intended, work the numbers through); the reply writes `trace` and `blocking_code` before `verdict`; "when in doubt, uncertain". |
+| The verifier saw the head code, not the change | The evidence carries the cited line's diff hunk, or says the PR does not change that line. |
+| Swift helpers were never found | The definition search knows `func`, `struct`, `protocol`, `extension`, `actor` (and Kotlin, Go, Rust forms). |
+| TypeScript habits applied to Swift (`TaskCancelledError`) | `LANGUAGE_NOTES` per file extension in candidate and verify turns. |
+| Claims about what a line "was" | Candidate turns tie a finding to a `+` line and may describe an old line only when its `-` line is in the diff. |
+| Swift sources ranked as docs (`review-budget.ts` had no `.swift`) | `.swift`, `.m`, `.mm`, `.h`, `.c`, `.cc`, `.cpp`, `.hpp`, `.kts`, `.scala`, `.dart` are code, and a root `Tests/` folder is tests. A feature turn now carries its own source with line numbers; this also changes the chat reviewers' context for such repositories. |
+| Every feature turn padded with ~24K chars of the PR's other files (tests, `Localizable.xcstrings`) | A feature of a split PR carries at most `PART_NON_CODE_MAX_CHARS` (6,000) of changed non-code files, prose docs (`.md`, `.txt`, …) first. |
+| The verifier could not see the design doc the PR edits | Its evidence adds `CHANGED_DOCS` (the PR's prose docs, up to 10% of its budget). They are never proof code. |
+
+Measured on #566's real diff with a mock model (turns and prompt characters; quality needs the real model):
+
+| | Turns | Prompt chars | Candidate turns |
+|---|---|---|---|
+| Before (#181, 3 lenses) | 62 | 2.60M | 42 × ~53K |
+| This change | 34 | 1.09M | 14 × ~45K, each with its own code context |
+
+Production adds retry turns on top (84–87 turns before).
+
+**Prompt prefix cache.** The local server (oMLX) reuses the KV cache of a prompt prefix it has already processed; on 2026-11-07 a request reused 8,192 of its 12,512 input tokens. The turns are ordered so that a PR's turns share as long a beginning as possible:
+
+- a verify turn: the fixed `VERIFY_RULES`, then the PR description and the PR's changed docs (the same for every candidate), then the language notes, the candidate and its own evidence;
+- a feature turn of a split PR: the instructions, PR description and reply shape (no per-feature `Changed:` line; FEATURE_GROUP names the files), then the repository rules, then the capped changed non-code files, then the feature's own code context, diff, PR map and feature block.
+
+On #566's diff the prefix a turn shares with an earlier one went from 86K to 325K chars (7% → 28% of all prompt text, before the PR description is counted). A whole-PR turn keeps the usual order.
+
+The verify turn now starts with its fixed rules, so every verify request shares the same prefix; a local server with prompt (prefix) caching reuses it. The ops line adds the elapsed minutes, for example `… 5 posted (41 turns, 52 min)`, and is no longer cut at 200 characters.
+
 ## Settings
 
 | Field | Default | Meaning |
@@ -98,7 +134,7 @@ Precision is enforced by the refute stage, so generation is now tuned for recall
 | `local_review.pipeline` | on | Off restores the grouped tool loop. |
 | `local_review.pipeline_max_findings` | 5 | 1–8: the selection's cap. |
 | `local_review.pipeline_verify_votes` | 1 | 1–3: refute turns per candidate. All must confirm. |
-| `local_review.pipeline_lenses` | 3 | 1–3: candidate passes per feature (1 = one combined pass). |
+| `local_review.pipeline_lenses` | 3 | 1–3: candidate passes for a PR reviewed in one turn (1 = one combined pass). A PR split into features always gets one pass per feature. |
 | `local_review.pipeline_keep_uncertain` | on | Post an undecided candidate at P2 when its own quote is real code. |
 
 ## Measuring it with the real model

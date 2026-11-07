@@ -8,7 +8,7 @@ const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'answer is of
   root_cause:'The constant changed.',evidence:'a.ts:1 `export const answer = 42;`',recommended_fix:'Keep 41.',recommended_test:'Assert 41.'};
 const dirty=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES',investigated_safe:[]});
 const reply=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
-const stage=body=>{const s=JSON.parse(body).messages[0].content;return s.startsWith('You summarize')?'map':/You verify ONE defect/.test(s)?'verify':s.startsWith('You rank')?'select':'review';};
+const stage=body=>{const s=JSON.parse(body).messages[0].content;return s.startsWith('You summarize')?'map':/You judge ONE reported defect/.test(s)?'verify':s.startsWith('You rank')?'select':'review';};
 const confirmed=JSON.stringify({verdict:'confirmed',reason:'the constant changed',proof_quote:'export const answer = 42;',severity:'P1'});
 const refuted=JSON.stringify({verdict:'refuted',reason:'documented change',counter_quote:'export const answer = 42;'});
 

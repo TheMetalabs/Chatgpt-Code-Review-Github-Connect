@@ -2,12 +2,15 @@
 // WHY: split out of github.server.ts (network) so ordering/budget is unit-testable
 // and so the prompt drops whole low-priority files instead of truncating mid-hunk.
 
-const CODE_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".rb", ".php", ".cs", ".rs", ".sql", ".vue", ".svelte"];
+// Swift, Objective-C, C/C++, Kotlin script, Scala and Dart are code too: without them a Swift PR's
+// sources ranked as docs, got no code context and were packed as "changed non-code files" (WalkieBoard).
+const CODE_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".kts", ".rb", ".php", ".cs", ".rs", ".sql", ".vue", ".svelte", ".swift", ".m", ".mm", ".h", ".c", ".cc", ".cpp", ".hpp", ".scala", ".dart"];
 const CONFIG_EXT = [".json", ".yml", ".yaml", ".toml"];
 const DOC_EXT = [".md", ".mdx", ".txt"];
 
 function isTestPath(p: string): boolean {
-  return /\.spec\.|\.test\.|__tests__|\/tests?\//.test(p);
+  // A tests folder at the repository root ("Tests/FooTests.swift") is a test path too.
+  return /\.spec\.|\.test\.|__tests__|(?:^|\/)tests?\//.test(p);
 }
 
 function hasExt(p: string, exts: string[]): boolean {

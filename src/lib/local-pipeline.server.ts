@@ -116,7 +116,9 @@ function noteTurn(ctx: Ctx, label: string, ms: number, usage: TurnUsage | undefi
   t.usageSeen = true;
   t.prompt += usage.prompt ?? 0;
   t.out += usage.out ?? 0;
-  if (usage.cached !== undefined) { t.cached += usage.cached; t.cachedSeen = true; }
+  // Cached tokens count only on a turn that also reports its prompt tokens: the cached share is taken of
+  // the summed prompt tokens, so a turn with cached but no prompt count could push it past 100%.
+  if (usage.cached !== undefined && usage.prompt !== undefined) { t.cached += usage.cached; t.cachedSeen = true; }
 }
 
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
@@ -1134,12 +1136,19 @@ export function rankSurvivors<T extends Pick<Finding, "severity" | "file" | "tit
 /**
  * Whether the select turn cannot change what is posted, so it is skipped (one model turn less). It picks
  * at most `max` and orders them; with at most `max` findings nothing has to be cut. It can also lower a
- * severity (nothing to lower when every finding is already P2) and merge two findings with one root cause:
- * two findings in one file still get the turn (one defect reported at two lines of a file is the usual
- * duplicate; one at the same line or quote was already merged by dedupeCandidates).
+ * severity (nothing to lower when every finding is already P2) and merge two findings with one root cause.
+ * dedupeCandidates merges only within a file (the same line or quote), so the select turn is the only step
+ * that merges across files: two findings in one file, or in two files of one feature group (a caller and
+ * its callee, e.g. a controller and its service, reporting one defect), still get the turn. A whole-PR run
+ * is one group, so there it runs for two or more findings.
  */
-function selectCanBeSkipped(rows: Pick<Finding, "severity" | "file">[], max: number): boolean {
-  return rows.length <= max && rows.every((r) => r.severity === "P2") && new Set(rows.map((r) => r.file)).size === rows.length;
+function selectCanBeSkipped(rows: (Pick<Finding, "severity" | "file"> & { group: number })[], max: number): boolean {
+  return (
+    rows.length <= max &&
+    rows.every((r) => r.severity === "P2") &&
+    new Set(rows.map((r) => r.file)).size === rows.length &&
+    new Set(rows.map((r) => r.group)).size === rows.length
+  );
 }
 
 /** The posted order without a select turn: severity, then confirmed before not confirmed (uncertain or
@@ -1592,6 +1601,10 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     const raw = finalJson({ findings, safe: unreviewed.length && !findings.length ? [] : safe, assumptions: [...assumptions, ...verifyNotes], coverage, unreviewed, refuted: stats.refuted, truncated });
     const summary = pipelineSummary(stats);
     deps.log?.(summary);
+    // The per-stage breakdown on a line of its own as well: harbor's log keeps only the first 300 chars of a
+    // line, and the summary line is usually longer, so the breakdown at its end would be cut off.
+    const stageLine = stageBreakdown(ctx.stages);
+    if (stageLine) deps.log?.(`pipeline stages: ${stageLine}`);
     const unparsedText = evidence.length ? evidence.join("\n\n---\n\n") : undefined;
     return { ok: true, raw, pipelineSummary: summary, ...(verifiedKeys.length ? { verifiedKeys } : {}), ...(unparsedText ? { unparsedText } : {}) };
   } catch (e) {

@@ -1131,6 +1131,25 @@ test("measurement: each turn's time and the server's usage (prompt, cached, out)
   assert.equal(m.count.select, 1, "two P1 findings still get the select turn");
   assert.match(out.pipelineSummary, / posted \(6 turns, \d+ min\) · map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/);
   assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50$/.test(l)), logs.join("\n"));
+  // harbor keeps only the first 300 chars of a log line, which cuts the breakdown off the summary: it is
+  // also logged on a line of its own, every stage on it.
+  assert.ok(logs.some((l) => /^pipeline stages: map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/.test(l)), logs.join("\n"));
+});
+
+test("measurement: cached tokens count only on turns that also report prompt tokens (the share never passes 100%)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F(), F({ title: "second distinct problem zzq", line: 2 })] }), verify: () => confirm() });
+  let verifyTurn = 0;
+  const request = async (...args) => {
+    const res = await m.request(...args);
+    if (stageOf(args[3]) !== "verify") return res;
+    // The first verify turn reports prompt and cached tokens, the second only a cached count.
+    verifyTurn += 1;
+    return { ...res, usage: verifyTurn === 1 ? { prompt_tokens: 1000, prompt_tokens_details: { cached_tokens: 800 } } : { cached_tokens: 900 } };
+  };
+  const out = await runLocalReviewPipeline(sample(), settings, { request });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(verifyTurn, 2);
+  assert.match(out.pipelineSummary, /· verify 2t [\d.]+m in 1K cached 80%( ·|$)/);
 });
 
 test("measurement: a server that reports no usage (or no cached count) still gets turns and minutes per stage", async () => {
@@ -1148,7 +1167,7 @@ test("measurement: a server that reports no usage (or no cached count) still get
   assert.match(withPrompt.pipelineSummary, /· verify 1t [\d.]+m in 100$/);
 });
 
-test("select: at most max findings, all P2 and in different files — no select turn; all posted, confirmed before uncertain", async () => {
+test("select: at most max findings, all P2, in different files of different feature groups — no select turn; all posted, confirmed before uncertain", async () => {
   const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
   const m = model({
     map: mapReply,
@@ -1161,6 +1180,27 @@ test("select: at most max findings, all P2 and in different files — no select 
   assert.equal(m.count.select, undefined, "no select request");
   assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.file), ["src/mail/mailer.ts", "src/orders/orders.controller.ts"]);
   assert.match(out.pipelineSummary, /1 confirmed, 1 uncertain, 0 refuted, 2 posted \(5 turns/);
+});
+
+test("select: two P2 findings in two files of one feature group (caller and callee) still get the select turn, which merges them", async () => {
+  // One root cause reported at the controller and at the service it calls: dedupeCandidates merges only
+  // within a file, so only the select turn can merge these two.
+  const caller = F({ severity: "P2", title: "create forwards an unvalidated amount to charge" });
+  const callee = F({ severity: "P2", file: "src/orders/orders.service.ts", line: 3, title: "charge passes the raw amount to pay", evidence: "src/orders/orders.service.ts:3 `return pay(amount);`" });
+  const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
+  const verify = (body) => ({ "src/orders/orders.service.ts": confirm("return pay(amount);", "P2"), "src/mail/mailer.ts": confirm("return queue.push(to);", "P2") })[candidateFile(body)] ?? confirm(undefined, "P2");
+  const run = async (rows, s = sample()) => {
+    const m = model({ map: mapReply, review: reviewFor(rows), verify, select: () => JSON.stringify({ selected: [{ id: "c1" }] }) });
+    const out = await runLocalReviewPipeline(s, settings, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    return { select: m.count.select ?? 0, posted: JSON.parse(out.raw).findings.map((f) => f.file) };
+  };
+  // Same feature group (orders), two files: the select turn runs and keeps one of the two.
+  assert.deepEqual(await run({ "src/orders/orders.controller.ts": [caller], "src/orders/orders.service.ts": [callee] }), { select: 1, posted: ["src/orders/orders.controller.ts"] });
+  // Different groups (orders, mailer), different files, all P2: nothing to merge, no select turn.
+  assert.deepEqual(await run({ "src/orders/orders.controller.ts": [caller], "src/mail/mailer.ts": [mail] }), { select: 0, posted: ["src/mail/mailer.ts", "src/orders/orders.controller.ts"] });
+  // The whole PR in one turn is one group: two findings get the select turn even in different files.
+  assert.deepEqual(await wholePr(() => run({ "src/orders/orders.controller.ts": [caller], "src/mail/mailer.ts": [mail] })), { select: 1, posted: ["src/orders/orders.controller.ts"] });
 });
 
 test("select: the turn still runs with more findings than max, a P1 it could lower, or two findings in one file (a possible duplicate)", async () => {
@@ -1180,26 +1220,45 @@ test("select: the turn still runs with more findings than max, a P1 it could low
 });
 
 test("prefix cache: verify turns go out grouped by file, files in severity order; the module docs come before the candidate", async () => {
-  const s = sample(FILES, { files: [...sample().files, { path: "src/orders/CLAUDE.md", content: "# Orders\nAmounts are validated in the service layer by design.", language: "md" }] });
+  const docs = [
+    { path: "src/orders/CLAUDE.md", content: "# Orders\nAmounts are validated in the service layer by design.", language: "md" },
+    { path: "src/mail/CLAUDE.md", content: "# Mail\nThe queue is created at startup.", language: "md" },
+  ];
+  const s = sample(FILES, { files: [...sample().files, ...docs] });
   const ctrl = (o) => F({ evidence: "src/orders/orders.controller.ts:3 `return charge(req.body.amount);`", ...o });
   const mail = (o) => F({ file: "src/mail/mailer.ts", line: 2, evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", ...o });
+  const title = (b) => /"title": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")?.[1];
+  // Different verdicts per candidate: the turns run in file order (bravo, delta, alpha, charlie) but the
+  // results are read back in severity order (bravo, alpha, delta, charlie). Matching them by position
+  // instead of by candidate id would give alpha delta's refutation and delta alpha's confirmation.
+  const verdicts = {
+    "alpha alphaq": () => confirm("return charge(req.body.amount);"),
+    "bravo bravoq": () => confirm("return queue.push(to);"),
+    "charlie charlieq": refute,
+    "delta deltaq": refute,
+  };
   const m = model({
     map: mapReply,
     review: reviewFor({
       "src/orders/orders.controller.ts": [ctrl({ severity: "P2", line: 2, title: "charlie charlieq" }), ctrl({ severity: "P1", title: "alpha alphaq" })],
       "src/mail/mailer.ts": [mail({ severity: "P1", title: "bravo bravoq" }), mail({ severity: "P2", line: 1, title: "delta deltaq" })],
     }),
-    verify: refute,
+    verify: (body) => verdicts[title(body)](body),
+    // The select turn keeps every finding it is shown, in its order.
+    select: (body) => JSON.stringify({ selected: [...body.messages[1].content.matchAll(/"id": "(c\d+)"/g)].map((x) => ({ id: x[1] })) }),
   });
   const out = await runLocalReviewPipeline(s, settings, { request: m.request });
   assert.equal(out.ok, true, out.error);
   const turns = m.bodies.filter((b) => stageOf(b) === "verify");
-  const title = (b) => /"title": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")?.[1];
   // The mailer feature is reviewed first, so its P1 is the first candidate: its file goes first.
   assert.deepEqual(turns.map(title), ["bravo bravoq", "delta deltaq", "alpha alphaq", "charlie charlieq"]);
+  // Each verify request carries its file's module docs once (in front of the candidate, not also after its code).
+  for (const t of turns) assert.equal(t.messages[1].content.split("<<<MODULE_DOCS").length, 2, title(t));
   const [a, b] = turns.slice(2).map((t) => t.messages[1].content);
   const shared = commonPrefix(a, b);
   assert.match(a.slice(0, shared), /<<<MODULE_DOCS[\s\S]*validated in the service layer by design/, "one file's module docs are in the prefix its verify turns share");
   assert.ok(a.indexOf("<<<CANDIDATE") <= shared);
-  assert.match(out.pipelineSummary, /4 to verify, 0 confirmed, 4 refuted/);
+  assert.match(out.pipelineSummary, /4 to verify, 2 confirmed, 2 refuted, 2 posted/);
+  // Each candidate's own verdict decides: exactly the two confirmed titles are posted.
+  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["bravo bravoq", "alpha alphaq"]);
 });

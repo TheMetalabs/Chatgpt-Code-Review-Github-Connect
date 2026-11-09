@@ -1103,8 +1103,7 @@ test("enclosingName: a bare assignment of an arrow function is not the enclosing
   assert.equal(enclosingName(["export class Form {", "  onSave: Handler = async (form) => {", "    await api.save(form!);", "  };", "}"], 3, "src/form.ts"), "onSave");
 });
 
-// ── Speed (2026-11-09): per-turn measurement, a select turn that cannot change the result, verify turns in
-// prefix-cache order ──
+// ── Speed (2026-11-09): per-turn measurement, verify turns in prefix-cache order; the select turn is kept ──
 
 const candidateFile = (body) => /"file": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? "")?.[1];
 
@@ -1167,56 +1166,17 @@ test("measurement: a server that reports no usage (or no cached count) still get
   assert.match(withPrompt.pipelineSummary, /· verify 1t [\d.]+m in 100$/);
 });
 
-test("select: at most max findings, all P2, in different files of different feature groups — no select turn; all posted, confirmed before uncertain", async () => {
+test("select: two P2 findings in different files of different feature groups still get the select turn (feature groups do not prove two findings unrelated)", async () => {
   const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
   const m = model({
     map: mapReply,
     review: reviewFor({ "src/orders/orders.controller.ts": [F({ severity: "P2" })], "src/mail/mailer.ts": [mail] }),
-    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : JSON.stringify({ verdict: "uncertain", reason: "cannot tell" })),
-    select: () => JSON.stringify({ selected: [{ id: "c1" }] }),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : confirm(undefined, "P2")),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c2" }] }),
   });
-  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.equal(out.ok, true, out.error);
-  assert.equal(m.count.select, undefined, "no select request");
-  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.file), ["src/mail/mailer.ts", "src/orders/orders.controller.ts"]);
-  assert.match(out.pipelineSummary, /1 confirmed, 1 uncertain, 0 refuted, 2 posted \(5 turns/);
-});
-
-test("select: two P2 findings in two files of one feature group (caller and callee) still get the select turn, which merges them", async () => {
-  // One root cause reported at the controller and at the service it calls: dedupeCandidates merges only
-  // within a file, so only the select turn can merge these two.
-  const caller = F({ severity: "P2", title: "create forwards an unvalidated amount to charge" });
-  const callee = F({ severity: "P2", file: "src/orders/orders.service.ts", line: 3, title: "charge passes the raw amount to pay", evidence: "src/orders/orders.service.ts:3 `return pay(amount);`" });
-  const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
-  const verify = (body) => ({ "src/orders/orders.service.ts": confirm("return pay(amount);", "P2"), "src/mail/mailer.ts": confirm("return queue.push(to);", "P2") })[candidateFile(body)] ?? confirm(undefined, "P2");
-  const run = async (rows, s = sample()) => {
-    const m = model({ map: mapReply, review: reviewFor(rows), verify, select: () => JSON.stringify({ selected: [{ id: "c1" }] }) });
-    const out = await runLocalReviewPipeline(s, settings, { request: m.request });
-    assert.equal(out.ok, true, out.error);
-    return { select: m.count.select ?? 0, posted: JSON.parse(out.raw).findings.map((f) => f.file) };
-  };
-  // Same feature group (orders), two files: the select turn runs and keeps one of the two.
-  assert.deepEqual(await run({ "src/orders/orders.controller.ts": [caller], "src/orders/orders.service.ts": [callee] }), { select: 1, posted: ["src/orders/orders.controller.ts"] });
-  // Different groups (orders, mailer), different files, all P2: nothing to merge, no select turn.
-  assert.deepEqual(await run({ "src/orders/orders.controller.ts": [caller], "src/mail/mailer.ts": [mail] }), { select: 0, posted: ["src/mail/mailer.ts", "src/orders/orders.controller.ts"] });
-  // The whole PR in one turn is one group: two findings get the select turn even in different files.
-  assert.deepEqual(await wholePr(() => run({ "src/orders/orders.controller.ts": [caller], "src/mail/mailer.ts": [mail] })), { select: 1, posted: ["src/orders/orders.controller.ts"] });
-});
-
-test("select: the turn still runs with more findings than max, a P1 it could lower, or two findings in one file (a possible duplicate)", async () => {
-  const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
-  const verify = (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : confirm(undefined, "P2"));
-  const cases = [
-    [{ "src/orders/orders.controller.ts": [F({ severity: "P2" })], "src/mail/mailer.ts": [mail] }, 1, verify],
-    [{ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] }, 5, (b) => (candidateFile(b) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : confirm())],
-    [{ "src/orders/orders.controller.ts": [F({ severity: "P2" }), F({ severity: "P2", line: 2, title: "create exported without a guard qq" })] }, 5, verify],
-  ];
-  for (const [rows, max, v] of cases) {
-    const m = model({ map: mapReply, review: reviewFor(rows), verify: v, select: () => JSON.stringify({ selected: [{ id: "c1" }] }) });
-    const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: max }, { request: m.request });
-    assert.equal(out.ok, true, out.error);
-    assert.equal(m.count.select, 1, JSON.stringify(rows));
-  }
+  assert.equal(m.count.select, 1, "a select request is sent");
 });
 
 test("prefix cache: verify turns go out grouped by file, files in severity order; the module docs come before the candidate", async () => {

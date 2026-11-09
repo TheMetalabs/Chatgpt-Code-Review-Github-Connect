@@ -16,8 +16,7 @@
  *                  with evidence Ashlar collects itself (the cited code, the definitions and uses of the
  *                  symbols it names, the module docs, the PR description). Only a candidate the verifier
  *                  confirms with a quote that exists in that code survives.
- *   4. Select    — one turn merges duplicates and keeps the most important few (Settings cap); skipped
- *                  when it cannot change what is posted (selectCanBeSkipped).
+ *   4. Select    — one turn merges duplicates and keeps the most important few (Settings cap).
  */
 import { buildChatParts, buildPolicyAttachment, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, prDescriptionBlock, REVIEW_INSTRUCTIONS, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { changedExportedSymbols } from "./context-slice.ts";
@@ -1133,33 +1132,8 @@ export function rankSurvivors<T extends Pick<Finding, "severity" | "file" | "tit
     .slice(0, Math.max(0, max));
 }
 
-/**
- * Whether the select turn cannot change what is posted, so it is skipped (one model turn less). It picks
- * at most `max` and orders them; with at most `max` findings nothing has to be cut. It can also lower a
- * severity (nothing to lower when every finding is already P2) and merge two findings with one root cause.
- * dedupeCandidates merges only within a file (the same line or quote), so the select turn is the only step
- * that merges across files: two findings in one file, or in two files of one feature group (a caller and
- * its callee, e.g. a controller and its service, reporting one defect), still get the turn. A whole-PR run
- * is one group, so there it runs for two or more findings.
- */
-function selectCanBeSkipped(rows: (Pick<Finding, "severity" | "file"> & { group: number })[], max: number): boolean {
-  return (
-    rows.length <= max &&
-    rows.every((r) => r.severity === "P2") &&
-    new Set(rows.map((r) => r.file)).size === rows.length &&
-    new Set(rows.map((r) => r.group)).size === rows.length
-  );
-}
-
-/** The posted order without a select turn: severity, then confirmed before not confirmed (uncertain or
- * unverified), then as found; one per file+title, at most `max` (rankSurvivors). */
-function postInOrder<T extends Pick<Finding, "severity" | "file" | "title"> & { confirmed?: boolean }>(rows: T[], max: number): T[] {
-  return rankSurvivors([...rows].sort((a, b) => Number(b.confirmed === true) - Number(a.confirmed === true)), max);
-}
-
-async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string; confirmed?: boolean })[], map: Map<string, MapEntry>, max: number, verified = true): Promise<{ picked: Candidate[]; byModel: boolean }> {
+async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string })[], map: Map<string, MapEntry>, max: number, verified = true): Promise<{ picked: Candidate[]; byModel: boolean }> {
   if (survivors.length <= 1) return { picked: survivors.slice(0, max), byModel: false };
-  if (selectCanBeSkipped(survivors, max)) return { picked: postInOrder(survivors, max), byModel: false };
   const list = survivors.map((c) => ({
     id: c.cid, severity: c.severity, file: c.file, line: c.line, title: c.title,
     failure_scenario: clip(c.failureScenario, 300), verified_because: clip(c.verifyReason, 200),
@@ -1340,17 +1314,17 @@ async function refuteAndSelect(
   }
   // Candidates past the verify cap were never judged: they stay candidates as reported (ranked last by
   // the selection), never silently dropped into a clean result.
-  const survivors: (Candidate & { verifyReason: string; verified: boolean; confirmed: boolean })[] = [];
+  const survivors: (Candidate & { verifyReason: string; verified: boolean })[] = [];
   let unverifiedPosted = 0;
   for (const c of toVerify) {
     const r = results.get(c.cid) as VerifyResult;
     if (r.status === "confirmed") {
       stats.confirmed += 1;
       const evidence = r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
-      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true, confirmed: true });
+      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true });
     } else if (r.status === "uncertain") {
       stats.uncertain += 1;
-      survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true, confirmed: false });
+      survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true });
     } else if (r.status === "refuted") {
       stats.refuted += 1;
       ctx.deps.log?.(`pipeline refuted ${c.file}:${c.line} (${c.title}): ${r.reason}`);
@@ -1360,10 +1334,10 @@ async function refuteAndSelect(
       // publish threshold cannot filter it away either — and said so.
       stats.unverified += 1;
       unverifiedPosted += 1;
-      survivors.push({ ...c, verifyReason: "not verified", verified: false, confirmed: false });
+      survivors.push({ ...c, verifyReason: "not verified", verified: false });
     }
   }
-  for (const c of overCap) survivors.push({ ...c, verifyReason: "not verified (over the verify cap)", verified: false, confirmed: false });
+  for (const c of overCap) survivors.push({ ...c, verifyReason: "not verified (over the verify cap)", verified: false });
   // A candidate the verifier never judged competes for a posting slot only when nothing was verified:
   // next to verified findings it is the least reliable kind (on WalkieBoard #566, 40 of 56 candidates
   // were past the cap). With none verified it is kept as reported (a failure never becomes a clean result).

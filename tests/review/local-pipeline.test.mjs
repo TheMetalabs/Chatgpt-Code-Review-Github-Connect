@@ -816,17 +816,17 @@ test("verifier rule 6: a claim about what a caller, client, database or config s
 
 test("calledNames: plain lower-case methods, member calls and JSX components; keywords and collection helpers left out", () => {
   assert.deepEqual(calledNames("switch whole.revert(in: &field) { case .kept: log(x) }"), ["revert"]);
-  assert.deepEqual(calledNames("return <TaskRowMeta task={task} /> && items.map((x) => format(x))"), ["TaskRowMeta", "format"]);
-  assert.deepEqual(calledNames("if (ok) { getApi(url, {}, { responseType: 'blob' }) }"), ["getApi"]);
+  assert.deepEqual(calledNames("return <ItemBadge item={item} /> && items.map((x) => format(x))"), ["ItemBadge", "format"]);
+  assert.deepEqual(calledNames("if (ok) { fetchJson(url, {}, { raw: true }) }"), ["fetchJson"]);
 });
 
 test("enclosingName: the function, method or component that holds a line", () => {
-  const js = ["export default function TaskRowMeta({ task }) {", "  const due = task.dueLabel;", "  return due;", "}"];
-  assert.equal(enclosingName(js, 2), "TaskRowMeta");
+  const js = ["export default function ItemBadge({ item }) {", "  const due = item.label;", "  return due;", "}"];
+  assert.equal(enclosingName(js, 2), "ItemBadge");
   const swift = ["final class Host {", "  private func revertSwap() {", "    defer { offerRevert() }", "  }", "}"];
   assert.equal(enclosingName(swift, 3), "revertSwap");
-  const arrow = ["const downloadEContract = async (id) => {", "  return getApi(url, {}, other);", "};"];
-  assert.equal(enclosingName(arrow, 2), "downloadEContract");
+  const arrow = ["const downloadFile = async (id) => {", "  return fetchJson(url, {}, other);", "};"];
+  assert.equal(enclosingName(arrow, 2), "downloadFile");
 });
 
 test("evidence: the verifier sees the definition of a lower-case method the cited line calls, in another file (WalkieBoard #570)", () => {
@@ -840,12 +840,12 @@ test("evidence: the verifier sees the definition of a lower-case method the cite
 });
 
 test("evidence: the verifier sees who calls the cited function (aicc: a component only rendered for an existing row)", () => {
-  const files = { "src/tasks/TaskRowMeta.js": "export default function TaskRowMeta({ task }) {\n  const label = task.dueLabel;\n  return label;\n}\n" };
+  const files = { "src/items/ItemBadge.js": "export default function ItemBadge({ item }) {\n  const label = item.label;\n  return label;\n}\n" };
   // The caller is not changed by the PR: only the caller search reaches it.
-  const s = sample(files, { referenceFiles: [{ path: "src/tasks/TaskRow.js", content: "import TaskRowMeta from './TaskRowMeta';\nexport function TaskRow({ task }) {\n  if (!task) return null;\n  return <TaskRowMeta task={task} />;\n}\n" }] });
-  const f = { id: "x", status: "accepted", severity: "P2", file: "src/tasks/TaskRowMeta.js", line: 2, side: "RIGHT", title: "Unhandled null task prop crashes the render", failureScenario: "A caller renders it with task null.", rootCause: "No guard.", evidence: "src/tasks/TaskRowMeta.js:2 `const label = task.dueLabel;`", recommendedFix: "f", recommendedTest: "t" };
+  const s = sample(files, { referenceFiles: [{ path: "src/items/ItemRow.js", content: "import ItemBadge from './ItemBadge';\nexport function ItemRow({ item }) {\n  if (!item) return null;\n  return <ItemBadge item={item} />;\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P2", file: "src/items/ItemBadge.js", line: 2, side: "RIGHT", title: "Unhandled null item prop crashes the render", failureScenario: "A caller renders it with item null.", rootCause: "No guard.", evidence: "src/items/ItemBadge.js:2 `const label = item.label;`", recommendedFix: "f", recommendedTest: "t" };
   const pack = evidencePack(s, f, new Map(), 20_000);
-  assert.match(pack.code, /src\/tasks\/TaskRow\.js[\s\S]*if \(!task\) return null;[\s\S]*<TaskRowMeta task=\{task\} \/>/);
+  assert.match(pack.code, /src\/items\/ItemRow\.js[\s\S]*if \(!item\) return null;[\s\S]*<ItemBadge item=\{item\} \/>/);
 });
 
 test("feature turn: CALLEE_DEFINITIONS carries the code its added lines call in another feature's file", async () => {

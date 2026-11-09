@@ -877,3 +877,18 @@ test("fitsOneTurn: the PR the pipeline reviews as one whole-PR feature is a smal
   });
 });
 
+
+test("enclosingName: a parenthesized value is not a function; an arrow function is (Codex #184)", () => {
+  assert.equal(enclosingName(["function ItemBadge(item) {", "  const label = (item.label);", "  return label;", "}"], 3), "ItemBadge");
+  assert.equal(enclosingName(["const format = (x: number): string => {", "  return String(x);", "};"], 2), "format");
+  assert.equal(enclosingName(["const total = (a + b) * 2;", "export const pick = async (id) => {", "  return id;", "};"], 3), "pick");
+});
+
+test("evidence: a standalone call in an unchanged file is a caller, not a definition (Codex #184)", () => {
+  // The cited line is well below the header, so only the caller search (not a definition lookup) can reach Runner.swift.
+  const files = { "App/Tasks.swift": "final class Tasks {\n  func processTask(task: Task?) {\n    log(1)\n    log(2)\n    log(3)\n    log(4)\n    let id = task!.id\n    let name = task!.name\n    store(id, name)\n  }\n}\n" };
+  const s = sample(files, { referenceFiles: [{ path: "App/Runner.swift", content: "final class Runner {\n  func run() {\n    processTask(task: nil)\n  }\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P1", file: "App/Tasks.swift", line: 8, side: "RIGHT", title: "Force unwrap crashes on a nil value", failureScenario: "A caller passes nil.", rootCause: "No guard.", evidence: "App/Tasks.swift:8 `let name = task!.name`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /App\/Runner\.swift[\s\S]*processTask\(task: nil\)/);
+});

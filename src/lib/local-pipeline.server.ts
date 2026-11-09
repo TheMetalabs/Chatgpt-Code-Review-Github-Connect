@@ -634,9 +634,31 @@ export function calledNames(code: string): string[] {
   return out;
 }
 
+/** A declaration of `name` (never a call): a keyword declaration, a binding, or a method/function header
+ * that opens its body on the line. DEF_RE also accepts an indented `name(`, which a standalone call
+ * (`processTask(task: nil)`) matches too. */
+const DECL_RE = (name: string) =>
+  new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$)`);
+
+/** Where `name` is declared among `files`: the first declaration proper in any file, else (only when no
+ * file declares it) the first looser DEF_RE match. [path, 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string): [string, number] | null {
+  const n = name.replace(/[$]/g, "\\$");
+  const all = [...files];
+  for (const re of [DECL_RE(n), DEF_RE(n)]) {
+    for (const [path, lines] of all) {
+      const i = lines.findIndex((l) => re.test(l));
+      if (i >= 0) return [path, i];
+    }
+  }
+  return null;
+}
+
 const ENCLOSING_RE = [
   /\b(?:func|function|fun|fn|def)\s+([A-Za-z_$][\w$]*)/,
-  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+  // A binding is a function only when its initializer is one: an arrow function, `function`, or `x =>`
+  // (a parenthesized value such as `(item.label)` is not).
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
   /^\s*(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^={]+)?\{\s*$/,
 ];
 
@@ -655,8 +677,8 @@ export function enclosingName(lines: string[], line: number): string | null {
 function callSiteLines(lines: string[], name: string): number[] {
   const n = name.replace(/[$]/g, "\\$");
   const use = new RegExp(`(?<![\\w$])${n}\\s*\\(|<${n}[\\s/>]`);
-  const def = DEF_RE(n);
-  return lines.flatMap((l, i) => (use.test(l) && !def.test(l) ? [i] : []));
+  const decl = DECL_RE(n);
+  return lines.flatMap((l, i) => (use.test(l) && !decl.test(l) ? [i] : []));
 }
 
 /** Definition windows, from files outside `exclude`, of the names a feature's added lines call: the
@@ -672,14 +694,12 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
   const blocks: string[] = [];
   let used = 0;
   for (const name of calledNames(added).slice(0, 24)) {
-    const def = DEF_RE(name.replace(/[$]/g, "\\$"));
-    for (const [path, lines] of corpus) {
-      const i = lines.findIndex((l) => def.test(l));
-      if (i < 0) continue;
-      const w = gutter(path, lines, i - 1, i + 14);
-      if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; }
-      break;
-    }
+    const found = findDefinition(corpus, name);
+    if (!found) continue;
+    const [path, i] = found;
+    const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
+    const w = gutter(path, lines, i - 1, i + 14);
+    if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; }
   }
   return blocks.length ? `<<<CALLEE_DEFINITIONS (code in other files that this feature's added lines call; not shown elsewhere in this turn)>>>\n${blocks.join("\n\n")}\n<<<END>>>` : "";
 }
@@ -792,11 +812,8 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   ].join("\n");
   for (const name of calledNames(citedCode).slice(0, 8)) {
     if (defs >= 6) break;
-    const def = DEF_RE(name.replace(/[$]/g, "\\$"));
-    for (const [path, lines] of corpus) {
-      const i = lines.findIndex((l) => def.test(l));
-      if (i >= 0) { addCode(path, i + 1, 3, 15); defs += 1; break; }
-    }
+    const found = findDefinition(corpus, name);
+    if (found) { addCode(found[0], found[1] + 1, 3, 15); defs += 1; }
   }
   // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
   // call site (aicc: a component only rendered for an existing row).

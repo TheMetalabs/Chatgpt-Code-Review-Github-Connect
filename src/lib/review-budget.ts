@@ -17,6 +17,11 @@ function hasExt(p: string, exts: string[]): boolean {
   return exts.some((e) => p.endsWith(e));
 }
 
+/** A source code file (a test file included), by extension. */
+export function isCodePath(path: string): boolean {
+  return hasExt(String(path || "").toLowerCase(), CODE_EXT);
+}
+
 /** 0 code · 1 test · 2 config · 3 doc/other. Lower rank = higher prompt priority. */
 export function rankChangedFile(path: string): 0 | 1 | 2 | 3 {
   const p = String(path || "").toLowerCase();

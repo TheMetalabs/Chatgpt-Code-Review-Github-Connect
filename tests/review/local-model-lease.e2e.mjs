@@ -243,10 +243,10 @@ test('short lane: a holding review lends the model to a waiting short job at its
 // ── Small reviews and re-requests (2026-11-09: small PRs waited 50–90 minutes behind large reviews; a
 // re-request went to the back of the queue) ──
 
-async function pipelineFixture(t){
+async function pipelineFixture(t,github={}){
   let leaseModule;
   const wrap={'src/lib/local-model-lease.ts':real=>{leaseModule=real;return real;}};
-  const app=await appFixture({reviewChatgpt:false,localReviewPipeline:true,localJsonRepairEnabled:false,localPipelineLenses:1},{wrap});
+  const app=await appFixture({reviewChatgpt:false,localReviewPipeline:true,localJsonRepairEnabled:false,localPipelineLenses:1},{...github,wrap});
   t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   return {app,lease:()=>leaseModule.localModelLease()};
@@ -319,5 +319,36 @@ test('re-request: a job that supersedes a queued one for the same PR keeps its p
     repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'PR 2'},comment:{id:999,body:'@ashlar-bot review'}}});
   await eventually(()=>lease().snapshot().queued.includes(out.jobId),'the re-request is not queued');
   assert.deepEqual([...lease().snapshot().queued],[out.jobId,c],'the re-request keeps PR 2\'s place ahead of PR 3');
+  t.after(answerAll(app,0));
+});
+
+test('re-request: the superseding job keeps the time the old job queued for the model, not when it was created', async t=>{
+  // The old job for PR 2 is created first but its local leg queues last (here its head lookup is slow;
+  // in verify mode the local leg starts only after the chat leg). Its re-request must not jump ahead of
+  // PR 3, which queued before it.
+  let holdHead=false,releaseHead=()=>{};
+  const headGate=new Promise(resolve=>{releaseHead=resolve;});
+  const {app,lease}=await pipelineFixture(t,{beforeHead:()=>holdHead?headGate:undefined});
+  t.after(()=>releaseHead());
+  app.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS='20'; // every PR "large": one lane, ordered by queue time
+  await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  app.clock.now+=60_000;
+  holdHead=true;
+  const b=(await mentionPr(app,2)).jobId; // created now, but held before its snapshot
+  await eventually(()=>app.githubCalls.head>=2,'PR 2 head lookup did not start');
+  holdHead=false;
+  app.clock.now+=60_000;
+  const c=await started(app,3);
+  await eventually(()=>lease().snapshot().queued.includes(c),'C not queued');
+  app.clock.now+=60_000;
+  releaseHead();
+  await eventually(()=>lease().snapshot().queued.includes(b),'B not queued');
+  assert.deepEqual([...lease().snapshot().queued],[c,b],'B queued after C');
+  app.clock.now+=60_000;
+  const out=await app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'lease-pr-2-again',event:'issue_comment',payload:{action:'created',installation:{id:1},
+    repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'PR 2'},comment:{id:998,body:'@ashlar-bot review'}}});
+  await eventually(()=>lease().snapshot().queued.includes(out.jobId),'the re-request is not queued');
+  assert.deepEqual([...lease().snapshot().queued],[c,out.jobId],'the re-request keeps B\'s place behind C');
   t.after(answerAll(app,0));
 });

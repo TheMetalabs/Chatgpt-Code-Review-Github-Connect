@@ -100,8 +100,9 @@ const localSamples = new Map<string, SamplePr>();
 const localHeadReads = new Map<string, Map<string, string>>();
 /** Per job: the local pipeline's verified finding keys (finding-gate verifiedKey), for its leg's gate. */
 const localVerifiedKeys = new Map<string, Set<string>>();
-/** The local-model queue time a job inherits from the job(s) for the same PR it superseded: a re-request
- * keeps its place in the queue instead of going to the back (jobId → ms). */
+/** When a job's local leg first queued for the local model, or the time it inherited from the job(s) for
+ * the same PR it superseded: a re-request keeps its place in the queue instead of going to the back
+ * (jobId → ms). */
 const localQueueSince = new Map<string, number>();
 // In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
 // the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
@@ -1002,6 +1003,10 @@ async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> 
   // model at a turn boundary. (A one-turn PR with many files split-retried into 23 turns on the small lane.)
   const sample = localSamples.get(jobId);
   const small = state.settings.localReviewPipeline !== false && sample !== undefined && isSmallReview(sample, state.settings);
+  // The job's place in the queue is when its local leg first asked for the model (or the place it
+  // inherited from a job it superseded), not when its webhook arrived: in verify mode the local leg
+  // starts only after the chat leg, so a re-request must not jump ahead of reviews queued before it.
+  if (!localQueueSince.has(jobId)) localQueueSince.set(jobId, Date.now());
   const handle = await localModelLease().acquire(jobId, {
     signal,
     lane: small ? "small" : "review",
@@ -2274,8 +2279,10 @@ function enqueueFromDecision(
   // transitionJob, which aborts its local leg and frees its snapshot.
   const supersededJobs = state.jobs.filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status));
   const superseded = supersededJobs.map((j) => j.id);
-  // The new job keeps the queue place of the oldest job it replaces (a re-request is not a new arrival).
-  const keepSince = supersededJobs.reduce((n, j) => Math.min(n, localQueueSince.get(j.id) ?? j.createdAt), Infinity);
+  // The new job keeps the queue place of the oldest job it replaces (a re-request is not a new arrival):
+  // the time that job's local leg queued for the model, never its creation time (a job whose leg had not
+  // queued yet has no place to keep; the new job queues when its own leg asks).
+  const keepSince = supersededJobs.reduce((n, j) => Math.min(n, localQueueSince.get(j.id) ?? Infinity), Infinity);
   if (Number.isFinite(keepSince)) localQueueSince.set(job.id, keepSince);
   for (const id of superseded) {
     transitionJob(id, (j) => ({ ...j, status: "cancelled", skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }));

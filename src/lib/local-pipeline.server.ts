@@ -21,7 +21,7 @@
 import { buildChatParts, buildPolicyAttachment, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, prDescriptionBlock, REVIEW_INSTRUCTIONS, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { changedExportedSymbols } from "./context-slice.ts";
 import { extractChatJsonParts, lastJsonObjectRange } from "./extract-chat-json.ts";
-import { importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
+import { importGraph, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
@@ -40,7 +40,7 @@ import {
 } from "./local-review-loop.server.ts";
 import { applyFindingGate, gateLiveSubmission } from "./poster.ts";
 import { unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
-import { orderFiles, rankChangedFile } from "./review-budget.ts";
+import { isCodePath, orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, Finding, SamplePr, Severity } from "./types.ts";
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
@@ -462,6 +462,8 @@ export function languageNotes(paths: string[]): string {
 
 type GroupOutcome = { files: string[]; raw: string | null; replies: string[] };
 
+const TS_LIKE_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+
 async function reviewFeature(
   ctx: Ctx,
   sample: SamplePr,
@@ -487,11 +489,11 @@ async function reviewFeature(
     languageNotes(files),
   ].filter(Boolean).join("\n");
   // The code this feature calls in other files (another feature's changed file, an unchanged module):
-  // most false positives were claims a callee or a config list elsewhere refutes. TypeScript/JavaScript
-  // whole-PR turns already carry imported definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here.
-  const tsLike = (p: string) => /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(p);
-  const calleeBlock = !whole || files.some((p) => !tsLike(p))
-    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)))
+  // most false positives were claims a callee or a config list elsewhere refutes. A whole-PR turn of
+  // TypeScript/JavaScript code (non-code files such as package.json aside) already carries its imported
+  // definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here, less what that block carries.
+  const calleeBlock = !whole || files.some((p) => isCodePath(p) && !TS_LIKE_RE.test(p))
+    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)), whole)
     : "";
   const built = buildChatParts({
     sample: sub,
@@ -625,34 +627,53 @@ const CALL_STOP = new Set([
  * component). Plain lower-case method names count too: a verifier that never saw `revert(in:)`'s body
  * confirmed a claim that body refutes (WalkieBoard #570). */
 export function calledNames(code: string): string[] {
-  const out: string[] = [];
+  const out = new Set<string>();
   for (const m of code.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
     const name = m[1] ?? m[2] ?? "";
-    if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name) || out.includes(name)) continue;
-    out.push(name);
+    if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name)) continue;
+    out.add(name);
   }
-  return out;
+  return [...out];
 }
 
-/** A declaration of `name` (never a call): a keyword declaration, a binding, or a method/function header
- * that opens its body on the line. DEF_RE also accepts an indented `name(`, which a standalone call
- * (`processTask(task: nil)`) matches too. */
-const DECL_RE = (name: string) =>
-  new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$)`);
+/** Swift and Kotlin declare every function and initializer with a keyword (func, fun, init): there a
+ * `name(args) {` line is a call with a trailing closure (`persist(item) {`, `VStack(spacing: 8) {`). */
+const TRAILING_CLOSURE_RE = /\.(?:swift|kt|kts)$/;
 
-/** Where `name` is declared among `files`: the first declaration proper in any file, else (only when no
- * file declares it) the first looser DEF_RE match. Within each pass the `prefer` paths are searched first,
- * in order (see definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based
- * line] or null. */
-function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
+/** A keyword declaration or a binding of `name`. */
+const DECL_KEYWORD_RE = (name: string) =>
+  new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])`);
+/** A method/function header of `name` that opens its body on the line (not in Swift/Kotlin, see TRAILING_CLOSURE_RE). */
+const DECL_HEADER_RE = (name: string) =>
+  new RegExp(`^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$`);
+
+/** A declaration of `name` (never a call) in a file at `path`: a keyword declaration, a binding, or (outside
+ * Swift/Kotlin) a method/function header that opens its body on the line. DEF_RE also accepts an indented
+ * `name(`, which a standalone call (`processTask(task: nil)`) matches too. */
+const DECL_RE = (name: string, path: string) =>
+  TRAILING_CLOSURE_RE.test(path) ? DECL_KEYWORD_RE(name) : new RegExp(`${DECL_KEYWORD_RE(name).source}|${DECL_HEADER_RE(name).source}`);
+
+/** Where `name` is declared among `files`: the first declaration proper in any file (within a file a
+ * keyword declaration or binding before a header-only match), else (only when no file declares it, and
+ * unless `loose` is false) the first looser DEF_RE match. Within each pass the `prefer` paths are searched
+ * first, in order (see definitionOrder), so a same-named function in an unrelated module loses. [path,
+ * 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = [], loose = true): [string, number] | null {
   const n = name.replace(/[$]/g, "\\$");
   const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
   const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
-  for (const re of [DECL_RE(n), DEF_RE(n)]) {
-    for (const [path, lines] of all) {
-      const i = lines.findIndex((l) => re.test(l));
-      if (i >= 0) return [path, i];
-    }
+  const keyword = DECL_KEYWORD_RE(n);
+  const header = DECL_HEADER_RE(n);
+  for (const [path, lines] of all) {
+    let i = lines.findIndex((l) => keyword.test(l));
+    if (i < 0 && !TRAILING_CLOSURE_RE.test(path)) i = lines.findIndex((l) => header.test(l));
+    if (i >= 0) return [path, i];
+  }
+  if (!loose) return null;
+  const def = DEF_RE(n);
+  for (const [path, lines] of all) {
+    const i = lines.findIndex((l) => def.test(l));
+    if (i >= 0) return [path, i];
   }
   return null;
 }
@@ -662,18 +683,33 @@ function definitionOrder(from: string, content: string): string[] {
   return [from, ...importSpecifiers(content).flatMap((spec) => resolveRelativeImport(from, spec))];
 }
 
-const ENCLOSING_RE = [
+const ENCLOSING_DECL_RE = [
   /\b(?:func|function|fun|fn|def)\s+([A-Za-z_$][\w$]*)/,
-  // A binding is a function only when its initializer is one: an arrow function, `function`, or `x =>`
-  // (a parenthesized value such as `(item.label)` is not).
-  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+  // A binding or class property is a function only when its initializer is one: an arrow function,
+  // `function`, or `x =>` (a parenthesized value such as `(item.label)` is not). A type annotation may
+  // come first (`const ItemBadge: React.FC<Props> = ({ item }) => {`, `private onSave = async (o) => {`).
+  /^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly|override)\s+)*)([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+];
+// A bare `name(args) {` header; in Swift/Kotlin that line is a call with a trailing closure (TRAILING_CLOSURE_RE).
+const ENCLOSING_RE = [
+  ...ENCLOSING_DECL_RE,
   /^\s*(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^={]+)?\{\s*$/,
 ];
+const SCOPE_MODIFIERS = String.raw`(?:@\w+\s+|(?:public|private|protected|internal|fileprivate|open|final|static|override|required|convenience|nonisolated|lazy)\s+)*`;
+/** Scopes whose callers cannot be found by a name: an initializer or constructor (called as `Player(url:)`
+ * or `new Player(`), and in Swift/Kotlin a computed property (`var body: some View {`). The walk stops there. */
+const UNNAMED_SCOPE_RE = new RegExp(`^\\s*${SCOPE_MODIFIERS}constructor\\s*\\(`);
+const UNNAMED_SCOPE_CLOSURE_RE = new RegExp(`^\\s*${SCOPE_MODIFIERS}(?:(?:init[?!]?|constructor)\\s*(?:<[^>]*>)?\\s*\\(|init\\s*\\{|(?:var|val)\\s+[A-Za-z_]\\w*\\s*:[^={]+\\{\\s*$)`);
 
-/** The function, method or component whose body holds 1-based `line`: the nearest definition above it. */
-export function enclosingName(lines: string[], line: number): string | null {
+/** The function, method or component whose body holds 1-based `line` of the file at `path`: the nearest
+ * definition above it, or null when that is an initializer (see UNNAMED_SCOPE_RE). */
+export function enclosingName(lines: string[], line: number, path = ""): string | null {
+  const closures = TRAILING_CLOSURE_RE.test(path);
+  const unnamed = closures ? UNNAMED_SCOPE_CLOSURE_RE : UNNAMED_SCOPE_RE;
+  const res = closures ? ENCLOSING_DECL_RE : ENCLOSING_RE;
   for (let i = Math.min(lines.length, line) - 1; i >= 0; i -= 1) {
-    for (const re of ENCLOSING_RE) {
+    if (unnamed.test(lines[i])) return null;
+    for (const re of res) {
       const m = re.exec(lines[i]);
       if (m && !CALL_STOP.has(m[1])) return m[1];
     }
@@ -681,17 +717,21 @@ export function enclosingName(lines: string[], line: number): string | null {
   return null;
 }
 
-/** 0-based lines of `lines` that call or render `name` (its own definition line excluded). */
-function callSiteLines(lines: string[], name: string): number[] {
+/** 0-based lines of `lines` (the file at `path`) that call or render `name` (its own definition line excluded). */
+function callSiteLines(lines: string[], name: string, path: string): number[] {
   const n = name.replace(/[$]/g, "\\$");
   const use = new RegExp(`(?<![\\w$])${n}\\s*\\(|<${n}[\\s/>]`);
-  const decl = DECL_RE(n);
+  const decl = DECL_RE(n, path);
   return lines.flatMap((l, i) => (use.test(l) && !decl.test(l) ? [i] : []));
 }
 
-/** Definition windows, from files outside `exclude`, of the names a feature's added lines call: the
- * callee code one feature turn would otherwise know only from a one-line PR map summary. */
-export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number): string {
+/** Definition windows, from files outside the feature's `files`, of the names its added lines call: the
+ * callee code one feature turn would otherwise know only from a one-line PR map summary. Declarations
+ * only (a framework view such as `Text(` has none, and a call of it in another file is not its code); a
+ * name the feature declares itself, a window overlapping one already shown, and (for a TypeScript/JavaScript
+ * caller) a definition this turn's CROSS_FILE_DEFINITIONS already carries are left out. `whole`: the turn
+ * reviews every changed file. */
+export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number, whole = files.length === reviewTargets(sample).length): string {
   if (maxChars < 400) return "";
   const own = new Set(files);
   const patches = patchesByPath(sample.diff);
@@ -702,17 +742,39 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     .map((f) => [f.path, f.content.split("\n")]);
   const content = new Map(sample.files.map((f) => [f.path, f.content]));
   const callsIn = addedIn.map(calledNames);
+  const ownLines: [string, string[]][] = files.map((p) => [p, (content.get(p) ?? "").split("\n")]);
+  // chat-prompt's crossFileDefs (CROSS_FILE_DEFINITIONS) looks a TS/JS file's plain call `name(` or
+  // qualified call `Import.name(` up in the module its relative import names, among the reference files
+  // (and on a whole-PR turn every changed file): a definition found there is already in this turn.
+  const crossCorpus = new Set([...(sample.referenceFiles ?? []).map((f) => f.path), ...(whole ? sample.changedPaths : [])]);
+  const imports = new Map<string, ReturnType<typeof importGraph>>();
+  const crossShown = (caller: string, name: string, path: string): boolean => {
+    if (!TS_LIKE_RE.test(caller) || !crossCorpus.has(path)) return false;
+    const text = addedIn[files.indexOf(caller)] ?? "";
+    const n = name.replace(/[$]/g, "\\$");
+    if (!imports.has(caller)) imports.set(caller, importGraph(caller, content.get(caller) ?? ""));
+    return (imports.get(caller) ?? []).some((b) => b.candidates.includes(path) && (b.local === name
+      ? b.kind !== "namespace" && new RegExp(`(?<![.\\w$])${n}\\s*\\(|<${n}[\\s/>]|\\bnew\\s+${n}\\b`).test(text)
+      : new RegExp(`(?<![\\w$.])${b.local.replace(/[$]/g, "\\$")}\\.${n}\\s*\\(`).test(text)));
+  };
   const blocks: string[] = [];
+  const shown: [string, number, number][] = [];
   let used = 0;
   for (const name of calledNames(added).slice(0, 24)) {
+    // A name the feature declares itself is its own: another file's same-named function is not what it calls.
+    if (findDefinition(ownLines, name, [], false)) continue;
     // The feature file whose added lines call it: its own imports decide between same-named definitions.
     const caller = files[callsIn.findIndex((c) => c.includes(name))];
-    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : [], false);
     if (!found) continue;
     const [path, i] = found;
+    if (caller && crossShown(caller, name, path)) continue;
     const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
-    const w = gutter(path, lines, i - 1, i + 14);
-    if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; }
+    const from = Math.max(1, i - 1);
+    const to = Math.min(lines.length, i + 14);
+    if (shown.some(([p, a, b]) => p === path && a <= to && from <= b)) continue;
+    const w = gutter(path, lines, from, to);
+    if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; shown.push([path, from, to]); }
   }
   return blocks.length ? `<<<CALLEE_DEFINITIONS (code in other files that this feature's added lines call; not shown elsewhere in this turn)>>>\n${blocks.join("\n\n")}\n<<<END>>>` : "";
 }
@@ -831,11 +893,11 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   }
   // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
   // call site (aicc: a component only rendered for an existing row).
-  const enclosing = enclosingName(fileLines, f.line);
+  const enclosing = enclosingName(fileLines, f.line, f.file);
   if (enclosing) {
     let callers = 0;
     for (const [path, lines] of corpus) {
-      for (const i of callSiteLines(lines, enclosing)) {
+      for (const i of callSiteLines(lines, enclosing, path)) {
         if (callers >= 3) break;
         if (path === f.file && Math.abs(i + 1 - f.line) <= 30) continue;
         addCode(path, i + 1, 4, 6);

@@ -906,7 +906,10 @@ const SAME_NAME = {
 };
 
 test("calleeDefinitions: of two same-named definitions, the one the calling file imports is shown", () => {
-  const block = calleeDefinitions(sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs }), ["src/rows/load.ts"], 6_000);
+  // Both modules are other features' changed files: CROSS_FILE_DEFINITIONS of this split turn holds only
+  // reference files, so the callee is shown here (an imported reference file is shown by that block instead).
+  const files = { ...SAME_NAME.load, ...Object.fromEntries(SAME_NAME.refs.map((r) => [r.path, r.content])) };
+  const block = calleeDefinitions(sample(files), ["src/rows/load.ts"], 6_000);
   assert.match(block, /--- src\/rows\/b\.ts[\s\S]*source: 'b'/);
   assert.doesNotMatch(block, /source: 'a'/);
 });
@@ -931,4 +934,136 @@ test("isSmallReview: a PR that fits one turn is small only with at most SMALL_RE
     assert.equal(isSmallReview(sample(), settings), true, "the four-file sample is small when it fits one turn");
   });
   assert.equal(isSmallReview(sample(), settings), false, "a PR split into features is never small");
+});
+
+// ── Review of #184 (2026-11-09): Swift/Kotlin trailing closures read as declarations, callee windows of the
+// feature's own names and of framework calls, imported definitions twice in TypeScript turns ──
+
+const swiftSample = (files, extra = {}) => ({ ...sample(files, extra), files: Object.keys(files).map((p) => ({ path: p, content: files[p], language: "swift" })) });
+const finding = (file, line, o = {}) => ({ id: "x", status: "accepted", severity: "P1", file, line, side: "RIGHT", title: "Force unwrap crashes", failureScenario: "A caller passes nil.", rootCause: "No guard.", evidence: `${file}:${line}`, recommendedFix: "f", recommendedTest: "t", ...o });
+
+test("enclosingName: a Swift/Kotlin `Name(args) {` is a call with a trailing closure, not the enclosing function", () => {
+  const swift = ["struct SettingsView: View {", "  func saveRow(_ item: Item) -> some View {", "    VStack(spacing: 8) {", "      Text(item.title)", "      Button(\"Save\") {", "        store.save(item)", "      }", "    }", "  }", "}"];
+  assert.equal(enclosingName(swift, 6, "App/SettingsView.swift"), "saveRow");
+  assert.equal(enclosingName(swift, 4, "App/SettingsView.swift"), "saveRow");
+  const compose = ["@Composable", "fun ItemRow(item: Item) {", "  Row(horizontalArrangement = Arrangement.End) {", "    Text(item.name!!)", "  }", "}"];
+  assert.equal(enclosingName(compose, 4, "app/ItemRow.kt"), "ItemRow");
+  // A TypeScript method header still is one.
+  assert.equal(enclosingName(["class Store {", "  save(item) {", "    db.write(item!);", "  }", "}"], 3, "src/store.ts"), "save");
+});
+
+test("enclosingName: an initializer, a constructor or a Swift computed property ends the walk (no caller lookup by name)", () => {
+  const player = ["final class Player {", "  func stop() {", "    engine.stop()", "  }", "  init(url: URL?) {", "    self.url = url!", "  }", "}"];
+  assert.equal(enclosingName(player, 6, "App/Player.swift"), null);
+  const service = ["export class OrderService {", "  load(id) {", "    return this.repo.find(id);", "  }", "  constructor(private repo: Repo) {", "    this.repo = repo!;", "  }", "}"];
+  assert.equal(enclosingName(service, 6, "src/orders/service.ts"), null);
+  const view = ["struct ItemView: View {", "  func helper() -> Int {", "    1", "  }", "  var body: some View {", "    VStack {", "      Text(item!.name)", "    }", "  }", "}"];
+  assert.equal(enclosingName(view, 7, "App/ItemView.swift"), null);
+});
+
+test("enclosingName: a typed arrow binding and a class-property arrow function are functions", () => {
+  const badge = ["export function formatDue(d: Date) {", "  return d.toISOString();", "}", "", "export const ItemBadge: React.FC<Props> = ({ item }) => {", "  const due = item!.dueAt;", "  return <span>{formatDue(due)}</span>;", "};"];
+  assert.equal(enclosingName(badge, 6, "src/items/ItemBadge.tsx"), "ItemBadge");
+  const cls = ["export class OrderService {", "  async load(id: string) {", "    return this.repo.find(id);", "  }", "  private onSave = async (order: Order) => {", "    await this.repo.save(order!);", "  };", "}"];
+  assert.equal(enclosingName(cls, 6, "src/orders/service.ts"), "onSave");
+});
+
+test("evidence: a Swift line inside a trailing closure still finds the callers of its function", () => {
+  const row = ["import SwiftUI", "struct ItemList: View {", "  let store: Store", "  func deleteRow(_ item: Item?) -> some View {", "    Button(\"Delete\") {", "      store.remove(item!.id)", "    }", "  }", "}"].join("\n");
+  const caller = ["struct Screen: View {", "  var body: some View {", "    ForEach(items) { item in", "      list.deleteRow(item)", "    }", "  }", "}"].join("\n");
+  const other = (n) => [`struct Other${n}: View {`, "  var body: some View {", `    Button("Other ${n}") {`, `      model.tap(${n})`, "    }", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/ItemList.swift": row }, { referenceFiles: [1, 2, 3].map((n) => ({ path: `App/Other${n}.swift`, content: other(n) })).concat({ path: "App/Screen.swift", content: caller }) });
+  const pack = evidencePack(s, finding("App/ItemList.swift", 6), new Map(), 20_000);
+  assert.match(pack.code, /App\/Screen\.swift[\s\S]*list\.deleteRow\(item\)/);
+  assert.doesNotMatch(pack.code, /App\/Other\d\.swift/);
+});
+
+test("evidence: a Swift trailing-closure call is not the definition; the real `func` further down is", () => {
+  const host = ["final class Editor {", "  func save() {", "    persist(item) {", "      self.dismiss()", "    }", "  }",
+    ...Array.from({ length: 60 }, (_, i) => `  let pad${i} = ${i}`),
+    "  func persist(_ item: Item, completion: @escaping () -> Void) {", "    guard item.isValid else { return }", "    db.write(item)", "    completion()", "  }", "}"].join("\n");
+  const pack = evidencePack(swiftSample({ "App/Editor.swift": host }), finding("App/Editor.swift", 3, { title: "save never checks validity" }), new Map(), 20_000);
+  assert.match(pack.code, /func persist\(_ item: Item[\s\S]*guard item\.isValid/);
+});
+
+test("evidence: a Swift caller that passes a trailing closure is a call site, not a declaration", () => {
+  const feed = ["final class Feed {", "  func refresh(force: Bool, done: () -> Void) {", "    log(1)", "    log(2)", "    log(3)", "    log(4)", "    let first = items.first!", "    show(first)", "  }", "}"].join("\n");
+  const puller = ["extension Feed {", "  func pull() {", "    refresh(force: true) {", "      self.spinner.stop()", "    }", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/Feed.swift": feed }, { referenceFiles: [{ path: "App/Feed+Pull.swift", content: puller }] });
+  const pack = evidencePack(s, finding("App/Feed.swift", 7, { title: "Force unwrap of an empty list crashes", evidence: "App/Feed.swift:7" }), new Map(), 20_000);
+  assert.match(pack.code, /App\/Feed\+Pull\.swift[\s\S]*refresh\(force: true\) \{/);
+});
+
+test("calleeDefinitions: a name the feature declares itself is not looked up in other files", () => {
+  const cart = ["final class CartModel {", "  func reload() {", "    items = store.items", "  }", "  func checkout() {", "    reload()", "    api.pay(items)", "  }", "}"].join("\n");
+  const profile = ["final class ProfileModel {", "  func reload() {", "    // refreshes the profile and clears the cache", "    cache.removeAll()", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/CartModel.swift": cart, "App/ProfileModel.swift": profile }), ["App/CartModel.swift"], 6_000);
+  assert.doesNotMatch(block, /ProfileModel/);
+});
+
+test("calleeDefinitions: framework calls with no declaration do not crowd out the real callee; overlapping windows are shown once", () => {
+  const view = ["import SwiftUI", "struct OrderView: View {", "  @ObservedObject var store: OrderStore", "  var body: some View {", "    VStack(spacing: 8) {", "      HStack(alignment: .top) {",
+    "        Image(systemName: \"cart\")", "        Text(store.title)", "        Spacer()", "      }", "      Toggle(\"Express\", isOn: $store.express)", "      Picker(\"Size\", selection: $store.size) {", "        Text(\"S\")", "      }",
+    "      Button(\"Pay\") {", "        store.submitOrder(store.draft)", "        store.validateDraft(store.draft)", "      }", "    }", "  }", "}"].join("\n");
+  // Other (unchanged) screens of the app use the same framework views.
+  const screen = (n) => ["import SwiftUI", `struct Screen${n}: View {`, "  var body: some View {", "    VStack(spacing: 12) {", "      HStack(alignment: .center) {", `        Image(systemName: "star${n}")`,
+    `        Text("Screen ${n} title that is fairly long, with an accessibility hint and a localized subtitle string")`, "        Spacer()", "      }", `      Toggle("Option ${n}", isOn: $flag)`,
+    `      Picker("Pick ${n}", selection: $sel) {`, "        Text(\"A\")", "      }", `      Button("Go ${n}") {`, `        model.go(${n}, analytics: .screen("settings-${n}"), haptics: .light, animated: true)`, "      }", "    }", "  }", "}"].join("\n");
+  const store = ["final class OrderStore: ObservableObject {", "  func submitOrder(_ draft: Draft) {", "    guard draft.total > 0 else { return }", "    api.post(draft)", "  }", "  func validateDraft(_ draft: Draft) {", "    errors = draft.check()", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/OrderView.swift": view }, { referenceFiles: [{ path: "App/Screen1.swift", content: screen(1) }, { path: "App/Screen2.swift", content: screen(2) }, { path: "App/OrderStore.swift", content: store }] });
+  const block = calleeDefinitions(s, ["App/OrderView.swift"], 2_000);
+  assert.match(block, /--- App\/OrderStore\.swift[\s\S]*guard draft\.total > 0/);
+  assert.doesNotMatch(block, /Screen\d\.swift/);
+  assert.equal((block.match(/^--- App\/OrderStore\.swift/gm) ?? []).length, 1, "validateDraft's window overlaps submitOrder's");
+});
+
+// A TypeScript feature that calls a helper of an unchanged imported module (CROSS_FILE_DEFINITIONS shows it).
+const IMPORTED = {
+  create: "import { charge } from './charge';\nexport function create(req) {\n  return charge(req.body.amount);\n}\n",
+  charge: { path: "src/orders/charge.ts", content: "export function charge(amount) {\n  if (amount <= 0) throw new Error('bad amount');\n  return amount;\n}\n" },
+};
+const featureTurns = (m) => m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+
+test("feature turn: a whole-PR TypeScript turn with a non-code file gets an imported definition once, not twice", async () => {
+  await wholePr(async () => {
+    const files = { "src/orders/create.ts": IMPORTED.create, "package.json": "{\n  \"name\": \"x\",\n  \"version\": \"1.0.1\"\n}\n" };
+    const m = model({ review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files, { referenceFiles: [IMPORTED.charge] }), settings, { request: m.request });
+    const turn = featureTurns(m).find((t) => /Review the whole change/.test(t));
+    assert.ok(turn, "one whole-PR turn");
+    assert.match(turn, /CROSS_FILE_DEFINITIONS/);
+    assert.equal((turn.match(/amount <= 0/g) ?? []).length, 1);
+  });
+});
+
+test("feature turn: a split TypeScript turn does not repeat in CALLEE_DEFINITIONS what CROSS_FILE_DEFINITIONS carries", async () => {
+  const files = { "src/orders/create.ts": IMPORTED.create, "src/mail/send.ts": "export function sendMail(to) {\n  return queue.push(to);\n}\n" };
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "400";
+  try {
+    const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files, { referenceFiles: [IMPORTED.charge] }), settings, { request: m.request });
+    const turn = featureTurns(m).find((t) => /one feature of this PR: src\/orders\/create\.ts/.test(t));
+    assert.ok(turn, "create.ts is a feature of its own");
+    assert.match(turn, /CROSS_FILE_DEFINITIONS/);
+    assert.equal((turn.match(/amount <= 0/g) ?? []).length, 1);
+  } finally {
+    process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
+  }
+});
+
+test("calleeDefinitions: a TypeScript caller still gets a callee CROSS_FILE_DEFINITIONS does not carry (a member call)", () => {
+  const files = { "src/orders/create.ts": "export function create(req, store) {\n  return store.persistOrder(req.body);\n}\n" };
+  const refs = [{ path: "src/orders/store.ts", content: "export class Store {\n  persistOrder(order) {\n    if (!order.id) throw new Error('no id');\n    return order;\n  }\n}\n" }];
+  assert.match(calleeDefinitions(sample(files, { referenceFiles: refs }), ["src/orders/create.ts"], 6_000), /--- src\/orders\/store\.ts[\s\S]*no id/);
+});
+
+test("calledNames: many distinct names stay linear, in order of first appearance", () => {
+  const code = Array.from({ length: 60_000 }, (_, i) => `name${i}(x); name${i % 7}(y)`).join("\n");
+  const t0 = performance.now();
+  const names = calledNames(code);
+  const ms = performance.now() - t0;
+  assert.equal(names.length, 60_000);
+  assert.deepEqual(names.slice(0, 3), ["name0", "name1", "name2"]);
+  assert.ok(ms < 1_500, `calledNames took ${Math.round(ms)}ms`);
 });

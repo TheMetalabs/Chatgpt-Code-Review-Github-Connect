@@ -21,7 +21,7 @@
 import { buildChatParts, buildPolicyAttachment, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, prDescriptionBlock, REVIEW_INSTRUCTIONS, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { changedExportedSymbols } from "./context-slice.ts";
 import { extractChatJsonParts, lastJsonObjectRange } from "./extract-chat-json.ts";
-import { importGraph, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
+import { importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
@@ -491,9 +491,10 @@ async function reviewFeature(
   // The code this feature calls in other files (another feature's changed file, an unchanged module):
   // most false positives were claims a callee or a config list elsewhere refutes. A whole-PR turn of
   // TypeScript/JavaScript code (non-code files such as package.json aside) already carries its imported
-  // definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here, less what that block carries.
+  // definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here, even where that block carries
+  // some of them too (it has its own budget, caps and export rules).
   const calleeBlock = !whole || files.some((p) => isCodePath(p) && !TS_LIKE_RE.test(p))
-    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)), whole)
+    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)))
     : "";
   const built = buildChatParts({
     sample: sub,
@@ -643,6 +644,10 @@ const TRAILING_CLOSURE_RE = /\.(?:swift|kt|kts)$/;
 /** A keyword declaration or a binding of `name`. */
 const DECL_KEYWORD_RE = (name: string) =>
   new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])`);
+/** A function declaration or binding of `name` (no type or extension: `extension Draft` adds to a type
+ * declared elsewhere, whose `Draft(` initializer is still another file's code). */
+const FUNC_DECL_RE = (name: string) =>
+  new RegExp(`(?:\\b(?:function|func|fun|fn|def)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])`);
 /** A method/function header of `name` that opens its body on the line (not in Swift/Kotlin, see TRAILING_CLOSURE_RE). */
 const DECL_HEADER_RE = (name: string) =>
   new RegExp(`^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$`);
@@ -654,11 +659,11 @@ const DECL_RE = (name: string, path: string) =>
   TRAILING_CLOSURE_RE.test(path) ? DECL_KEYWORD_RE(name) : new RegExp(`${DECL_KEYWORD_RE(name).source}|${DECL_HEADER_RE(name).source}`);
 
 /** Where `name` is declared among `files`: the first declaration proper in any file (within a file a
- * keyword declaration or binding before a header-only match), else (only when no file declares it, and
- * unless `loose` is false) the first looser DEF_RE match. Within each pass the `prefer` paths are searched
- * first, in order (see definitionOrder), so a same-named function in an unrelated module loses. [path,
- * 0-based line] or null. */
-function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = [], loose = true): [string, number] | null {
+ * keyword declaration or binding before a header-only match), else (only when no file declares it) the
+ * first looser DEF_RE match outside Swift/Kotlin (a multi-line signature, a class-property arrow; there an
+ * indented `VStack(` is a call). Within each pass the `prefer` paths are searched first, in order (see
+ * definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
   const n = name.replace(/[$]/g, "\\$");
   const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
   const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
@@ -669,9 +674,9 @@ function findDefinition(files: Iterable<[string, string[]]>, name: string, prefe
     if (i < 0 && !TRAILING_CLOSURE_RE.test(path)) i = lines.findIndex((l) => header.test(l));
     if (i >= 0) return [path, i];
   }
-  if (!loose) return null;
   const def = DEF_RE(n);
   for (const [path, lines] of all) {
+    if (TRAILING_CLOSURE_RE.test(path)) continue;
     const i = lines.findIndex((l) => def.test(l));
     if (i >= 0) return [path, i];
   }
@@ -687,8 +692,9 @@ const ENCLOSING_DECL_RE = [
   /\b(?:func|function|fun|fn|def)\s+([A-Za-z_$][\w$]*)/,
   // A binding or class property is a function only when its initializer is one: an arrow function,
   // `function`, or `x =>` (a parenthesized value such as `(item.label)` is not). A type annotation may
-  // come first (`const ItemBadge: React.FC<Props> = ({ item }) => {`, `private onSave = async (o) => {`).
-  /^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly|override)\s+)*)([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+  // come first (`const ItemBadge: React.FC<Props> = ({ item }) => {`, `private onSave = async (o) => {`). Without
+  // const/let/var a modifier or a type annotation is required: a bare `cleanup = () => …` is an assignment.
+  /^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly|override)\s+)+|(?=[A-Za-z_$][\w$]*\s*:[^=]+=))([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
 ];
 // A bare `name(args) {` header; in Swift/Kotlin that line is a call with a trailing closure (TRAILING_CLOSURE_RE).
 const ENCLOSING_RE = [
@@ -726,12 +732,11 @@ function callSiteLines(lines: string[], name: string, path: string): number[] {
 }
 
 /** Definition windows, from files outside the feature's `files`, of the names its added lines call: the
- * callee code one feature turn would otherwise know only from a one-line PR map summary. Declarations
- * only (a framework view such as `Text(` has none, and a call of it in another file is not its code); a
- * name the feature declares itself, a window overlapping one already shown, and (for a TypeScript/JavaScript
- * caller) a definition this turn's CROSS_FILE_DEFINITIONS already carries are left out. `whole`: the turn
- * reviews every changed file. */
-export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number, whole = files.length === reviewTargets(sample).length): string {
+ * callee code one feature turn would otherwise know only from a one-line PR map summary. No Swift/Kotlin
+ * call site counts as a definition (a framework view such as `Text(` has none, and a call of it in another
+ * file is not its code); a function the feature declares itself and a window inside one already shown are
+ * left out. */
+export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number): string {
   if (maxChars < 400) return "";
   const own = new Set(files);
   const patches = patchesByPath(sample.diff);
@@ -742,37 +747,26 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     .map((f) => [f.path, f.content.split("\n")]);
   const content = new Map(sample.files.map((f) => [f.path, f.content]));
   const callsIn = addedIn.map(calledNames);
-  const ownLines: [string, string[]][] = files.map((p) => [p, (content.get(p) ?? "").split("\n")]);
-  // chat-prompt's crossFileDefs (CROSS_FILE_DEFINITIONS) looks a TS/JS file's plain call `name(` or
-  // qualified call `Import.name(` up in the module its relative import names, among the reference files
-  // (and on a whole-PR turn every changed file): a definition found there is already in this turn.
-  const crossCorpus = new Set([...(sample.referenceFiles ?? []).map((f) => f.path), ...(whole ? sample.changedPaths : [])]);
-  const imports = new Map<string, ReturnType<typeof importGraph>>();
-  const crossShown = (caller: string, name: string, path: string): boolean => {
-    if (!TS_LIKE_RE.test(caller) || !crossCorpus.has(path)) return false;
-    const text = addedIn[files.indexOf(caller)] ?? "";
-    const n = name.replace(/[$]/g, "\\$");
-    if (!imports.has(caller)) imports.set(caller, importGraph(caller, content.get(caller) ?? ""));
-    return (imports.get(caller) ?? []).some((b) => b.candidates.includes(path) && (b.local === name
-      ? b.kind !== "namespace" && new RegExp(`(?<![.\\w$])${n}\\s*\\(|<${n}[\\s/>]|\\bnew\\s+${n}\\b`).test(text)
-      : new RegExp(`(?<![\\w$.])${b.local.replace(/[$]/g, "\\$")}\\.${n}\\s*\\(`).test(text)));
-  };
+  const ownLines = files.map((p) => [p, (content.get(p) ?? "").split("\n")] as const);
   const blocks: string[] = [];
   const shown: [string, number, number][] = [];
   let used = 0;
   for (const name of calledNames(added).slice(0, 24)) {
-    // A name the feature declares itself is its own: another file's same-named function is not what it calls.
-    if (findDefinition(ownLines, name, [], false)) continue;
+    // A function the feature declares itself is its own: another file's same-named function is not what it
+    // calls. A type or extension it declares is not (`extension Draft` and a call of `Draft(`'s initializer).
+    const n = name.replace(/[$]/g, "\\$");
+    const ownDecl = FUNC_DECL_RE(n);
+    const ownHeader = DECL_HEADER_RE(n);
+    if (ownLines.some(([p, lines]) => lines.some((l) => ownDecl.test(l) || (!TRAILING_CLOSURE_RE.test(p) && ownHeader.test(l))))) continue;
     // The feature file whose added lines call it: its own imports decide between same-named definitions.
     const caller = files[callsIn.findIndex((c) => c.includes(name))];
-    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : [], false);
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
     if (!found) continue;
     const [path, i] = found;
-    if (caller && crossShown(caller, name, path)) continue;
     const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
     const from = Math.max(1, i - 1);
     const to = Math.min(lines.length, i + 14);
-    if (shown.some(([p, a, b]) => p === path && a <= to && from <= b)) continue;
+    if (shown.some(([p, a, b]) => p === path && a <= from && to <= b)) continue;
     const w = gutter(path, lines, from, to);
     if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; shown.push([path, from, to]); }
   }

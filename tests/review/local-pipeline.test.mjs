@@ -906,10 +906,7 @@ const SAME_NAME = {
 };
 
 test("calleeDefinitions: of two same-named definitions, the one the calling file imports is shown", () => {
-  // Both modules are other features' changed files: CROSS_FILE_DEFINITIONS of this split turn holds only
-  // reference files, so the callee is shown here (an imported reference file is shown by that block instead).
-  const files = { ...SAME_NAME.load, ...Object.fromEntries(SAME_NAME.refs.map((r) => [r.path, r.content])) };
-  const block = calleeDefinitions(sample(files), ["src/rows/load.ts"], 6_000);
+  const block = calleeDefinitions(sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs }), ["src/rows/load.ts"], 6_000);
   assert.match(block, /--- src\/rows\/b\.ts[\s\S]*source: 'b'/);
   assert.doesNotMatch(block, /source: 'a'/);
 });
@@ -1036,17 +1033,17 @@ test("feature turn: a whole-PR TypeScript turn with a non-code file gets an impo
   });
 });
 
-test("feature turn: a split TypeScript turn does not repeat in CALLEE_DEFINITIONS what CROSS_FILE_DEFINITIONS carries", async () => {
+test("feature turn: a split TypeScript turn shows a callee CROSS_FILE_DEFINITIONS does not carry (exported by an export list)", async () => {
   const files = { "src/orders/create.ts": IMPORTED.create, "src/mail/send.ts": "export function sendMail(to) {\n  return queue.push(to);\n}\n" };
+  const charge = { path: "src/orders/charge.ts", content: "function charge(amount) {\n  if (amount <= 0) throw new Error('bad amount');\n  return amount;\n}\n\nexport { charge };\n" };
   const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
   process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "400";
   try {
     const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
-    await runLocalReviewPipeline(sample(files, { referenceFiles: [IMPORTED.charge] }), settings, { request: m.request });
+    await runLocalReviewPipeline(sample(files, { referenceFiles: [charge] }), settings, { request: m.request });
     const turn = featureTurns(m).find((t) => /one feature of this PR: src\/orders\/create\.ts/.test(t));
     assert.ok(turn, "create.ts is a feature of its own");
-    assert.match(turn, /CROSS_FILE_DEFINITIONS/);
-    assert.equal((turn.match(/amount <= 0/g) ?? []).length, 1);
+    assert.match(turn, /CALLEE_DEFINITIONS[\s\S]*--- src\/orders\/charge\.ts[\s\S]*amount <= 0/);
   } finally {
     process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
   }
@@ -1066,4 +1063,42 @@ test("calledNames: many distinct names stay linear, in order of first appearance
   assert.equal(names.length, 60_000);
   assert.deepEqual(names.slice(0, 3), ["name0", "name1", "name2"]);
   assert.ok(ms < 1_500, `calledNames took ${Math.round(ms)}ms`);
+});
+
+// ── Review of 49339d9: TS callees outside the one-line header shape, a feature's extension of a type,
+// a second callee window running past the first, a bare assignment read as the enclosing function ──
+
+test("calleeDefinitions: TypeScript/JavaScript callees declared over several lines, with an object return type or as arrow properties are found", () => {
+  const cases = [
+    ["src/store.ts", "export class OrderStore {\n  async submitOrder(\n    draft: Draft,\n    opts: SubmitOptions = {},\n  ): Promise<void> {\n    if (draft.total <= 0) throw new Error('empty draft');\n    await this.api.post(draft);\n  }\n}\n", "store.submitOrder(draft)", /empty draft/],
+    ["src/service.ts", "export class OrdersService {\n  async findOne(@Inject(REPO) id: string): Promise<{ ok: boolean }> {\n    if (!id) throw new Error('no id');\n    return { ok: true };\n  }\n}\n", "service.findOne(draft)", /no id/],
+    ["src/cart.ts", "export class Cart {\n  private recalc = (items: Item[]) => {\n    if (!items.length) throw new Error('empty cart');\n    return items.length;\n  };\n}\n", "cart.recalc(draft)", /empty cart/],
+    ["src/api.js", "export const api = {\n  postOrder: async (order) => {\n    if (!order.id) throw new Error('no order id');\n    return fetch('/o', { method: 'POST' });\n  },\n};\n", "api.postOrder(draft)", /no order id/],
+  ];
+  for (const [path, content, call, body] of cases) {
+    const files = { "src/view.ts": `export function submit(draft) {\n  return ${call};\n}\n`, [path]: content };
+    assert.match(calleeDefinitions(sample(files), ["src/view.ts"], 6_000), body, path);
+  }
+});
+
+test("calleeDefinitions: a feature that extends a type still gets that type's declaration from another file", () => {
+  const row = ["import SwiftUI", "extension Draft {", "  var isEmpty: Bool { lines.isEmpty }", "}", "struct DraftRow: View {", "  let store: DraftStore", "  var body: some View {", "    Button(\"New\") {", "      store.open(Draft(title: \"\", lines: []))", "    }", "  }", "}"].join("\n");
+  const draft = ["struct Draft {", "  let title: String", "  let lines: [Line]", "  init(title: String, lines: [Line]) {", "    precondition(!title.isEmpty, \"a draft needs a title\")", "    self.title = title", "    self.lines = lines", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/DraftRow.swift": row }, { referenceFiles: [{ path: "App/Models/Draft.swift", content: draft }] }), ["App/DraftRow.swift"], 6_000);
+  assert.match(block, /--- App\/Models\/Draft\.swift[\s\S]*a draft needs a title/);
+});
+
+test("calleeDefinitions: a second callee whose body runs past the first one's window is still shown", () => {
+  const view = ["struct PayView: View {", "  let store: OrderStore", "  var body: some View {", "    Button(\"Pay\") {", "      store.submitOrder(store.draft)", "      store.refund(store.draft)", "    }", "  }", "}"].join("\n");
+  const store = ["final class OrderStore {", "  func submitOrder(_ draft: Draft) {", ...Array.from({ length: 10 }, (_, i) => `    step${i}(draft)`), "  }",
+    "  func refund(_ draft: Draft) {", "    log(draft)", "    log(draft)", "    log(draft)", "    log(draft)", "    guard draft.isPaid else { fatalError(\"refund of unpaid draft\") }", "    api.refund(draft.id)", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/PayView.swift": view }, { referenceFiles: [{ path: "App/OrderStore.swift", content: store }] }), ["App/PayView.swift"], 6_000);
+  assert.match(block, /refund of unpaid draft/);
+});
+
+test("enclosingName: a bare assignment of an arrow function is not the enclosing function", () => {
+  const sub = ["export function subscribe(store, listener) {", "  let cleanup;", "  store.on('change', listener);", "  cleanup = () => store.off('change', listener);", "  return cleanup!;", "}"];
+  assert.equal(enclosingName(sub, 5, "src/subscribe.ts"), "subscribe");
+  // A typed class property without a modifier still is one.
+  assert.equal(enclosingName(["export class Form {", "  onSave: Handler = async (form) => {", "    await api.save(form!);", "  };", "}"], 3, "src/form.ts"), "onSave");
 });

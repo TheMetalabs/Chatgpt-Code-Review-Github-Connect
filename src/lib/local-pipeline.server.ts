@@ -59,6 +59,8 @@ const PART_FINDINGS_CAP = 3;
  * not for every test and resource file of the PR (WalkieBoard #566: 24K chars of them in each of 14
  * feature turns, next to as little as 0.8K of the feature's own diff). */
 export const PART_NON_CODE_MAX_CHARS = 6_000;
+/** Callee definitions (calleeDefinitions) one feature turn may carry. */
+export const CALLEE_DEFINITIONS_MAX_CHARS = 6_000;
 export const featureFindingsCap = (whole: boolean) => (whole ? FEATURE_FINDINGS_CAP : PART_FINDINGS_CAP);
 
 function envNum(key: string, dflt: number): number {
@@ -403,7 +405,7 @@ export const HUNT_INSTRUCTIONS = [
   "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
-  "coverage: one entry per changed code file you read. If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
+  "coverage: leave it an empty array (Ashlar records coverage itself). If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
 ].join("\n");
 
 /** What each candidate pass looks at hardest (Settings local_review.pipeline_lenses). A small model finds
@@ -484,6 +486,13 @@ async function reviewFeature(
     "<<<END>>>",
     languageNotes(files),
   ].filter(Boolean).join("\n");
+  // The code this feature calls in other files (another feature's changed file, an unchanged module):
+  // most false positives were claims a callee or a config list elsewhere refutes. TypeScript/JavaScript
+  // whole-PR turns already carry imported definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here.
+  const tsLike = (p: string) => /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(p);
+  const calleeBlock = !whole || files.some((p) => !tsLike(p))
+    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)))
+    : "";
   const built = buildChatParts({
     sample: sub,
     extra,
@@ -493,7 +502,7 @@ async function reviewFeature(
     prChangedPaths: sample.changedPaths,
     nonCodeFirst: !whole,
     localBudget: {
-      maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + 8, shrinkContext: true,
+      maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + calleeBlock.length + 10, shrinkContext: true,
       ...(whole ? {} : { nonCodeMaxChars: PART_NON_CODE_MAX_CHARS }),
     },
   });
@@ -513,7 +522,7 @@ async function reviewFeature(
     .join("\n\n");
   const messages: Msg[] = [
     { role: "system", content: REVIEW_SYSTEM },
-    { role: "user", content: [prompt, attach, mapBlock, groupBlock].filter(Boolean).join("\n\n") },
+    { role: "user", content: [prompt, attach, calleeBlock, mapBlock, groupBlock].filter(Boolean).join("\n\n") },
   ];
   const label = `${lens}[${files[0]}${files.length > 1 ? ` +${files.length - 1}` : ""}]`;
   const replies: string[] = [];
@@ -566,6 +575,7 @@ export const VERIFY_RULES = [
   "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing. A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait.",
   "4. Does a doc comment next to the code, MODULE_DOCS or the PR description state this behaviour as intended? Intended behaviour is not a defect.",
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
+  "6. Does the failure depend on something the cited code does not control — what a caller passes (a null, an empty value, two inputs together), what a client sends, how the database or a library behaves, or what a config or registry list holds? Then it is real only if the evidence shows a path that supplies it: a caller, a route or a config entry. If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted. If no such path is shown, it is uncertain, never confirmed.",
   "Verdicts:",
   "- refuted: something shown prevents or explains it (one of the checks above), or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
   "- confirmed: you followed the failure scenario through the code shown, step by step, from the changed code to an observable failure, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE.",
@@ -599,6 +609,80 @@ const DEF_RE = (name: string) =>
   new RegExp(`(?:\\b(?:function|func|fun|fn|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum|const|let|var|val|def)\\s+${name}\\b)|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub)\\s+)*${name}\\s*[(<:=])`);
 
 const PROSE_DOC_RE = /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
+
+/** Words that look like calls but name a keyword, a test helper or a common collection method: looking up
+ * their "definition" would only add noise. */
+const CALL_STOP = new Set([
+  "if", "for", "while", "switch", "guard", "return", "catch", "func", "function", "init", "super", "self", "this",
+  "print", "println", "await", "async", "new", "typeof", "require", "import", "expect", "test", "it", "describe",
+  "assert", "defer", "case", "when", "let", "var", "try", "throw", "sizeof", "map", "filter", "reduce", "forEach",
+  "flatMap", "compactMap", "push", "append", "contains", "includes", "get", "set", "has", "add", "remove", "count",
+  "join", "split", "slice", "trim", "toString", "then", "log", "error", "warn", "info", "debug", "min", "max",
+  "String", "Int", "Array", "Set", "Map", "Object", "Promise", "Number", "Boolean", "Date", "JSON", "Math", "console",
+]);
+
+/** The names `code` calls or renders, in order of first appearance: `name(`, `.name(`, `<Name` (a JSX
+ * component). Plain lower-case method names count too: a verifier that never saw `revert(in:)`'s body
+ * confirmed a claim that body refutes (WalkieBoard #570). */
+export function calledNames(code: string): string[] {
+  const out: string[] = [];
+  for (const m of code.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
+    const name = m[1] ?? m[2] ?? "";
+    if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name) || out.includes(name)) continue;
+    out.push(name);
+  }
+  return out;
+}
+
+const ENCLOSING_RE = [
+  /\b(?:func|function|fun|fn|def)\s+([A-Za-z_$][\w$]*)/,
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+  /^\s*(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^={]+)?\{\s*$/,
+];
+
+/** The function, method or component whose body holds 1-based `line`: the nearest definition above it. */
+export function enclosingName(lines: string[], line: number): string | null {
+  for (let i = Math.min(lines.length, line) - 1; i >= 0; i -= 1) {
+    for (const re of ENCLOSING_RE) {
+      const m = re.exec(lines[i]);
+      if (m && !CALL_STOP.has(m[1])) return m[1];
+    }
+  }
+  return null;
+}
+
+/** 0-based lines of `lines` that call or render `name` (its own definition line excluded). */
+function callSiteLines(lines: string[], name: string): number[] {
+  const n = name.replace(/[$]/g, "\\$");
+  const use = new RegExp(`(?<![\\w$])${n}\\s*\\(|<${n}[\\s/>]`);
+  const def = DEF_RE(n);
+  return lines.flatMap((l, i) => (use.test(l) && !def.test(l) ? [i] : []));
+}
+
+/** Definition windows, from files outside `exclude`, of the names a feature's added lines call: the
+ * callee code one feature turn would otherwise know only from a one-line PR map summary. */
+export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number): string {
+  if (maxChars < 400) return "";
+  const own = new Set(files);
+  const patches = patchesByPath(sample.diff);
+  const added = files.map((p) => (patches.get(p) ?? "").split("\n").filter((l) => l.startsWith("+")).join("\n")).join("\n");
+  const corpus: [string, string[]][] = [...sample.files, ...(sample.referenceFiles ?? [])]
+    .filter((f) => !own.has(f.path))
+    .map((f) => [f.path, f.content.split("\n")]);
+  const blocks: string[] = [];
+  let used = 0;
+  for (const name of calledNames(added).slice(0, 24)) {
+    const def = DEF_RE(name.replace(/[$]/g, "\\$"));
+    for (const [path, lines] of corpus) {
+      const i = lines.findIndex((l) => def.test(l));
+      if (i < 0) continue;
+      const w = gutter(path, lines, i - 1, i + 14);
+      if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; }
+      break;
+    }
+  }
+  return blocks.length ? `<<<CALLEE_DEFINITIONS (code in other files that this feature's added lines call; not shown elsewhere in this turn)>>>\n${blocks.join("\n\n")}\n<<<END>>>` : "";
+}
 
 /** A hunk cut to `maxChars` around RIGHT-side `line` (the removed lines just before it included), with
  * its header and a note for each side left out: a large hunk's prefix would miss the cited change. */
@@ -699,11 +783,41 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   for (const m of f.evidence.matchAll(/([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+):(\d+)/g)) addCode(m[1], Number(m[2]), 10, 10);
   const changed = new Set(sample.changedPaths);
   let defs = 0;
+  // What the cited code calls: the definition of each name called on the cited lines or in the
+  // candidate's quotes, wherever it lives (another changed file, an unchanged imported one).
+  const fileLines = corpus.get(f.file) ?? [];
+  const citedCode = [
+    ...fileLines.slice(Math.max(0, f.line - 3), f.line + 2),
+    ...[...f.evidence.matchAll(/`([^`]+)`/g)].map((m) => m[1]),
+  ].join("\n");
+  for (const name of calledNames(citedCode).slice(0, 8)) {
+    if (defs >= 6) break;
+    const def = DEF_RE(name.replace(/[$]/g, "\\$"));
+    for (const [path, lines] of corpus) {
+      const i = lines.findIndex((l) => def.test(l));
+      if (i >= 0) { addCode(path, i + 1, 3, 15); defs += 1; break; }
+    }
+  }
+  // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
+  // call site (aicc: a component only rendered for an existing row).
+  const enclosing = enclosingName(fileLines, f.line);
+  if (enclosing) {
+    let callers = 0;
+    for (const [path, lines] of corpus) {
+      for (const i of callSiteLines(lines, enclosing)) {
+        if (callers >= 3) break;
+        if (path === f.file && Math.abs(i + 1 - f.line) <= 30) continue;
+        addCode(path, i + 1, 4, 6);
+        callers += 1;
+      }
+      if (callers >= 3) break;
+    }
+  }
   let uses = 0;
   for (const name of namedSymbols(f)) {
     const def = DEF_RE(name.replace(/[$]/g, "\\$"));
     for (const [path, lines] of corpus) {
-      if (defs >= 4) break;
+      if (defs >= 8) break;
       const i = lines.findIndex((l) => def.test(l));
       if (i >= 0) { addCode(path, i + 1, 3, 15); defs += 1; }
     }
@@ -1192,7 +1306,6 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
         reportedUnreviewed.push(...gated.unreviewed);
         if (!anyOk) {
           safe.push(...gated.safe);
-          coverage.push(...gated.coverage);
         }
         assumptions.push(...gated.assumptions);
         anyOk = true;
@@ -1233,6 +1346,13 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     stats.turns = ctx.turns;
     stats.minutes = Math.round((Date.now() - startedAt) / 60_000);
     const unreviewed = [...new Set([...failed, ...reportedUnreviewed, ...unreviewablePaths(sample)])];
+    // Coverage is Ashlar's own record, not the model's self-assessment: a file whose feature turn returned
+    // a usable review is cleared; one whose turn failed, that the reply marked unreviewed, or that has no
+    // usable diff is not. (The model's own labels marked nearly every file not_cleared — 7 of 7 on a review
+    // whose every candidate was refuted — so they said nothing about what was actually reviewed.)
+    for (const file of reviewTargets(sample)) {
+      if (!unreviewed.includes(file)) coverage.push({ file, status: "cleared", reason: "reviewed in a feature turn" });
+    }
     for (const file of unreviewed) {
       const reason = failed.includes(file) ? "feature review failed" : reportedUnreviewed.includes(file) ? "the reviewer reported it unreviewed" : "no usable diff";
       coverage.push({ file, status: "not_cleared", reason });

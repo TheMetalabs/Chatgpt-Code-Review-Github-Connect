@@ -19,6 +19,8 @@ import {
   languageNotes,
   VERIFY_RULES,
   PART_NON_CODE_MAX_CHARS,
+  calledNames,
+  enclosingName,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -188,7 +190,7 @@ test("pipeline: a feature turn sees what the OTHER features do (PR map), so a gu
 
 test("pipeline: a confirmation that quotes no code is only uncertain — posted at P2 when the candidate's own quote is real code", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm("chargeEverything(amount) // not in the code") });
-  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.deepEqual(review.findings.map((f) => [f.title, f.severity]), [["create() charges a negative amount", "P2"]]);
   assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted, 1 posted/);
@@ -206,7 +208,7 @@ test("pipeline: an uncertain candidate whose own quote is not real code is dropp
 
 test("pipeline: a refutation without a counter-quote from the evidence is not accepted (it becomes uncertain)", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => JSON.stringify({ verdict: "refuted", reason: "probably fine" }) });
-  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.equal(review.findings.length, 1);
   assert.equal(review.findings[0].severity, "P2");
@@ -781,3 +783,86 @@ test("failed feature turn: files still failing alone are unreviewed and named in
   assert.match(out.pipelineSummary, /\(1 failed, 3 file\(s\) retried alone, unreviewed: orders\.(controller|service)\.ts, /);
   assert.ok(review.coverage.filter((c) => c.reason === "feature review failed").length === 3);
 });
+
+// ── Precision on aicc-center and WalkieBoard (2026-11-09: 17 posted findings after #183, none valid; 8 of 10
+// false positives were refuted by code in another file — a callee, a caller, a DTO, a config list, the
+// database; at least 4 posted findings were "uncertain"; and the model marked nearly every file not_cleared) ──
+
+test("coverage: Ashlar records it — a file reviewed in a feature turn is cleared whatever the model says; only failed files are not", async () => {
+  const review = (body) => {
+    const group = groupOf(body);
+    if (group.includes("src/mail/mailer.ts")) return "no json";
+    return JSON.stringify({ merge_recommendation: "COMMENT", investigated_safe: group.map((f) => `${f}: read`), findings: [], coverage: group.map((file) => ({ file, status: "not_cleared", reason: "helpers not shown" })) });
+  };
+  const m = model({ map: mapReply, review, verify: refute });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const cov = JSON.parse(out.raw).coverage;
+  for (const f of ORDERS) assert.deepEqual(cov.filter((c) => c.file === f).map((c) => c.status), ["cleared"], f);
+  assert.deepEqual(cov.filter((c) => c.file === "src/mail/mailer.ts").map((c) => [c.status, c.reason]), [["not_cleared", "feature review failed"]]);
+  assert.match(HUNT_INSTRUCTIONS, /coverage: leave it an empty array \(Ashlar records coverage itself\)/);
+});
+
+test("uncertain: by default a candidate the verifier could not decide is not posted", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineKeepUncertain, false);
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => JSON.stringify({ trace: "t", verdict: "uncertain", blocking_code: "", proof_quote: "", severity: "P2" }) });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: DEFAULT_SETTINGS.localPipelineKeepUncertain }, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 0);
+});
+
+test("verifier rule 6: a claim about what a caller, client, database or config supplies needs a path that supplies it", () => {
+  assert.match(VERIFY_RULES, /6\. Does the failure depend on something the cited code does not control/);
+  assert.match(VERIFY_RULES, /If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted\. If no such path is shown, it is uncertain, never confirmed\./);
+});
+
+test("calledNames: plain lower-case methods, member calls and JSX components; keywords and collection helpers left out", () => {
+  assert.deepEqual(calledNames("switch whole.revert(in: &field) { case .kept: log(x) }"), ["revert"]);
+  assert.deepEqual(calledNames("return <TaskRowMeta task={task} /> && items.map((x) => format(x))"), ["TaskRowMeta", "format"]);
+  assert.deepEqual(calledNames("if (ok) { getApi(url, {}, { responseType: 'blob' }) }"), ["getApi"]);
+});
+
+test("enclosingName: the function, method or component that holds a line", () => {
+  const js = ["export default function TaskRowMeta({ task }) {", "  const due = task.dueLabel;", "  return due;", "}"];
+  assert.equal(enclosingName(js, 2), "TaskRowMeta");
+  const swift = ["final class Host {", "  private func revertSwap() {", "    defer { offerRevert() }", "  }", "}"];
+  assert.equal(enclosingName(swift, 3), "revertSwap");
+  const arrow = ["const downloadEContract = async (id) => {", "  return getApi(url, {}, other);", "};"];
+  assert.equal(enclosingName(arrow, 2), "downloadEContract");
+});
+
+test("evidence: the verifier sees the definition of a lower-case method the cited line calls, in another file (WalkieBoard #570)", () => {
+  const files = {
+    "Keyboard/Host.swift": "final class Host {\n  private func revertSwap() {\n    defer { offerRevert() }\n    switch whole.revert(in: &field) {\n    case .reverted: break\n    case .kept(let reason): log(reason)\n    }\n  }\n}\n",
+    "Core/WholeDictation.swift": "public struct WholeDictation {\n  public mutating func revert(in field: inout Field) -> Outcome {\n    guard let swap = swapped else { return .nothing }\n    swapped = nil\n    return field.matches(swap) ? .reverted : .kept(reason: \"edited\")\n  }\n}\n",
+  };
+  const f = { id: "x", status: "accepted", severity: "P2", file: "Keyboard/Host.swift", line: 6, side: "RIGHT", title: "Revert button reappears when revert returns kept", failureScenario: "The function does not drop the swap.", rootCause: "No dropSwap on kept.", evidence: "Keyboard/Host.swift:4 `switch whole.revert(in: &field) {`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(sample(files), f, new Map(), 20_000);
+  assert.match(pack.code, /Core\/WholeDictation\.swift[\s\S]*func revert\(in field: inout Field\)[\s\S]*swapped = nil/);
+});
+
+test("evidence: the verifier sees who calls the cited function (aicc: a component only rendered for an existing row)", () => {
+  const files = { "src/tasks/TaskRowMeta.js": "export default function TaskRowMeta({ task }) {\n  const label = task.dueLabel;\n  return label;\n}\n" };
+  // The caller is not changed by the PR: only the caller search reaches it.
+  const s = sample(files, { referenceFiles: [{ path: "src/tasks/TaskRow.js", content: "import TaskRowMeta from './TaskRowMeta';\nexport function TaskRow({ task }) {\n  if (!task) return null;\n  return <TaskRowMeta task={task} />;\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P2", file: "src/tasks/TaskRowMeta.js", line: 2, side: "RIGHT", title: "Unhandled null task prop crashes the render", failureScenario: "A caller renders it with task null.", rootCause: "No guard.", evidence: "src/tasks/TaskRowMeta.js:2 `const label = task.dueLabel;`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /src\/tasks\/TaskRow\.js[\s\S]*if \(!task\) return null;[\s\S]*<TaskRowMeta task=\{task\} \/>/);
+});
+
+test("feature turn: CALLEE_DEFINITIONS carries the code its added lines call in another feature's file", async () => {
+  const files = {
+    "Keyboard/Host.swift": "final class Host {\n  func tap() {\n    let outcome = whole.revert(in: &field)\n    show(outcome)\n  }\n}\n",
+    "Core/WholeDictation.swift": "public struct WholeDictation {\n  public mutating func revert(in field: inout Field) -> Outcome {\n    swapped = nil\n    return .kept\n  }\n}\n",
+  };
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "600";
+  try {
+    const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    const host = m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content).find((t) => /one feature of this PR: Keyboard\/Host\.swift/.test(t));
+    assert.ok(host, "Host.swift is a feature of its own");
+    assert.match(host, /<<<CALLEE_DEFINITIONS[^\n]*>>>\n--- Core\/WholeDictation\.swift \(L[\s\S]*func revert\(in field: inout Field\)[\s\S]*swapped = nil/);
+  } finally {
+    process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
+  }
+});
+

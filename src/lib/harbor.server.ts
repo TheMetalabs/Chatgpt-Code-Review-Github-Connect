@@ -1138,8 +1138,9 @@ async function generateLocalLeg(
           .filter((l) => l.provider !== "local" && l.raw.trim())
           .map((l) => ({ provider: l.provider, raw: l.raw })),
       // Per-token heartbeat from the wire: queued (server alive, nothing for us yet) vs generating.
-      request: (base, key, path, body, sig) =>
-        requestLocalJson(base, key, path, body, sig, { onActivity: (a) => noteLocalActivity(jobId, a.kind) }),
+      // The caller's own activity listener (the pipeline's first-token timing) is kept.
+      request: (base, key, path, body, sig, opts) =>
+        requestLocalJson(base, key, path, body, sig, { ...opts, onActivity: (a) => { noteLocalActivity(jobId, a.kind); opts?.onActivity?.(a); } }),
       // Turn boundaries: a completed tool round is real progress; the next request starts queued again.
       onProgress: (p) => noteLocalActivity(jobId, p.stage === "tool" ? "output" : "turn"),
       // Turn boundary: lend the model to waiting JSON repairs (short lane, capped), then resume ahead

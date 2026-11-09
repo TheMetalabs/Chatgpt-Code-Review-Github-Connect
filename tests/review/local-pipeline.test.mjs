@@ -22,6 +22,9 @@ import {
   calledNames,
   enclosingName,
   fitsOneTurn,
+  calleeDefinitions,
+  isSmallReview,
+  SMALL_REVIEW_MAX_FILES,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -891,4 +894,41 @@ test("evidence: a standalone call in an unchanged file is a caller, not a defini
   const f = { id: "x", status: "accepted", severity: "P1", file: "App/Tasks.swift", line: 8, side: "RIGHT", title: "Force unwrap crashes on a nil value", failureScenario: "A caller passes nil.", rootCause: "No guard.", evidence: "App/Tasks.swift:8 `let name = task!.name`", recommendedFix: "f", recommendedTest: "t" };
   const pack = evidencePack(s, f, new Map(), 20_000);
   assert.match(pack.code, /App\/Runner\.swift[\s\S]*processTask\(task: nil\)/);
+});
+
+// Two modules declare the same name; the corpus lists the one the calling file does NOT import first.
+const SAME_NAME = {
+  load: { "src/rows/load.ts": "import { parseRow } from './b';\nexport function load(text) {\n  return text.split('\\n').map((line) => parseRow(line));\n}\n" },
+  refs: [
+    { path: "src/rows/a.ts", content: "export function parseRow(line) {\n  return { source: 'a', cells: line.split(';') };\n}\n" },
+    { path: "src/rows/b.ts", content: "export function parseRow(line) {\n  return { source: 'b', cells: line.split(',') };\n}\n" },
+  ],
+};
+
+test("calleeDefinitions: of two same-named definitions, the one the calling file imports is shown", () => {
+  const block = calleeDefinitions(sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs }), ["src/rows/load.ts"], 6_000);
+  assert.match(block, /--- src\/rows\/b\.ts[\s\S]*source: 'b'/);
+  assert.doesNotMatch(block, /source: 'a'/);
+});
+
+test("evidence: of two same-named definitions, the verifier sees the one the cited file imports", () => {
+  const s = sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs });
+  // No quote or symbol name in the finding text, so only the called-name lookup reaches either module.
+  const f = { id: "x", status: "accepted", severity: "P2", file: "src/rows/load.ts", line: 3, side: "RIGHT", title: "Rows lose their cells", failureScenario: "A row with a comma is read as one cell.", rootCause: "The row parser ignores commas.", evidence: "src/rows/load.ts:3", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /src\/rows\/b\.ts[\s\S]*source: 'b'/);
+  assert.doesNotMatch(pack.code, /source: 'a'/);
+});
+
+test("isSmallReview: a PR that fits one turn is small only with at most SMALL_REVIEW_MAX_FILES files", async () => {
+  const items = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`src/items/item${i}.ts`, `export const item${i} = ${i};\n`]));
+  assert.equal(SMALL_REVIEW_MAX_FILES, 4);
+  await wholePr(async () => {
+    for (const [n, small] of [[3, true], [4, true], [5, false]]) {
+      assert.equal(fitsOneTurn(sample(items(n)), settings), true, `${n} files fit one turn`);
+      assert.equal(isSmallReview(sample(items(n)), settings), small, `${n} files`);
+    }
+    assert.equal(isSmallReview(sample(), settings), true, "the four-file sample is small when it fits one turn");
+  });
+  assert.equal(isSmallReview(sample(), settings), false, "a PR split into features is never small");
 });

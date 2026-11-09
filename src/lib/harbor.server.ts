@@ -24,7 +24,7 @@ import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode, type LocalReviewDeps } from "./local-review-loop.server";
-import { fitsOneTurn, runLocalReviewPipeline } from "./local-pipeline.server";
+import { isSmallReview, runLocalReviewPipeline } from "./local-pipeline.server";
 import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, smallReviewsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
@@ -997,10 +997,11 @@ async function kickLocalRace(jobId: string, prompt: string) {
 async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> {
   const signal = localControllers.get(jobId)?.signal;
   let waited = false;
-  // A PR the pipeline reviews in one turn is a small review: it waits in the lease's "small" lane,
-  // ahead of large reviews, and a running large review lends it the model at a turn boundary.
+  // A PR the pipeline reviews in one turn with at most SMALL_REVIEW_MAX_FILES files is a small review: it
+  // waits in the lease's "small" lane, ahead of large reviews, and a running large review lends it the
+  // model at a turn boundary. (A one-turn PR with many files split-retried into 23 turns on the small lane.)
   const sample = localSamples.get(jobId);
-  const small = state.settings.localReviewPipeline !== false && sample !== undefined && fitsOneTurn(sample, state.settings);
+  const small = state.settings.localReviewPipeline !== false && sample !== undefined && isSmallReview(sample, state.settings);
   const handle = await localModelLease().acquire(jobId, {
     signal,
     lane: small ? "small" : "review",

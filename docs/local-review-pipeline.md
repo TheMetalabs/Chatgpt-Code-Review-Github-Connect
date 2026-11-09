@@ -151,7 +151,7 @@ On #566's and #569's real diffs (mock model) this adds about 7–8% prompt text,
 
 On aicc-center, small PRs took 1–2 minutes of pipeline time but 50–90 minutes from request to result. The extra time was spent waiting for the local model: the lease was one FIFO, and a large review held the model for 30–50 minutes.
 
-- **Small lane.** A PR the pipeline reviews as one whole-PR feature (`fitsOneTurn`) waits in the lease's `small` lane: after short (JSON repair) and fix work, before large reviews.
+- **Small lane.** A PR the pipeline reviews as one whole-PR feature (`fitsOneTurn`) with at most 4 reviewable files (`SMALL_REVIEW_MAX_FILES`, `isSmallReview`) waits in the lease's `small` lane: after short (JSON repair) and fix work, before large reviews. The file limit exists because a failed whole-PR turn split-retries per file: a PR that fit one turn but had many files took 23 turns while holding the small lane, so few files bound how long a small review holds the model.
 - **Lending to small reviews.** At each turn boundary a large review lends the model to up to `ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT` (default 1) waiting small reviews, then resumes ahead of every other queued job. oMLX keeps KV blocks on SSD, so the large review's prompt cache survives the lend.
 - **Re-requests keep their place.** A job that supersedes a waiting or running job for the same PR keeps that job's queue time (`since`) instead of going to the back of the queue.
 

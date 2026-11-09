@@ -527,3 +527,57 @@ test('ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: default 1, 0 allowed, capped at
   assert.equal(smallReviewsPerCheckpoint({ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: '9'}), 4);
   assert.equal(smallReviewsPerCheckpoint({ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: 'x'}), 1);
 });
+
+// ── Nested lending: a small review on a lent slot never lends it on (revocation does not chain, so a
+// revoked small borrower used to leave its large lender parked forever) ──
+
+const within = (p, ms, what) => {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} hung`)), ms); });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+};
+
+test('checkpoint: a small review running on a lent slot lends nothing, even with a short job waiting', async () => {
+  const lease = new LocalModelLease();
+  const big = await lease.acquire('BIG');
+  const sm = lease.acquire('SM', {lane: 'small'});
+  const bigCp = lease.checkpoint(big, 0, undefined, 1); // lends only to the small review
+  const hs = await sm;
+  const s = lease.acquire('S', {lane: 'short'});
+  assert.equal(await within(lease.checkpoint(hs, 2, undefined, 1), 1000, 'borrower checkpoint'), 0);
+  assert.deepEqual(lease.snapshot(), {active: ['SM'], queued: ['S'], parked: ['BIG']});
+  hs.release();
+  assert.equal(await within(bigCp, 1000, 'lender checkpoint'), 1);
+  assert.deepEqual(lease.snapshot(), {active: ['BIG'], queued: ['S']});
+  big.release();
+  (await s).release();
+  assert.deepEqual(lease.snapshot(), {active: [], queued: []});
+});
+
+for (const [how, cancel] of [
+  ['releaseOwner', (lease) => { lease.releaseOwner('SM'); }],
+  ['its own abort, then release', (lease, hs, ctl) => { ctl.abort(new Error('cancelled')); hs.release(); }],
+]) {
+  test(`checkpoint: a small borrower cancelled (${how}) after its checkpoint with a short job waiting hands the model back to the large review`, async () => {
+    const lease = new LocalModelLease();
+    const big = await lease.acquire('BIG');
+    const sm = lease.acquire('SM', {lane: 'small'});
+    const bigCp = lease.checkpoint(big, 0, undefined, 1); // lends only to the small review
+    const hs = await sm;
+    let short; // held until released below, so a lent short job is still running at the cancel
+    const s = lease.acquire('S', {lane: 'short'}).then(h => { short = h; });
+    const ctl = new AbortController();
+    const smCp = lease.checkpoint(hs, 2, ctl.signal, 0);
+    await tick();
+    cancel(lease, hs, ctl);
+    await within(smCp, 1000, 'borrower checkpoint');
+    assert.equal(await within(bigCp, 1000, 'lender checkpoint'), 1, 'the large review resumes');
+    assert.deepEqual(lease.snapshot(), {active: ['BIG'], queued: ['S']}, 'the large review holds the slot again');
+    const next = lease.checkpoint(big);
+    await s;
+    short.release();
+    assert.equal(await within(next, 1000, 'next checkpoint'), 1, 'and lends to the short job at its next turn');
+    big.release();
+    assert.deepEqual(lease.snapshot(), {active: [], queued: []});
+  });
+}

@@ -17,7 +17,7 @@
  * Lanes: a waiter joins the queue in its lane and is granted before every waiter of a lower lane, in
  * order of its `since` time within a lane (FIFO unless a waiter inherits an earlier time): "short"
  * (JSON repair: 1-3 small calls) before "fix" (one call that unblocks a PR) before "small" (a review
- * whose whole PR fits one turn: minutes) before "review" (can take hours). A lane never preempts: the
+ * whose whole PR fits one turn in a few files: minutes) before "review" (can take hours). A lane never preempts: the
  * holder keeps the model until it releases — except that a review holder calls checkpoint() at each
  * turn boundary, which lends the model to waiting "short" jobs (at most `cap` per checkpoint) and, for
  * a "review" holder, to waiting "small" reviews (at most `smallCap`), and then gives it back to that
@@ -190,9 +190,12 @@ export class LocalModelLease {
    * keeps running and the slot goes to the next waiter when it finishes. `signal` (the holder's own
    * cancellation) is honored before lending and while lent: an abort revokes the parked holder and
    * returns at once, leaving the borrower active on its slot until its own release.
+   * A holder that is itself a borrower (a small review on a lent slot) never lends: revocation does not
+   * chain, so its lender would stay parked forever if it were revoked while parked.
    */
   async checkpoint(handle: LocalModelLeaseHandle, cap = DEFAULT_SHORT_PER_CHECKPOINT, signal?: AbortSignal, smallCap = 0): Promise<number> {
     const holderId = this.ids.get(handle);
+    if (holderId !== undefined && this.lends.has(holderId)) return 0;
     let served = 0;
     let shortServed = 0;
     let smallServed = 0;

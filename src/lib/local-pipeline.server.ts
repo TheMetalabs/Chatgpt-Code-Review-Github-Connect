@@ -641,10 +641,13 @@ const DECL_RE = (name: string) =>
   new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$)`);
 
 /** Where `name` is declared among `files`: the first declaration proper in any file, else (only when no
- * file declares it) the first looser DEF_RE match. [path, 0-based line] or null. */
-function findDefinition(files: Iterable<[string, string[]]>, name: string): [string, number] | null {
+ * file declares it) the first looser DEF_RE match. Within each pass the `prefer` paths are searched first,
+ * in order (see definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based
+ * line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
   const n = name.replace(/[$]/g, "\\$");
-  const all = [...files];
+  const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
+  const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
   for (const re of [DECL_RE(n), DEF_RE(n)]) {
     for (const [path, lines] of all) {
       const i = lines.findIndex((l) => re.test(l));
@@ -652,6 +655,11 @@ function findDefinition(files: Iterable<[string, string[]]>, name: string): [str
     }
   }
   return null;
+}
+
+/** Where to look first for a name `from` uses: `from` itself, then the files it imports by relative path. */
+function definitionOrder(from: string, content: string): string[] {
+  return [from, ...importSpecifiers(content).flatMap((spec) => resolveRelativeImport(from, spec))];
 }
 
 const ENCLOSING_RE = [
@@ -687,14 +695,19 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
   if (maxChars < 400) return "";
   const own = new Set(files);
   const patches = patchesByPath(sample.diff);
-  const added = files.map((p) => (patches.get(p) ?? "").split("\n").filter((l) => l.startsWith("+")).join("\n")).join("\n");
+  const addedIn = files.map((p) => (patches.get(p) ?? "").split("\n").filter((l) => l.startsWith("+")).join("\n"));
+  const added = addedIn.join("\n");
   const corpus: [string, string[]][] = [...sample.files, ...(sample.referenceFiles ?? [])]
     .filter((f) => !own.has(f.path))
     .map((f) => [f.path, f.content.split("\n")]);
+  const content = new Map(sample.files.map((f) => [f.path, f.content]));
+  const callsIn = addedIn.map(calledNames);
   const blocks: string[] = [];
   let used = 0;
   for (const name of calledNames(added).slice(0, 24)) {
-    const found = findDefinition(corpus, name);
+    // The feature file whose added lines call it: its own imports decide between same-named definitions.
+    const caller = files[callsIn.findIndex((c) => c.includes(name))];
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
     if (!found) continue;
     const [path, i] = found;
     const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
@@ -810,9 +823,10 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
     ...fileLines.slice(Math.max(0, f.line - 3), f.line + 2),
     ...[...f.evidence.matchAll(/`([^`]+)`/g)].map((m) => m[1]),
   ].join("\n");
+  const prefer = definitionOrder(f.file, fileLines.join("\n"));
   for (const name of calledNames(citedCode).slice(0, 8)) {
     if (defs >= 6) break;
-    const found = findDefinition(corpus, name);
+    const found = findDefinition(corpus, name, prefer);
     if (found) { addCode(found[0], found[1] + 1, 3, 15); defs += 1; }
   }
   // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
@@ -1087,11 +1101,19 @@ function featureBudget(settings: BotSettings, t: LoopTuning): number {
   return Math.min(t.groupMaxChars, Math.floor(promptBudget(settings, t).promptChars * 0.5));
 }
 
-/** Whether the pipeline reviews this PR as one whole-PR feature (no map, a handful of turns): a small
- * review. Harbor queues it in the lease's "small" lane, ahead of large reviews. */
+/** Whether the pipeline reviews this PR as one whole-PR feature (no map, a handful of turns). */
 export function fitsOneTurn(sample: SamplePr, settings: BotSettings): boolean {
   const patches = patchesByPath(sample.diff);
   return reviewTargets(sample).reduce((n, p) => n + (patches.get(p)?.length ?? 0) + 200, 0) <= featureBudget(settings, tuning());
+}
+
+/** A failed whole-PR turn split-retries per file, so only a few files bound how long a small holder runs. */
+export const SMALL_REVIEW_MAX_FILES = 4;
+
+/** A small review: fits one turn and has at most SMALL_REVIEW_MAX_FILES review targets. Harbor queues it
+ * in the lease's "small" lane, ahead of large reviews. */
+export function isSmallReview(sample: SamplePr, settings: BotSettings): boolean {
+  return reviewTargets(sample).length <= SMALL_REVIEW_MAX_FILES && fitsOneTurn(sample, settings);
 }
 
 function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): Ctx {

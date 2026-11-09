@@ -16,13 +16,14 @@
  *                  with evidence Ashlar collects itself (the cited code, the definitions and uses of the
  *                  symbols it names, the module docs, the PR description). Only a candidate the verifier
  *                  confirms with a quote that exists in that code survives.
- *   4. Select    — one turn merges duplicates and keeps the most important few (Settings cap).
+ *   4. Select    — one turn merges duplicates and keeps the most important few (Settings cap); skipped
+ *                  when it cannot change what is posted (selectCanBeSkipped).
  */
 import { buildChatParts, buildPolicyAttachment, LOCAL_CHARS_PER_TOKEN, parseChatSubmission, prDescriptionBlock, REVIEW_INSTRUCTIONS, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { changedExportedSymbols } from "./context-slice.ts";
 import { extractChatJsonParts, lastJsonObjectRange } from "./extract-chat-json.ts";
 import { importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
-import { requestLocalJson } from "./local-chat-request.server.ts";
+import { requestLocalJson, type LocalRequestActivity } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
 import {
@@ -84,7 +85,41 @@ type Ctx = {
   /** What a stage's prompt may take, in chars (the cap less room for the reply). */
   promptChars: number;
   turns: number;
+  /** Per-stage totals of every turn (time and the server's token counts), for the ops line. */
+  stages: Partial<Record<StageName, StageTotals>>;
 };
+
+export type StageName = "map" | "feature" | "verify" | "select";
+/** What one stage's turns took: wall time, and the token counts the server reported (`usage`), where it
+ * reported them. `cachedSeen` is false when the server never said how many prompt tokens it reused. */
+export type StageTotals = { turns: number; ms: number; prompt: number; cached: number; out: number; usageSeen: boolean; cachedSeen: boolean };
+type TurnUsage = { prompt?: number; cached?: number; out?: number };
+
+const stageName = (label: string): StageName =>
+  label.startsWith("map") ? "map" : label.startsWith("verify") ? "verify" : label.startsWith("select") ? "select" : "feature";
+
+const tokenCount = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined);
+/** The token counts of an OpenAI-style `usage`: cached prompt tokens from prompt_tokens_details.cached_tokens
+ * (or a top-level cached_tokens); any of them may be absent. */
+function turnUsage(usage: unknown): TurnUsage | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as { prompt_tokens?: unknown; completion_tokens?: unknown; cached_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } | null };
+  const out = { prompt: tokenCount(u.prompt_tokens), cached: tokenCount(u.prompt_tokens_details?.cached_tokens) ?? tokenCount(u.cached_tokens), out: tokenCount(u.completion_tokens) };
+  return out.prompt === undefined && out.cached === undefined && out.out === undefined ? undefined : out;
+}
+
+function noteTurn(ctx: Ctx, label: string, ms: number, usage: TurnUsage | undefined) {
+  const t = (ctx.stages[stageName(label)] ??= { turns: 0, ms: 0, prompt: 0, cached: 0, out: 0, usageSeen: false, cachedSeen: false });
+  t.turns += 1;
+  t.ms += ms;
+  if (!usage) return;
+  t.usageSeen = true;
+  t.prompt += usage.prompt ?? 0;
+  t.out += usage.out ?? 0;
+  if (usage.cached !== undefined) { t.cached += usage.cached; t.cachedSeen = true; }
+}
+
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 
 const STRICT_TEMPERATURE = () => envNum("ASHLAR_LOCAL_PIPELINE_STRICT_TEMPERATURE", 0.1);
 const VOTE_TEMPERATURE = () => envNum("ASHLAR_LOCAL_PIPELINE_VOTE_TEMPERATURE", 0.4);
@@ -106,15 +141,36 @@ async function ask(ctx: Ctx, stage: string, messages: Msg[], mode: Sampling): Pr
   if (deps.signal?.aborted) throw deps.signal.reason ?? new Error("local review cancelled at a turn boundary");
   ctx.turns += 1;
   deps.onProgress?.({ group: 0, groups: 0, iter: ctx.turns, stage: "generating" });
-  const res = (await ctx.request(ctx.baseUrl, ctx.apiKey, "chat/completions", {
-    model: settings.localLlmModel.trim(),
-    messages,
-    ...sampling(settings, mode),
-  }, deps.signal)) as { choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: unknown[] } }[] };
+  // Time to first token: from the dispatch to the first streamed output. A buffered reply reports its one
+  // `output` only when it is complete, so a single output event gives no first-token time.
+  const start = Date.now();
+  let sentAt = 0;
+  let firstAt = 0;
+  let outputs = 0;
+  const onActivity = (a: LocalRequestActivity) => {
+    if (a.kind === "sent" && !sentAt) sentAt = a.at;
+    if (a.kind === "output") { outputs += 1; firstAt ||= a.at; }
+  };
+  let res: { choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: unknown[] } }[]; usage?: unknown };
+  try {
+    res = (await ctx.request(ctx.baseUrl, ctx.apiKey, "chat/completions", {
+      model: settings.localLlmModel.trim(),
+      messages,
+      ...sampling(settings, mode),
+    }, deps.signal, { onActivity })) as typeof res;
+  } catch (e) {
+    noteTurn(ctx, stage, Date.now() - start, undefined);
+    throw e;
+  }
+  const ms = Date.now() - start;
+  const usage = turnUsage(res.usage);
+  noteTurn(ctx, stage, ms, usage);
   const choice = res.choices?.[0];
   const calls = choice?.message?.tool_calls;
   deps.onProgress?.({ group: 0, groups: 0, iter: ctx.turns, stage: "tool" });
-  deps.log?.(`pipeline ${stage}: finish=${choice?.finish_reason} chars=${chars(messages)}`);
+  const timing = [secs(ms), outputs > 1 && firstAt ? `ttft=${secs(firstAt - (sentAt || start))}` : ""];
+  const tokens = usage ? [usage.prompt !== undefined ? `prompt=${usage.prompt}` : "", usage.cached !== undefined ? `cached=${usage.cached}` : "", usage.out !== undefined ? `out=${usage.out}` : ""] : [];
+  deps.log?.(`pipeline ${stage}: finish=${choice?.finish_reason} chars=${chars(messages)} ${[...timing, ...tokens].filter(Boolean).join(" ")}`);
   return { content: choice?.message?.content ?? "", finish: choice?.finish_reason, toolCalls: Array.isArray(calls) ? calls.length : 0 };
 }
 
@@ -826,7 +882,7 @@ export function hunkAt(diff: string, file: string, line: number, maxChars = 2_00
  * the cited code, the code each evidence step cites, the definitions and the uses (in other changed
  * files) of the symbols the finding names, the diff hunk of the cited line, the module docs for its
  * file, the prose docs the PR edits, the PR description, and the PR map lines of the files involved. `code` is the code part alone (what a proof quote must come from). */
-export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string; shared: string; specific: string } {
+export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapEntry>, maxChars: number): { text: string; code: string; shared: string; perFile: string; specific: string } {
   const corpus = new Map<string, string[]>();
   for (const r of sample.referenceFiles ?? []) corpus.set(r.path, r.content.split("\n"));
   for (const r of sample.files) corpus.set(r.path, r.content.split("\n"));
@@ -921,22 +977,27 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   const policy = buildPolicyAttachment({ ...sample, changedPaths: [f.file] }, Math.floor(maxChars * 0.12), sample.changedPaths);
   // `shared` is the same for every candidate of this PR (its description and changed docs), so the
   // verify request puts it right after the fixed rules: a prefix-caching server reuses it from one
-  // verify turn to the next. `specific` is this candidate's own evidence.
+  // verify turn to the next. `perFile` (the module docs of the cited file, when they fit) is the same for
+  // every candidate in one file, so it goes before the candidate. `specific` is this candidate's own evidence.
   const shared = [
     description,
     docs.length ? `<<<CHANGED_DOCS (design docs this PR edits, at its head; PR-authored)>>>\n${docs.join("\n\n")}\n<<<END>>>` : "",
   ].filter(Boolean).join("\n\n");
+  const moduleDocs = policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "";
   const sections = [
     `<<<CODE (head of the PR; line-numbered)>>>\n${code.join("\n\n")}\n<<<END>>>`,
     diffBlock,
     mapLines.length ? `<<<PR_MAP_LINES (summaries, untrusted data)>>>\n${mapLines.join("\n")}\n<<<END>>>` : "",
-    policy ? `<<<MODULE_DOCS (repository rules and documented design)>>>\n${policy}\n<<<END>>>` : "",
+    moduleDocs,
   ].filter(Boolean);
-  let specific = "";
+  let packed = "";
+  const kept: string[] = [];
   const room = maxChars - shared.length - 2;
-  for (const s of sections) if (specific.length + s.length + 2 <= room) specific += (specific ? "\n\n" : "") + s;
-  const text = [shared, specific].filter(Boolean).join("\n\n");
-  return { text, code: code.join("\n"), shared, specific };
+  for (const s of sections) if (packed.length + s.length + 2 <= room) { packed += (packed ? "\n\n" : "") + s; kept.push(s); }
+  const text = [shared, packed].filter(Boolean).join("\n\n");
+  // The same sections fit or not as before; only where the module docs sit in the request moves.
+  const perFile = moduleDocs && kept.includes(moduleDocs) ? moduleDocs : "";
+  return { text, code: code.join("\n"), shared, perFile, specific: kept.filter((s) => !perFile || s !== perFile).join("\n\n") };
 }
 
 const norm = (s: string) => s.replace(/^\s*\d+\|\s?/gm, "").replace(/[`'"]/g, "").replace(/\s+/g, " ").trim();
@@ -1000,11 +1061,13 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     root_cause: c.rootCause, evidence: c.evidence,
   }, null, 1);
   const user = [
-    // Fixed first, then what every candidate of this PR shares, then this candidate: the longest
-    // possible prefix in common with the previous verify turns (a prefix cache reuses it).
+    // Fixed first, then what every candidate of this PR shares, then what every candidate in this file
+    // shares, then this candidate: the longest possible prefix in common with the previous verify turns
+    // (a prefix cache reuses it; refuteAndSelect verifies one file's candidates in a row).
     VERIFY_RULES,
     pack.shared,
     languageNotes([c.file]),
+    pack.perFile,
     `<<<CANDIDATE (a report to check; untrusted)>>>\n${candidate}\n<<<END>>>`,
     pack.specific,
     "Check the candidate against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, severity).",
@@ -1068,8 +1131,26 @@ export function rankSurvivors<T extends Pick<Finding, "severity" | "file" | "tit
     .slice(0, Math.max(0, max));
 }
 
-async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string })[], map: Map<string, MapEntry>, max: number, verified = true): Promise<{ picked: Candidate[]; byModel: boolean }> {
+/**
+ * Whether the select turn cannot change what is posted, so it is skipped (one model turn less). It picks
+ * at most `max` and orders them; with at most `max` findings nothing has to be cut. It can also lower a
+ * severity (nothing to lower when every finding is already P2) and merge two findings with one root cause:
+ * two findings in one file still get the turn (one defect reported at two lines of a file is the usual
+ * duplicate; one at the same line or quote was already merged by dedupeCandidates).
+ */
+function selectCanBeSkipped(rows: Pick<Finding, "severity" | "file">[], max: number): boolean {
+  return rows.length <= max && rows.every((r) => r.severity === "P2") && new Set(rows.map((r) => r.file)).size === rows.length;
+}
+
+/** The posted order without a select turn: severity, then confirmed before not confirmed (uncertain or
+ * unverified), then as found; one per file+title, at most `max` (rankSurvivors). */
+function postInOrder<T extends Pick<Finding, "severity" | "file" | "title"> & { confirmed?: boolean }>(rows: T[], max: number): T[] {
+  return rankSurvivors([...rows].sort((a, b) => Number(b.confirmed === true) - Number(a.confirmed === true)), max);
+}
+
+async function selectFindings(ctx: Ctx, survivors: (Candidate & { verifyReason: string; confirmed?: boolean })[], map: Map<string, MapEntry>, max: number, verified = true): Promise<{ picked: Candidate[]; byModel: boolean }> {
   if (survivors.length <= 1) return { picked: survivors.slice(0, max), byModel: false };
+  if (selectCanBeSkipped(survivors, max)) return { picked: postInOrder(survivors, max), byModel: false };
   const list = survivors.map((c) => ({
     id: c.cid, severity: c.severity, file: c.file, line: c.line, title: c.title,
     failure_scenario: clip(c.failureScenario, 300), verified_because: clip(c.verifyReason, 200),
@@ -1136,10 +1217,30 @@ const failedNote = (s: Pick<PipelineStats, "failedGroups" | "splitRetried" | "un
 export type PipelineStats = {
   mapTurns: number; groups: number; lenses: number; minutes?: number; splitRetried: number; unreviewedFiles: string[]; failedGroups: number; candidates: number; gated: number; softGated: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
+  stages?: Partial<Record<StageName, StageTotals>>;
 };
 
+const STAGE_ORDER: StageName[] = ["map", "feature", "verify", "select"];
+const stageMinutes = (ms: number) => { const m = ms / 60_000; return `${m < 10 ? Math.round(m * 10) / 10 : Math.round(m)}m`; };
+const kTokens = (n: number) => (n < 1_000 ? String(n) : `${n < 10_000 ? Math.round(n / 100) / 10 : Math.round(n / 1_000)}K`);
+
+/** Per stage: turns, minutes, and (when the server reported usage) prompt tokens, the share of them it
+ * served from its prefix cache, and output tokens. Prefill time follows the uncached prompt tokens,
+ * decode time the output tokens. */
+function stageBreakdown(stages: Partial<Record<StageName, StageTotals>>): string {
+  return STAGE_ORDER.flatMap((name) => {
+    const t = stages[name];
+    if (!t?.turns) return [];
+    const usage = t.usageSeen
+      ? [t.prompt ? ` in ${kTokens(t.prompt)}` : "", t.cachedSeen && t.prompt ? ` cached ${Math.round((100 * t.cached) / t.prompt)}%` : "", t.out ? ` out ${kTokens(t.out)}` : ""].join("")
+      : "";
+    return [`${name} ${t.turns}t ${stageMinutes(t.ms)}${usage}`];
+  }).join(" · ");
+}
+
 export function pipelineSummary(s: PipelineStats): string {
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
+  const stages = s.stages ? stageBreakdown(s.stages) : "";
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
 }
 
 /** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
@@ -1188,7 +1289,14 @@ function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): C
     capTokens,
     promptChars,
     turns: 0,
+    stages: {},
   };
+}
+
+/** The order the verify turns run in: grouped by file, the files in the order of their first (most severe)
+ * candidate, each file's candidates in their own order. */
+function verifyOrder<T extends Pick<Finding, "file">>(rows: T[]): T[] {
+  return [...new Set(rows.map((r) => r.file))].flatMap((file) => rows.filter((r) => r.file === file));
 }
 
 /** Stages 3 and 4 over the candidates: each verified, the survivors ranked and capped. `verifiedKeys` are
@@ -1207,11 +1315,11 @@ async function refuteAndSelect(
   const toVerify = ordered.slice(0, MAX_VERIFIED_CANDIDATES);
   const overCap = ordered.slice(MAX_VERIFIED_CANDIDATES);
   stats.overCap = overCap.length;
-  // Candidates past the verify cap were never judged: they stay candidates as reported (ranked last by
-  // the selection), never silently dropped into a clean result.
-  const survivors: (Candidate & { verifyReason: string; verified: boolean })[] = [];
-  let unverifiedPosted = 0;
-  for (const c of toVerify) {
+  // The verify turns run one file at a time (verifyOrder), so consecutive turns share that file's module
+  // docs as well (a prefix cache reuses them). The results are read back in severity order: which
+  // candidates are verified and how the survivors are ranked do not depend on that turn order.
+  const results = new Map<string, VerifyResult>();
+  for (const c of verifyOrder(toVerify)) {
     let r: VerifyResult;
     try {
       r = await verifyCandidate(ctx, sample, c, map, votes);
@@ -1219,13 +1327,21 @@ async function refuteAndSelect(
       if (ctx.deps.signal?.aborted) throw e;
       r = { cid: c.cid, status: "unverified", reason: (e instanceof Error ? e.message : String(e)).slice(0, 160), severity: c.severity };
     }
+    results.set(c.cid, r);
+  }
+  // Candidates past the verify cap were never judged: they stay candidates as reported (ranked last by
+  // the selection), never silently dropped into a clean result.
+  const survivors: (Candidate & { verifyReason: string; verified: boolean; confirmed: boolean })[] = [];
+  let unverifiedPosted = 0;
+  for (const c of toVerify) {
+    const r = results.get(c.cid) as VerifyResult;
     if (r.status === "confirmed") {
       stats.confirmed += 1;
       const evidence = r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
-      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true });
+      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true, confirmed: true });
     } else if (r.status === "uncertain") {
       stats.uncertain += 1;
-      survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true });
+      survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true, confirmed: false });
     } else if (r.status === "refuted") {
       stats.refuted += 1;
       ctx.deps.log?.(`pipeline refuted ${c.file}:${c.line} (${c.title}): ${r.reason}`);
@@ -1235,10 +1351,10 @@ async function refuteAndSelect(
       // publish threshold cannot filter it away either — and said so.
       stats.unverified += 1;
       unverifiedPosted += 1;
-      survivors.push({ ...c, verifyReason: "not verified", verified: false });
+      survivors.push({ ...c, verifyReason: "not verified", verified: false, confirmed: false });
     }
   }
-  for (const c of overCap) survivors.push({ ...c, verifyReason: "not verified (over the verify cap)", verified: false });
+  for (const c of overCap) survivors.push({ ...c, verifyReason: "not verified (over the verify cap)", verified: false, confirmed: false });
   // A candidate the verifier never judged competes for a posting slot only when nothing was verified:
   // next to verified findings it is the least reliable kind (on WalkieBoard #566, 40 of 56 candidates
   // were past the cap). With none verified it is kept as reported (a failure never becomes a clean result).
@@ -1460,6 +1576,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     const { findings, assumptions: verifyNotes, verifiedKeys } = await refuteAndSelect(ctx, sample, unique, map, stats);
     stats.turns = ctx.turns;
     stats.minutes = Math.round((Date.now() - startedAt) / 60_000);
+    stats.stages = ctx.stages;
     const unreviewed = [...new Set([...failed, ...reportedUnreviewed, ...unreviewablePaths(sample)])];
     // Coverage is Ashlar's own record, not the model's self-assessment: a file whose feature turn returned
     // a usable review is cleared; one whose turn failed, that the reply marked unreviewed, or that has no

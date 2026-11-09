@@ -12,7 +12,7 @@ const stage=body=>{const s=JSON.parse(body).messages[0].content;return s.startsW
 const confirmed=JSON.stringify({verdict:'confirmed',reason:'the constant changed',proof_quote:'export const answer = 42;',severity:'P1'});
 const refuted=JSON.stringify({verdict:'refuted',reason:'documented change',counter_quote:'export const answer = 42;'});
 
-async function run(t,settings,answers,env={}){
+async function run(t,settings,answers,env={},respond=(res,content)=>res.end(reply(content))){
   const app=await appFixture({reviewChatgpt:false,localJsonRepairEnabled:false,localReviewPipeline:true,localPipelineLenses:1,...settings});t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   Object.assign(app.env,env);
@@ -23,7 +23,7 @@ async function run(t,settings,answers,env={}){
     while(answered<app.localResponses.length){
       const body=app.localRequests[answered].raw??JSON.stringify(app.localRequests[answered]);
       const s=stage(body);stages.push(s);
-      app.localResponses[answered].end(reply(answers[s](stages.filter(x=>x===s).length)));answered++;
+      respond(app.localResponses[answered],answers[s](stages.filter(x=>x===s).length));answered++;
     }
     return ['posted','skipped','dlq','cancelled'].includes(job()?.status);
   },'the job never finished');
@@ -70,4 +70,21 @@ test('large PR: the staged pipeline runs map → feature → verify and posts th
 test('pipeline off: the grouped tool loop of before (no map, no verify turn)',async t=>{
   const {stages}=await run(t,{localReviewMode:'multiturn',localReviewPipeline:false},{review:()=>dirty});
   assert.deepEqual(stages,['review']);
+});
+
+test('a streamed reply: the turn log has its time to first token and token counts; the ops line sums them per stage',async t=>{
+  // An SSE reply in two content chunks, then the usage chunk (stream_options.include_usage).
+  const sse=(res,content)=>{
+    const data=o=>`data: ${JSON.stringify(o)}\n\n`;
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    res.write(data({choices:[{delta:{content:content.slice(0,5)}}]}));
+    res.end(data({choices:[{delta:{content:content.slice(5)},finish_reason:'stop'}]})+data({choices:[],usage:{prompt_tokens:120,completion_tokens:30,prompt_tokens_details:{cached_tokens:60}}})+'data: [DONE]\n\n');
+  };
+  const lines=[];const info=console.info;console.info=(...a)=>{lines.push(a.join(' '));};
+  t.after(()=>{console.info=info;});
+  const {app,stages}=await run(t,{localReviewMode:'single'},{review:()=>dirty,verify:()=>confirmed},{ASHLAR_LOCAL_LLM_STREAM:'true'},sse);
+  console.info=info;
+  assert.deepEqual(stages,['review','verify']);
+  assert.ok(lines.some(l=>/pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s ttft=[\d.]+s prompt=120 cached=60 out=30$/.test(l)),lines.filter(l=>/pipeline /.test(l)).join('\n'));
+  await eventually(()=>/1 posted \(2 turns, \d+ min\) · feature 1t [\d.]+m in 120 cached 50% out 30 · verify 1t [\d.]+m in 120 cached 50% out 30/.test(app.ops.at(-1)??''),'no per-stage breakdown in the ops comment');
 });

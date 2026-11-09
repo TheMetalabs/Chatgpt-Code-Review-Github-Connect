@@ -1102,3 +1102,104 @@ test("enclosingName: a bare assignment of an arrow function is not the enclosing
   // A typed class property without a modifier still is one.
   assert.equal(enclosingName(["export class Form {", "  onSave: Handler = async (form) => {", "    await api.save(form!);", "  };", "}"], 3, "src/form.ts"), "onSave");
 });
+
+// ── Speed (2026-11-09): per-turn measurement, a select turn that cannot change the result, verify turns in
+// prefix-cache order ──
+
+const candidateFile = (body) => /"file": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(body.messages[1].content)?.[1] ?? "")?.[1];
+
+test("measurement: each turn's time and the server's usage (prompt, cached, out) are logged and summed per stage in the ops line", async () => {
+  const usage = { map: [1000, 0, 100], review: [2000, 1000, 300], verify: [3000, 2400, 50], select: [500, 0, 20] };
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" })] }),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);") : confirm()),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c2" }] }),
+  });
+  const request = async (b, k, path, body, sig, opts) => {
+    // A streamed reply: dispatched at t=1000, first token at t=3500, more tokens after it.
+    opts?.onActivity?.({ kind: "sent", at: 1_000 });
+    opts?.onActivity?.({ kind: "output", at: 3_500 });
+    opts?.onActivity?.({ kind: "output", at: 4_000 });
+    const res = await m.request(b, k, path, body);
+    const [prompt_tokens, cached_tokens, completion_tokens] = usage[stageOf(body)];
+    return { ...res, usage: { prompt_tokens, completion_tokens, prompt_tokens_details: { cached_tokens } } };
+  };
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(m.count.select, 1, "two P1 findings still get the select turn");
+  assert.match(out.pipelineSummary, / posted \(6 turns, \d+ min\) · map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/);
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50$/.test(l)), logs.join("\n"));
+});
+
+test("measurement: a server that reports no usage (or no cached count) still gets turns and minutes per stage", async () => {
+  const on = { map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() };
+  const bare = model(on);
+  const request = async (...args) => { const { usage: _drop, ...res } = await bare.request(...args); return res; };
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  assert.match(out.pipelineSummary, / posted \(4 turns, \d+ min\) · map 1t [\d.]+m · feature 2t [\d.]+m · verify 1t [\d.]+m$/);
+  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s$/.test(l)), "no token counts, and no first-token time without a streamed reply");
+  // The default mock reports prompt_tokens only: no cached share is claimed.
+  const m = model(on);
+  const withPrompt = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(withPrompt.pipelineSummary, /· verify 1t [\d.]+m in 100$/);
+});
+
+test("select: at most max findings, all P2 and in different files — no select turn; all posted, confirmed before uncertain", async () => {
+  const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F({ severity: "P2" })], "src/mail/mailer.ts": [mail] }),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : JSON.stringify({ verdict: "uncertain", reason: "cannot tell" })),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }] }),
+  });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(m.count.select, undefined, "no select request");
+  assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.file), ["src/mail/mailer.ts", "src/orders/orders.controller.ts"]);
+  assert.match(out.pipelineSummary, /1 confirmed, 1 uncertain, 0 refuted, 2 posted \(5 turns/);
+});
+
+test("select: the turn still runs with more findings than max, a P1 it could lower, or two findings in one file (a possible duplicate)", async () => {
+  const mail = F({ severity: "P2", file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
+  const verify = (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : confirm(undefined, "P2"));
+  const cases = [
+    [{ "src/orders/orders.controller.ts": [F({ severity: "P2" })], "src/mail/mailer.ts": [mail] }, 1, verify],
+    [{ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] }, 5, (b) => (candidateFile(b) === "src/mail/mailer.ts" ? confirm("return queue.push(to);", "P2") : confirm())],
+    [{ "src/orders/orders.controller.ts": [F({ severity: "P2" }), F({ severity: "P2", line: 2, title: "create exported without a guard qq" })] }, 5, verify],
+  ];
+  for (const [rows, max, v] of cases) {
+    const m = model({ map: mapReply, review: reviewFor(rows), verify: v, select: () => JSON.stringify({ selected: [{ id: "c1" }] }) });
+    const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineMaxFindings: max }, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    assert.equal(m.count.select, 1, JSON.stringify(rows));
+  }
+});
+
+test("prefix cache: verify turns go out grouped by file, files in severity order; the module docs come before the candidate", async () => {
+  const s = sample(FILES, { files: [...sample().files, { path: "src/orders/CLAUDE.md", content: "# Orders\nAmounts are validated in the service layer by design.", language: "md" }] });
+  const ctrl = (o) => F({ evidence: "src/orders/orders.controller.ts:3 `return charge(req.body.amount);`", ...o });
+  const mail = (o) => F({ file: "src/mail/mailer.ts", line: 2, evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", ...o });
+  const m = model({
+    map: mapReply,
+    review: reviewFor({
+      "src/orders/orders.controller.ts": [ctrl({ severity: "P2", line: 2, title: "charlie charlieq" }), ctrl({ severity: "P1", title: "alpha alphaq" })],
+      "src/mail/mailer.ts": [mail({ severity: "P1", title: "bravo bravoq" }), mail({ severity: "P2", line: 1, title: "delta deltaq" })],
+    }),
+    verify: refute,
+  });
+  const out = await runLocalReviewPipeline(s, settings, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  const turns = m.bodies.filter((b) => stageOf(b) === "verify");
+  const title = (b) => /"title": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")?.[1];
+  // The mailer feature is reviewed first, so its P1 is the first candidate: its file goes first.
+  assert.deepEqual(turns.map(title), ["bravo bravoq", "delta deltaq", "alpha alphaq", "charlie charlieq"]);
+  const [a, b] = turns.slice(2).map((t) => t.messages[1].content);
+  const shared = commonPrefix(a, b);
+  assert.match(a.slice(0, shared), /<<<MODULE_DOCS[\s\S]*validated in the service layer by design/, "one file's module docs are in the prefix its verify turns share");
+  assert.ok(a.indexOf("<<<CANDIDATE") <= shared);
+  assert.match(out.pipelineSummary, /4 to verify, 0 confirmed, 4 refuted/);
+});

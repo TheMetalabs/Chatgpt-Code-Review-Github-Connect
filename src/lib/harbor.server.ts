@@ -24,10 +24,10 @@ import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode, type LocalReviewDeps } from "./local-review-loop.server";
-import { runLocalReviewPipeline } from "./local-pipeline.server";
+import { isSmallReview, runLocalReviewPipeline } from "./local-pipeline.server";
 import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
-import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
+import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, smallReviewsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
 import { attemptFailedNote, buildOpsComment, opsCommentAllowed, reviewPostedNotes, vendoredSkippedNote, type OpsPhase } from "./ops-comment";
 import { gateStatsLine } from "./finding-gate";
 import {
@@ -100,6 +100,10 @@ const localSamples = new Map<string, SamplePr>();
 const localHeadReads = new Map<string, Map<string, string>>();
 /** Per job: the local pipeline's verified finding keys (finding-gate verifiedKey), for its leg's gate. */
 const localVerifiedKeys = new Map<string, Set<string>>();
+/** When a job's local leg first queued for the local model, or the time it inherited from the job(s) for
+ * the same PR it superseded: a re-request keeps its place in the queue instead of going to the back
+ * (jobId → ms). */
+const localQueueSince = new Map<string, number>();
 // In-memory only, beside localSamples: the single-turn local prompt for a job's chat prompt, fitted to
 // the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
 // (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
@@ -286,6 +290,7 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
   // No merge follows a terminal edge: an in-flight leg's later reads are not kept either.
   localHeadReads.delete(job.id);
   localVerifiedKeys.delete(job.id);
+  localQueueSince.delete(job.id);
   if (!stop) return;
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
@@ -993,8 +998,19 @@ async function kickLocalRace(jobId: string, prompt: string) {
 async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> {
   const signal = localControllers.get(jobId)?.signal;
   let waited = false;
+  // A PR the pipeline reviews in one turn with at most SMALL_REVIEW_MAX_FILES files is a small review: it
+  // waits in the lease's "small" lane, ahead of large reviews, and a running large review lends it the
+  // model at a turn boundary. (A one-turn PR with many files split-retried into 23 turns on the small lane.)
+  const sample = localSamples.get(jobId);
+  const small = state.settings.localReviewPipeline !== false && sample !== undefined && isSmallReview(sample, state.settings);
+  // The job's place in the queue is when its local leg first asked for the model (or the place it
+  // inherited from a job it superseded), not when its webhook arrived: in verify mode the local leg
+  // starts only after the chat leg, so a re-request must not jump ahead of reviews queued before it.
+  if (!localQueueSince.has(jobId)) localQueueSince.set(jobId, Date.now());
   const handle = await localModelLease().acquire(jobId, {
     signal,
+    lane: small ? "small" : "review",
+    since: localQueueSince.get(jobId),
     onPosition: (position) => {
       waited = true;
       const now = Date.now();
@@ -1133,7 +1149,7 @@ async function generateLocalLeg(
       ...(lease ? {
         checkpoint: async () => {
           localLiveness.get(jobId)?.clear();
-          try { await localModelLease().checkpoint(lease, shortJobsPerCheckpoint(), signal); }
+          try { await localModelLease().checkpoint(lease, shortJobsPerCheckpoint(), signal, smallReviewsPerCheckpoint()); }
           finally { localLiveness.get(jobId)?.reset(); }
         },
       } : {}),
@@ -2261,9 +2277,13 @@ function enqueueFromDecision(
   };
   // Supersession is an explicit cancellation, not a timer: each live job for the same PR ends through
   // transitionJob, which aborts its local leg and frees its snapshot.
-  const superseded = state.jobs
-    .filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status))
-    .map((j) => j.id);
+  const supersededJobs = state.jobs.filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status));
+  const superseded = supersededJobs.map((j) => j.id);
+  // The new job keeps the queue place of the oldest job it replaces (a re-request is not a new arrival):
+  // the time that job's local leg queued for the model, never its creation time (a job whose leg had not
+  // queued yet has no place to keep; the new job queues when its own leg asks).
+  const keepSince = supersededJobs.reduce((n, j) => Math.min(n, localQueueSince.get(j.id) ?? Infinity), Infinity);
+  if (Number.isFinite(keepSince)) localQueueSince.set(job.id, keepSince);
   for (const id of superseded) {
     transitionJob(id, (j) => ({ ...j, status: "cancelled", skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }));
   }

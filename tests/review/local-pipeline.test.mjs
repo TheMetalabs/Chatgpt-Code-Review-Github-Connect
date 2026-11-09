@@ -19,6 +19,12 @@ import {
   languageNotes,
   VERIFY_RULES,
   PART_NON_CODE_MAX_CHARS,
+  calledNames,
+  enclosingName,
+  fitsOneTurn,
+  calleeDefinitions,
+  isSmallReview,
+  SMALL_REVIEW_MAX_FILES,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -188,7 +194,7 @@ test("pipeline: a feature turn sees what the OTHER features do (PR map), so a gu
 
 test("pipeline: a confirmation that quotes no code is only uncertain — posted at P2 when the candidate's own quote is real code", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm("chargeEverything(amount) // not in the code") });
-  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.deepEqual(review.findings.map((f) => [f.title, f.severity]), [["create() charges a negative amount", "P2"]]);
   assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted, 1 posted/);
@@ -206,7 +212,7 @@ test("pipeline: an uncertain candidate whose own quote is not real code is dropp
 
 test("pipeline: a refutation without a counter-quote from the evidence is not accepted (it becomes uncertain)", async () => {
   const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => JSON.stringify({ verdict: "refuted", reason: "probably fine" }) });
-  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
   const review = JSON.parse(out.raw);
   assert.equal(review.findings.length, 1);
   assert.equal(review.findings[0].severity, "P2");
@@ -780,4 +786,319 @@ test("failed feature turn: files still failing alone are unreviewed and named in
   assert.deepEqual([...review.unreviewed_paths].sort(), [...ORDERS].sort());
   assert.match(out.pipelineSummary, /\(1 failed, 3 file\(s\) retried alone, unreviewed: orders\.(controller|service)\.ts, /);
   assert.ok(review.coverage.filter((c) => c.reason === "feature review failed").length === 3);
+});
+
+// ── Precision on aicc-center and WalkieBoard (2026-11-09: 17 posted findings after #183, none valid; 8 of 10
+// false positives were refuted by code in another file — a callee, a caller, a DTO, a config list, the
+// database; at least 4 posted findings were "uncertain"; and the model marked nearly every file not_cleared) ──
+
+test("coverage: Ashlar records it — a file reviewed in a feature turn is cleared whatever the model says; only failed files are not", async () => {
+  const review = (body) => {
+    const group = groupOf(body);
+    if (group.includes("src/mail/mailer.ts")) return "no json";
+    return JSON.stringify({ merge_recommendation: "COMMENT", investigated_safe: group.map((f) => `${f}: read`), findings: [], coverage: group.map((file) => ({ file, status: "not_cleared", reason: "helpers not shown" })) });
+  };
+  const m = model({ map: mapReply, review, verify: refute });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const cov = JSON.parse(out.raw).coverage;
+  for (const f of ORDERS) assert.deepEqual(cov.filter((c) => c.file === f).map((c) => c.status), ["cleared"], f);
+  assert.deepEqual(cov.filter((c) => c.file === "src/mail/mailer.ts").map((c) => [c.status, c.reason]), [["not_cleared", "feature review failed"]]);
+  assert.match(HUNT_INSTRUCTIONS, /coverage: leave it an empty array \(Ashlar records coverage itself\)/);
+});
+
+test("uncertain: by default a candidate the verifier could not decide is not posted", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineKeepUncertain, false);
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => JSON.stringify({ trace: "t", verdict: "uncertain", blocking_code: "", proof_quote: "", severity: "P2" }) });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: DEFAULT_SETTINGS.localPipelineKeepUncertain }, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings.length, 0);
+});
+
+test("verifier rule 6: a claim about what a caller, client, database or config supplies needs a path that supplies it", () => {
+  assert.match(VERIFY_RULES, /6\. Does the failure depend on something the cited code does not control/);
+  assert.match(VERIFY_RULES, /If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted\. If no such path is shown, it is uncertain, never confirmed\./);
+});
+
+test("calledNames: plain lower-case methods, member calls and JSX components; keywords and collection helpers left out", () => {
+  assert.deepEqual(calledNames("switch whole.revert(in: &field) { case .kept: log(x) }"), ["revert"]);
+  assert.deepEqual(calledNames("return <ItemBadge item={item} /> && items.map((x) => format(x))"), ["ItemBadge", "format"]);
+  assert.deepEqual(calledNames("if (ok) { fetchJson(url, {}, { raw: true }) }"), ["fetchJson"]);
+});
+
+test("enclosingName: the function, method or component that holds a line", () => {
+  const js = ["export default function ItemBadge({ item }) {", "  const due = item.label;", "  return due;", "}"];
+  assert.equal(enclosingName(js, 2), "ItemBadge");
+  const swift = ["final class Host {", "  private func revertSwap() {", "    defer { offerRevert() }", "  }", "}"];
+  assert.equal(enclosingName(swift, 3), "revertSwap");
+  const arrow = ["const downloadFile = async (id) => {", "  return fetchJson(url, {}, other);", "};"];
+  assert.equal(enclosingName(arrow, 2), "downloadFile");
+});
+
+test("evidence: the verifier sees the definition of a lower-case method the cited line calls, in another file (WalkieBoard #570)", () => {
+  const files = {
+    "Keyboard/Host.swift": "final class Host {\n  private func revertSwap() {\n    defer { offerRevert() }\n    switch whole.revert(in: &field) {\n    case .reverted: break\n    case .kept(let reason): log(reason)\n    }\n  }\n}\n",
+    "Core/WholeDictation.swift": "public struct WholeDictation {\n  public mutating func revert(in field: inout Field) -> Outcome {\n    guard let swap = swapped else { return .nothing }\n    swapped = nil\n    return field.matches(swap) ? .reverted : .kept(reason: \"edited\")\n  }\n}\n",
+  };
+  const f = { id: "x", status: "accepted", severity: "P2", file: "Keyboard/Host.swift", line: 6, side: "RIGHT", title: "Revert button reappears when revert returns kept", failureScenario: "The function does not drop the swap.", rootCause: "No dropSwap on kept.", evidence: "Keyboard/Host.swift:4 `switch whole.revert(in: &field) {`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(sample(files), f, new Map(), 20_000);
+  assert.match(pack.code, /Core\/WholeDictation\.swift[\s\S]*func revert\(in field: inout Field\)[\s\S]*swapped = nil/);
+});
+
+test("evidence: the verifier sees who calls the cited function (aicc: a component only rendered for an existing row)", () => {
+  const files = { "src/items/ItemBadge.js": "export default function ItemBadge({ item }) {\n  const label = item.label;\n  return label;\n}\n" };
+  // The caller is not changed by the PR: only the caller search reaches it.
+  const s = sample(files, { referenceFiles: [{ path: "src/items/ItemRow.js", content: "import ItemBadge from './ItemBadge';\nexport function ItemRow({ item }) {\n  if (!item) return null;\n  return <ItemBadge item={item} />;\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P2", file: "src/items/ItemBadge.js", line: 2, side: "RIGHT", title: "Unhandled null item prop crashes the render", failureScenario: "A caller renders it with item null.", rootCause: "No guard.", evidence: "src/items/ItemBadge.js:2 `const label = item.label;`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /src\/items\/ItemRow\.js[\s\S]*if \(!item\) return null;[\s\S]*<ItemBadge item=\{item\} \/>/);
+});
+
+test("feature turn: CALLEE_DEFINITIONS carries the code its added lines call in another feature's file", async () => {
+  const files = {
+    "Keyboard/Host.swift": "final class Host {\n  func tap() {\n    let outcome = whole.revert(in: &field)\n    show(outcome)\n  }\n}\n",
+    "Core/WholeDictation.swift": "public struct WholeDictation {\n  public mutating func revert(in field: inout Field) -> Outcome {\n    swapped = nil\n    return .kept\n  }\n}\n",
+  };
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "600";
+  try {
+    const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    const host = m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content).find((t) => /one feature of this PR: Keyboard\/Host\.swift/.test(t));
+    assert.ok(host, "Host.swift is a feature of its own");
+    assert.match(host, /<<<CALLEE_DEFINITIONS[^\n]*>>>\n--- Core\/WholeDictation\.swift \(L[\s\S]*func revert\(in field: inout Field\)[\s\S]*swapped = nil/);
+  } finally {
+    process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
+  }
+});
+
+test("fitsOneTurn: the PR the pipeline reviews as one whole-PR feature is a small review (harbor's lease lane)", async () => {
+  assert.equal(fitsOneTurn(sample(), settings), false, "the two-feature sample is split");
+  await wholePr(async () => {
+    assert.equal(fitsOneTurn(sample(), settings), true);
+    const m = model({ review: reviewFor({}), verify: refute });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request, log: () => {} });
+    assert.match(out.pipelineSummary, /1 feature group\(s\)/, "and the pipeline reviews it in one feature");
+  });
+});
+
+
+test("enclosingName: a parenthesized value is not a function; an arrow function is (Codex #184)", () => {
+  assert.equal(enclosingName(["function ItemBadge(item) {", "  const label = (item.label);", "  return label;", "}"], 3), "ItemBadge");
+  assert.equal(enclosingName(["const format = (x: number): string => {", "  return String(x);", "};"], 2), "format");
+  assert.equal(enclosingName(["const total = (a + b) * 2;", "export const pick = async (id) => {", "  return id;", "};"], 3), "pick");
+});
+
+test("evidence: a standalone call in an unchanged file is a caller, not a definition (Codex #184)", () => {
+  // The cited line is well below the header, so only the caller search (not a definition lookup) can reach Runner.swift.
+  const files = { "App/Tasks.swift": "final class Tasks {\n  func processTask(task: Task?) {\n    log(1)\n    log(2)\n    log(3)\n    log(4)\n    let id = task!.id\n    let name = task!.name\n    store(id, name)\n  }\n}\n" };
+  const s = sample(files, { referenceFiles: [{ path: "App/Runner.swift", content: "final class Runner {\n  func run() {\n    processTask(task: nil)\n  }\n}\n" }] });
+  const f = { id: "x", status: "accepted", severity: "P1", file: "App/Tasks.swift", line: 8, side: "RIGHT", title: "Force unwrap crashes on a nil value", failureScenario: "A caller passes nil.", rootCause: "No guard.", evidence: "App/Tasks.swift:8 `let name = task!.name`", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /App\/Runner\.swift[\s\S]*processTask\(task: nil\)/);
+});
+
+// Two modules declare the same name; the corpus lists the one the calling file does NOT import first.
+const SAME_NAME = {
+  load: { "src/rows/load.ts": "import { parseRow } from './b';\nexport function load(text) {\n  return text.split('\\n').map((line) => parseRow(line));\n}\n" },
+  refs: [
+    { path: "src/rows/a.ts", content: "export function parseRow(line) {\n  return { source: 'a', cells: line.split(';') };\n}\n" },
+    { path: "src/rows/b.ts", content: "export function parseRow(line) {\n  return { source: 'b', cells: line.split(',') };\n}\n" },
+  ],
+};
+
+test("calleeDefinitions: of two same-named definitions, the one the calling file imports is shown", () => {
+  const block = calleeDefinitions(sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs }), ["src/rows/load.ts"], 6_000);
+  assert.match(block, /--- src\/rows\/b\.ts[\s\S]*source: 'b'/);
+  assert.doesNotMatch(block, /source: 'a'/);
+});
+
+test("evidence: of two same-named definitions, the verifier sees the one the cited file imports", () => {
+  const s = sample(SAME_NAME.load, { referenceFiles: SAME_NAME.refs });
+  // No quote or symbol name in the finding text, so only the called-name lookup reaches either module.
+  const f = { id: "x", status: "accepted", severity: "P2", file: "src/rows/load.ts", line: 3, side: "RIGHT", title: "Rows lose their cells", failureScenario: "A row with a comma is read as one cell.", rootCause: "The row parser ignores commas.", evidence: "src/rows/load.ts:3", recommendedFix: "f", recommendedTest: "t" };
+  const pack = evidencePack(s, f, new Map(), 20_000);
+  assert.match(pack.code, /src\/rows\/b\.ts[\s\S]*source: 'b'/);
+  assert.doesNotMatch(pack.code, /source: 'a'/);
+});
+
+test("isSmallReview: a PR that fits one turn is small only with at most SMALL_REVIEW_MAX_FILES files", async () => {
+  const items = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`src/items/item${i}.ts`, `export const item${i} = ${i};\n`]));
+  assert.equal(SMALL_REVIEW_MAX_FILES, 4);
+  await wholePr(async () => {
+    for (const [n, small] of [[3, true], [4, true], [5, false]]) {
+      assert.equal(fitsOneTurn(sample(items(n)), settings), true, `${n} files fit one turn`);
+      assert.equal(isSmallReview(sample(items(n)), settings), small, `${n} files`);
+    }
+    assert.equal(isSmallReview(sample(), settings), true, "the four-file sample is small when it fits one turn");
+  });
+  assert.equal(isSmallReview(sample(), settings), false, "a PR split into features is never small");
+});
+
+// ── Review of #184 (2026-11-09): Swift/Kotlin trailing closures read as declarations, callee windows of the
+// feature's own names and of framework calls, imported definitions twice in TypeScript turns ──
+
+const swiftSample = (files, extra = {}) => ({ ...sample(files, extra), files: Object.keys(files).map((p) => ({ path: p, content: files[p], language: "swift" })) });
+const finding = (file, line, o = {}) => ({ id: "x", status: "accepted", severity: "P1", file, line, side: "RIGHT", title: "Force unwrap crashes", failureScenario: "A caller passes nil.", rootCause: "No guard.", evidence: `${file}:${line}`, recommendedFix: "f", recommendedTest: "t", ...o });
+
+test("enclosingName: a Swift/Kotlin `Name(args) {` is a call with a trailing closure, not the enclosing function", () => {
+  const swift = ["struct SettingsView: View {", "  func saveRow(_ item: Item) -> some View {", "    VStack(spacing: 8) {", "      Text(item.title)", "      Button(\"Save\") {", "        store.save(item)", "      }", "    }", "  }", "}"];
+  assert.equal(enclosingName(swift, 6, "App/SettingsView.swift"), "saveRow");
+  assert.equal(enclosingName(swift, 4, "App/SettingsView.swift"), "saveRow");
+  const compose = ["@Composable", "fun ItemRow(item: Item) {", "  Row(horizontalArrangement = Arrangement.End) {", "    Text(item.name!!)", "  }", "}"];
+  assert.equal(enclosingName(compose, 4, "app/ItemRow.kt"), "ItemRow");
+  // A TypeScript method header still is one.
+  assert.equal(enclosingName(["class Store {", "  save(item) {", "    db.write(item!);", "  }", "}"], 3, "src/store.ts"), "save");
+});
+
+test("enclosingName: an initializer, a constructor or a Swift computed property ends the walk (no caller lookup by name)", () => {
+  const player = ["final class Player {", "  func stop() {", "    engine.stop()", "  }", "  init(url: URL?) {", "    self.url = url!", "  }", "}"];
+  assert.equal(enclosingName(player, 6, "App/Player.swift"), null);
+  const service = ["export class OrderService {", "  load(id) {", "    return this.repo.find(id);", "  }", "  constructor(private repo: Repo) {", "    this.repo = repo!;", "  }", "}"];
+  assert.equal(enclosingName(service, 6, "src/orders/service.ts"), null);
+  const view = ["struct ItemView: View {", "  func helper() -> Int {", "    1", "  }", "  var body: some View {", "    VStack {", "      Text(item!.name)", "    }", "  }", "}"];
+  assert.equal(enclosingName(view, 7, "App/ItemView.swift"), null);
+});
+
+test("enclosingName: a typed arrow binding and a class-property arrow function are functions", () => {
+  const badge = ["export function formatDue(d: Date) {", "  return d.toISOString();", "}", "", "export const ItemBadge: React.FC<Props> = ({ item }) => {", "  const due = item!.dueAt;", "  return <span>{formatDue(due)}</span>;", "};"];
+  assert.equal(enclosingName(badge, 6, "src/items/ItemBadge.tsx"), "ItemBadge");
+  const cls = ["export class OrderService {", "  async load(id: string) {", "    return this.repo.find(id);", "  }", "  private onSave = async (order: Order) => {", "    await this.repo.save(order!);", "  };", "}"];
+  assert.equal(enclosingName(cls, 6, "src/orders/service.ts"), "onSave");
+});
+
+test("evidence: a Swift line inside a trailing closure still finds the callers of its function", () => {
+  const row = ["import SwiftUI", "struct ItemList: View {", "  let store: Store", "  func deleteRow(_ item: Item?) -> some View {", "    Button(\"Delete\") {", "      store.remove(item!.id)", "    }", "  }", "}"].join("\n");
+  const caller = ["struct Screen: View {", "  var body: some View {", "    ForEach(items) { item in", "      list.deleteRow(item)", "    }", "  }", "}"].join("\n");
+  const other = (n) => [`struct Other${n}: View {`, "  var body: some View {", `    Button("Other ${n}") {`, `      model.tap(${n})`, "    }", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/ItemList.swift": row }, { referenceFiles: [1, 2, 3].map((n) => ({ path: `App/Other${n}.swift`, content: other(n) })).concat({ path: "App/Screen.swift", content: caller }) });
+  const pack = evidencePack(s, finding("App/ItemList.swift", 6), new Map(), 20_000);
+  assert.match(pack.code, /App\/Screen\.swift[\s\S]*list\.deleteRow\(item\)/);
+  assert.doesNotMatch(pack.code, /App\/Other\d\.swift/);
+});
+
+test("evidence: a Swift trailing-closure call is not the definition; the real `func` further down is", () => {
+  const host = ["final class Editor {", "  func save() {", "    persist(item) {", "      self.dismiss()", "    }", "  }",
+    ...Array.from({ length: 60 }, (_, i) => `  let pad${i} = ${i}`),
+    "  func persist(_ item: Item, completion: @escaping () -> Void) {", "    guard item.isValid else { return }", "    db.write(item)", "    completion()", "  }", "}"].join("\n");
+  const pack = evidencePack(swiftSample({ "App/Editor.swift": host }), finding("App/Editor.swift", 3, { title: "save never checks validity" }), new Map(), 20_000);
+  assert.match(pack.code, /func persist\(_ item: Item[\s\S]*guard item\.isValid/);
+});
+
+test("evidence: a Swift caller that passes a trailing closure is a call site, not a declaration", () => {
+  const feed = ["final class Feed {", "  func refresh(force: Bool, done: () -> Void) {", "    log(1)", "    log(2)", "    log(3)", "    log(4)", "    let first = items.first!", "    show(first)", "  }", "}"].join("\n");
+  const puller = ["extension Feed {", "  func pull() {", "    refresh(force: true) {", "      self.spinner.stop()", "    }", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/Feed.swift": feed }, { referenceFiles: [{ path: "App/Feed+Pull.swift", content: puller }] });
+  const pack = evidencePack(s, finding("App/Feed.swift", 7, { title: "Force unwrap of an empty list crashes", evidence: "App/Feed.swift:7" }), new Map(), 20_000);
+  assert.match(pack.code, /App\/Feed\+Pull\.swift[\s\S]*refresh\(force: true\) \{/);
+});
+
+test("calleeDefinitions: a name the feature declares itself is not looked up in other files", () => {
+  const cart = ["final class CartModel {", "  func reload() {", "    items = store.items", "  }", "  func checkout() {", "    reload()", "    api.pay(items)", "  }", "}"].join("\n");
+  const profile = ["final class ProfileModel {", "  func reload() {", "    // refreshes the profile and clears the cache", "    cache.removeAll()", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/CartModel.swift": cart, "App/ProfileModel.swift": profile }), ["App/CartModel.swift"], 6_000);
+  assert.doesNotMatch(block, /ProfileModel/);
+});
+
+test("calleeDefinitions: framework calls with no declaration do not crowd out the real callee; overlapping windows are shown once", () => {
+  const view = ["import SwiftUI", "struct OrderView: View {", "  @ObservedObject var store: OrderStore", "  var body: some View {", "    VStack(spacing: 8) {", "      HStack(alignment: .top) {",
+    "        Image(systemName: \"cart\")", "        Text(store.title)", "        Spacer()", "      }", "      Toggle(\"Express\", isOn: $store.express)", "      Picker(\"Size\", selection: $store.size) {", "        Text(\"S\")", "      }",
+    "      Button(\"Pay\") {", "        store.submitOrder(store.draft)", "        store.validateDraft(store.draft)", "      }", "    }", "  }", "}"].join("\n");
+  // Other (unchanged) screens of the app use the same framework views.
+  const screen = (n) => ["import SwiftUI", `struct Screen${n}: View {`, "  var body: some View {", "    VStack(spacing: 12) {", "      HStack(alignment: .center) {", `        Image(systemName: "star${n}")`,
+    `        Text("Screen ${n} title that is fairly long, with an accessibility hint and a localized subtitle string")`, "        Spacer()", "      }", `      Toggle("Option ${n}", isOn: $flag)`,
+    `      Picker("Pick ${n}", selection: $sel) {`, "        Text(\"A\")", "      }", `      Button("Go ${n}") {`, `        model.go(${n}, analytics: .screen("settings-${n}"), haptics: .light, animated: true)`, "      }", "    }", "  }", "}"].join("\n");
+  const store = ["final class OrderStore: ObservableObject {", "  func submitOrder(_ draft: Draft) {", "    guard draft.total > 0 else { return }", "    api.post(draft)", "  }", "  func validateDraft(_ draft: Draft) {", "    errors = draft.check()", "  }", "}"].join("\n");
+  const s = swiftSample({ "App/OrderView.swift": view }, { referenceFiles: [{ path: "App/Screen1.swift", content: screen(1) }, { path: "App/Screen2.swift", content: screen(2) }, { path: "App/OrderStore.swift", content: store }] });
+  const block = calleeDefinitions(s, ["App/OrderView.swift"], 2_000);
+  assert.match(block, /--- App\/OrderStore\.swift[\s\S]*guard draft\.total > 0/);
+  assert.doesNotMatch(block, /Screen\d\.swift/);
+  assert.equal((block.match(/^--- App\/OrderStore\.swift/gm) ?? []).length, 1, "validateDraft's window overlaps submitOrder's");
+});
+
+// A TypeScript feature that calls a helper of an unchanged imported module (CROSS_FILE_DEFINITIONS shows it).
+const IMPORTED = {
+  create: "import { charge } from './charge';\nexport function create(req) {\n  return charge(req.body.amount);\n}\n",
+  charge: { path: "src/orders/charge.ts", content: "export function charge(amount) {\n  if (amount <= 0) throw new Error('bad amount');\n  return amount;\n}\n" },
+};
+const featureTurns = (m) => m.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+
+test("feature turn: a whole-PR TypeScript turn with a non-code file gets an imported definition once, not twice", async () => {
+  await wholePr(async () => {
+    const files = { "src/orders/create.ts": IMPORTED.create, "package.json": "{\n  \"name\": \"x\",\n  \"version\": \"1.0.1\"\n}\n" };
+    const m = model({ review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files, { referenceFiles: [IMPORTED.charge] }), settings, { request: m.request });
+    const turn = featureTurns(m).find((t) => /Review the whole change/.test(t));
+    assert.ok(turn, "one whole-PR turn");
+    assert.match(turn, /CROSS_FILE_DEFINITIONS/);
+    assert.equal((turn.match(/amount <= 0/g) ?? []).length, 1);
+  });
+});
+
+test("feature turn: a split TypeScript turn shows a callee CROSS_FILE_DEFINITIONS does not carry (exported by an export list)", async () => {
+  const files = { "src/orders/create.ts": IMPORTED.create, "src/mail/send.ts": "export function sendMail(to) {\n  return queue.push(to);\n}\n" };
+  const charge = { path: "src/orders/charge.ts", content: "function charge(amount) {\n  if (amount <= 0) throw new Error('bad amount');\n  return amount;\n}\n\nexport { charge };\n" };
+  const before = process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = "400";
+  try {
+    const m = model({ map: mapReply, review: reviewFor({}), verify: refute });
+    await runLocalReviewPipeline(sample(files, { referenceFiles: [charge] }), settings, { request: m.request });
+    const turn = featureTurns(m).find((t) => /one feature of this PR: src\/orders\/create\.ts/.test(t));
+    assert.ok(turn, "create.ts is a feature of its own");
+    assert.match(turn, /CALLEE_DEFINITIONS[\s\S]*--- src\/orders\/charge\.ts[\s\S]*amount <= 0/);
+  } finally {
+    process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
+  }
+});
+
+test("calleeDefinitions: a TypeScript caller still gets a callee CROSS_FILE_DEFINITIONS does not carry (a member call)", () => {
+  const files = { "src/orders/create.ts": "export function create(req, store) {\n  return store.persistOrder(req.body);\n}\n" };
+  const refs = [{ path: "src/orders/store.ts", content: "export class Store {\n  persistOrder(order) {\n    if (!order.id) throw new Error('no id');\n    return order;\n  }\n}\n" }];
+  assert.match(calleeDefinitions(sample(files, { referenceFiles: refs }), ["src/orders/create.ts"], 6_000), /--- src\/orders\/store\.ts[\s\S]*no id/);
+});
+
+test("calledNames: many distinct names stay linear, in order of first appearance", () => {
+  const code = Array.from({ length: 60_000 }, (_, i) => `name${i}(x); name${i % 7}(y)`).join("\n");
+  const t0 = performance.now();
+  const names = calledNames(code);
+  const ms = performance.now() - t0;
+  assert.equal(names.length, 60_000);
+  assert.deepEqual(names.slice(0, 3), ["name0", "name1", "name2"]);
+  assert.ok(ms < 1_500, `calledNames took ${Math.round(ms)}ms`);
+});
+
+// ── Review of 49339d9: TS callees outside the one-line header shape, a feature's extension of a type,
+// a second callee window running past the first, a bare assignment read as the enclosing function ──
+
+test("calleeDefinitions: TypeScript/JavaScript callees declared over several lines, with an object return type or as arrow properties are found", () => {
+  const cases = [
+    ["src/store.ts", "export class OrderStore {\n  async submitOrder(\n    draft: Draft,\n    opts: SubmitOptions = {},\n  ): Promise<void> {\n    if (draft.total <= 0) throw new Error('empty draft');\n    await this.api.post(draft);\n  }\n}\n", "store.submitOrder(draft)", /empty draft/],
+    ["src/service.ts", "export class OrdersService {\n  async findOne(@Inject(REPO) id: string): Promise<{ ok: boolean }> {\n    if (!id) throw new Error('no id');\n    return { ok: true };\n  }\n}\n", "service.findOne(draft)", /no id/],
+    ["src/cart.ts", "export class Cart {\n  private recalc = (items: Item[]) => {\n    if (!items.length) throw new Error('empty cart');\n    return items.length;\n  };\n}\n", "cart.recalc(draft)", /empty cart/],
+    ["src/api.js", "export const api = {\n  postOrder: async (order) => {\n    if (!order.id) throw new Error('no order id');\n    return fetch('/o', { method: 'POST' });\n  },\n};\n", "api.postOrder(draft)", /no order id/],
+  ];
+  for (const [path, content, call, body] of cases) {
+    const files = { "src/view.ts": `export function submit(draft) {\n  return ${call};\n}\n`, [path]: content };
+    assert.match(calleeDefinitions(sample(files), ["src/view.ts"], 6_000), body, path);
+  }
+});
+
+test("calleeDefinitions: a feature that extends a type still gets that type's declaration from another file", () => {
+  const row = ["import SwiftUI", "extension Draft {", "  var isEmpty: Bool { lines.isEmpty }", "}", "struct DraftRow: View {", "  let store: DraftStore", "  var body: some View {", "    Button(\"New\") {", "      store.open(Draft(title: \"\", lines: []))", "    }", "  }", "}"].join("\n");
+  const draft = ["struct Draft {", "  let title: String", "  let lines: [Line]", "  init(title: String, lines: [Line]) {", "    precondition(!title.isEmpty, \"a draft needs a title\")", "    self.title = title", "    self.lines = lines", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/DraftRow.swift": row }, { referenceFiles: [{ path: "App/Models/Draft.swift", content: draft }] }), ["App/DraftRow.swift"], 6_000);
+  assert.match(block, /--- App\/Models\/Draft\.swift[\s\S]*a draft needs a title/);
+});
+
+test("calleeDefinitions: a second callee whose body runs past the first one's window is still shown", () => {
+  const view = ["struct PayView: View {", "  let store: OrderStore", "  var body: some View {", "    Button(\"Pay\") {", "      store.submitOrder(store.draft)", "      store.refund(store.draft)", "    }", "  }", "}"].join("\n");
+  const store = ["final class OrderStore {", "  func submitOrder(_ draft: Draft) {", ...Array.from({ length: 10 }, (_, i) => `    step${i}(draft)`), "  }",
+    "  func refund(_ draft: Draft) {", "    log(draft)", "    log(draft)", "    log(draft)", "    log(draft)", "    guard draft.isPaid else { fatalError(\"refund of unpaid draft\") }", "    api.refund(draft.id)", "  }", "}"].join("\n");
+  const block = calleeDefinitions(swiftSample({ "App/PayView.swift": view }, { referenceFiles: [{ path: "App/OrderStore.swift", content: store }] }), ["App/PayView.swift"], 6_000);
+  assert.match(block, /refund of unpaid draft/);
+});
+
+test("enclosingName: a bare assignment of an arrow function is not the enclosing function", () => {
+  const sub = ["export function subscribe(store, listener) {", "  let cleanup;", "  store.on('change', listener);", "  cleanup = () => store.off('change', listener);", "  return cleanup!;", "}"];
+  assert.equal(enclosingName(sub, 5, "src/subscribe.ts"), "subscribe");
+  // A typed class property without a modifier still is one.
+  assert.equal(enclosingName(["export class Form {", "  onSave: Handler = async (form) => {", "    await api.save(form!);", "  };", "}"], 3, "src/form.ts"), "onSave");
 });

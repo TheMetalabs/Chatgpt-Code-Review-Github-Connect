@@ -40,7 +40,7 @@ import {
 } from "./local-review-loop.server.ts";
 import { applyFindingGate, gateLiveSubmission } from "./poster.ts";
 import { unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
-import { orderFiles, rankChangedFile } from "./review-budget.ts";
+import { isCodePath, orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, Finding, SamplePr, Severity } from "./types.ts";
 
 type Msg = { role: "system" | "user" | "assistant"; content: string };
@@ -59,6 +59,8 @@ const PART_FINDINGS_CAP = 3;
  * not for every test and resource file of the PR (WalkieBoard #566: 24K chars of them in each of 14
  * feature turns, next to as little as 0.8K of the feature's own diff). */
 export const PART_NON_CODE_MAX_CHARS = 6_000;
+/** Callee definitions (calleeDefinitions) one feature turn may carry. */
+export const CALLEE_DEFINITIONS_MAX_CHARS = 6_000;
 export const featureFindingsCap = (whole: boolean) => (whole ? FEATURE_FINDINGS_CAP : PART_FINDINGS_CAP);
 
 function envNum(key: string, dflt: number): number {
@@ -403,7 +405,7 @@ export const HUNT_INSTRUCTIONS = [
   "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
-  "coverage: one entry per changed code file you read. If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
+  "coverage: leave it an empty array (Ashlar records coverage itself). If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
 ].join("\n");
 
 /** What each candidate pass looks at hardest (Settings local_review.pipeline_lenses). A small model finds
@@ -460,6 +462,8 @@ export function languageNotes(paths: string[]): string {
 
 type GroupOutcome = { files: string[]; raw: string | null; replies: string[] };
 
+const TS_LIKE_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+
 async function reviewFeature(
   ctx: Ctx,
   sample: SamplePr,
@@ -484,6 +488,14 @@ async function reviewFeature(
     "<<<END>>>",
     languageNotes(files),
   ].filter(Boolean).join("\n");
+  // The code this feature calls in other files (another feature's changed file, an unchanged module):
+  // most false positives were claims a callee or a config list elsewhere refutes. A whole-PR turn of
+  // TypeScript/JavaScript code (non-code files such as package.json aside) already carries its imported
+  // definitions (CROSS_FILE_DEFINITIONS); every other turn gets them here, even where that block carries
+  // some of them too (it has its own budget, caps and export rules).
+  const calleeBlock = !whole || files.some((p) => isCodePath(p) && !TS_LIKE_RE.test(p))
+    ? calleeDefinitions(sample, files, Math.min(CALLEE_DEFINITIONS_MAX_CHARS, Math.floor(ctx.promptChars * 0.1)))
+    : "";
   const built = buildChatParts({
     sample: sub,
     extra,
@@ -493,7 +505,7 @@ async function reviewFeature(
     prChangedPaths: sample.changedPaths,
     nonCodeFirst: !whole,
     localBudget: {
-      maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + 8, shrinkContext: true,
+      maxChars: ctx.promptChars, overheadChars: REVIEW_SYSTEM.length + mapBlock.length + groupBlock.length + calleeBlock.length + 10, shrinkContext: true,
       ...(whole ? {} : { nonCodeMaxChars: PART_NON_CODE_MAX_CHARS }),
     },
   });
@@ -513,7 +525,7 @@ async function reviewFeature(
     .join("\n\n");
   const messages: Msg[] = [
     { role: "system", content: REVIEW_SYSTEM },
-    { role: "user", content: [prompt, attach, mapBlock, groupBlock].filter(Boolean).join("\n\n") },
+    { role: "user", content: [prompt, attach, calleeBlock, mapBlock, groupBlock].filter(Boolean).join("\n\n") },
   ];
   const label = `${lens}[${files[0]}${files.length > 1 ? ` +${files.length - 1}` : ""}]`;
   const replies: string[] = [];
@@ -566,6 +578,7 @@ export const VERIFY_RULES = [
   "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing. A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait.",
   "4. Does a doc comment next to the code, MODULE_DOCS or the PR description state this behaviour as intended? Intended behaviour is not a defect.",
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
+  "6. Does the failure depend on something the cited code does not control — what a caller passes (a null, an empty value, two inputs together), what a client sends, how the database or a library behaves, or what a config or registry list holds? Then it is real only if the evidence shows a path that supplies it: a caller, a route or a config entry. If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted. If no such path is shown, it is uncertain, never confirmed.",
   "Verdicts:",
   "- refuted: something shown prevents or explains it (one of the checks above), or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
   "- confirmed: you followed the failure scenario through the code shown, step by step, from the changed code to an observable failure, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE.",
@@ -599,6 +612,166 @@ const DEF_RE = (name: string) =>
   new RegExp(`(?:\\b(?:function|func|fun|fn|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum|const|let|var|val|def)\\s+${name}\\b)|(?:^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub)\\s+)*${name}\\s*[(<:=])`);
 
 const PROSE_DOC_RE = /\.(?:md|mdx|markdown|txt|rst|adoc)$/i;
+
+/** Words that look like calls but name a keyword, a test helper or a common collection method: looking up
+ * their "definition" would only add noise. */
+const CALL_STOP = new Set([
+  "if", "for", "while", "switch", "guard", "return", "catch", "func", "function", "init", "super", "self", "this",
+  "print", "println", "await", "async", "new", "typeof", "require", "import", "expect", "test", "it", "describe",
+  "assert", "defer", "case", "when", "let", "var", "try", "throw", "sizeof", "map", "filter", "reduce", "forEach",
+  "flatMap", "compactMap", "push", "append", "contains", "includes", "get", "set", "has", "add", "remove", "count",
+  "join", "split", "slice", "trim", "toString", "then", "log", "error", "warn", "info", "debug", "min", "max",
+  "String", "Int", "Array", "Set", "Map", "Object", "Promise", "Number", "Boolean", "Date", "JSON", "Math", "console",
+]);
+
+/** The names `code` calls or renders, in order of first appearance: `name(`, `.name(`, `<Name` (a JSX
+ * component). Plain lower-case method names count too: a verifier that never saw `revert(in:)`'s body
+ * confirmed a claim that body refutes (WalkieBoard #570). */
+export function calledNames(code: string): string[] {
+  const out = new Set<string>();
+  for (const m of code.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
+    const name = m[1] ?? m[2] ?? "";
+    if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name)) continue;
+    out.add(name);
+  }
+  return [...out];
+}
+
+/** Swift and Kotlin declare every function and initializer with a keyword (func, fun, init): there a
+ * `name(args) {` line is a call with a trailing closure (`persist(item) {`, `VStack(spacing: 8) {`). */
+const TRAILING_CLOSURE_RE = /\.(?:swift|kt|kts)$/;
+
+/** A keyword declaration or a binding of `name`. */
+const DECL_KEYWORD_RE = (name: string) =>
+  new RegExp(`(?:\\b(?:function|func|fun|fn|def|class|struct|protocol|extension|actor|interface|trait|impl|object|type|typealias|enum)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])`);
+/** A function declaration or binding of `name` (no type or extension: `extension Draft` adds to a type
+ * declared elsewhere, whose `Draft(` initializer is still another file's code). */
+const FUNC_DECL_RE = (name: string) =>
+  new RegExp(`(?:\\b(?:function|func|fun|fn|def)\\s+${name}\\b)|(?:\\b(?:const|let|var|val)\\s+${name}\\s*[:=])`);
+/** A method/function header of `name` that opens its body on the line (not in Swift/Kotlin, see TRAILING_CLOSURE_RE). */
+const DECL_HEADER_RE = (name: string) =>
+  new RegExp(`^\\s*(?:(?:public|private|protected|internal|fileprivate|open|final|static|async|readonly|override|export|get|set|pub|mutating|nonisolated)\\s+)*${name}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)\\s*(?::\\s*[^={]+)?\\{\\s*$`);
+
+/** A declaration of `name` (never a call) in a file at `path`: a keyword declaration, a binding, or (outside
+ * Swift/Kotlin) a method/function header that opens its body on the line. DEF_RE also accepts an indented
+ * `name(`, which a standalone call (`processTask(task: nil)`) matches too. */
+const DECL_RE = (name: string, path: string) =>
+  TRAILING_CLOSURE_RE.test(path) ? DECL_KEYWORD_RE(name) : new RegExp(`${DECL_KEYWORD_RE(name).source}|${DECL_HEADER_RE(name).source}`);
+
+/** Where `name` is declared among `files`: the first declaration proper in any file (within a file a
+ * keyword declaration or binding before a header-only match), else (only when no file declares it) the
+ * first looser DEF_RE match outside Swift/Kotlin (a multi-line signature, a class-property arrow; there an
+ * indented `VStack(` is a call). Within each pass the `prefer` paths are searched first, in order (see
+ * definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
+  const n = name.replace(/[$]/g, "\\$");
+  const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
+  const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
+  const keyword = DECL_KEYWORD_RE(n);
+  const header = DECL_HEADER_RE(n);
+  for (const [path, lines] of all) {
+    let i = lines.findIndex((l) => keyword.test(l));
+    if (i < 0 && !TRAILING_CLOSURE_RE.test(path)) i = lines.findIndex((l) => header.test(l));
+    if (i >= 0) return [path, i];
+  }
+  const def = DEF_RE(n);
+  for (const [path, lines] of all) {
+    if (TRAILING_CLOSURE_RE.test(path)) continue;
+    const i = lines.findIndex((l) => def.test(l));
+    if (i >= 0) return [path, i];
+  }
+  return null;
+}
+
+/** Where to look first for a name `from` uses: `from` itself, then the files it imports by relative path. */
+function definitionOrder(from: string, content: string): string[] {
+  return [from, ...importSpecifiers(content).flatMap((spec) => resolveRelativeImport(from, spec))];
+}
+
+const ENCLOSING_DECL_RE = [
+  /\b(?:func|function|fun|fn|def)\s+([A-Za-z_$][\w$]*)/,
+  // A binding or class property is a function only when its initializer is one: an arrow function,
+  // `function`, or `x =>` (a parenthesized value such as `(item.label)` is not). A type annotation may
+  // come first (`const ItemBadge: React.FC<Props> = ({ item }) => {`, `private onSave = async (o) => {`). Without
+  // const/let/var a modifier or a type annotation is required: a bare `cleanup = () => …` is an assignment.
+  /^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly|override)\s+)+|(?=[A-Za-z_$][\w$]*\s*:[^=]+=))([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)\s*(?::[^=]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/,
+];
+// A bare `name(args) {` header; in Swift/Kotlin that line is a call with a trailing closure (TRAILING_CLOSURE_RE).
+const ENCLOSING_RE = [
+  ...ENCLOSING_DECL_RE,
+  /^\s*(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^={]+)?\{\s*$/,
+];
+const SCOPE_MODIFIERS = String.raw`(?:@\w+\s+|(?:public|private|protected|internal|fileprivate|open|final|static|override|required|convenience|nonisolated|lazy)\s+)*`;
+/** Scopes whose callers cannot be found by a name: an initializer or constructor (called as `Player(url:)`
+ * or `new Player(`), and in Swift/Kotlin a computed property (`var body: some View {`). The walk stops there. */
+const UNNAMED_SCOPE_RE = new RegExp(`^\\s*${SCOPE_MODIFIERS}constructor\\s*\\(`);
+const UNNAMED_SCOPE_CLOSURE_RE = new RegExp(`^\\s*${SCOPE_MODIFIERS}(?:(?:init[?!]?|constructor)\\s*(?:<[^>]*>)?\\s*\\(|init\\s*\\{|(?:var|val)\\s+[A-Za-z_]\\w*\\s*:[^={]+\\{\\s*$)`);
+
+/** The function, method or component whose body holds 1-based `line` of the file at `path`: the nearest
+ * definition above it, or null when that is an initializer (see UNNAMED_SCOPE_RE). */
+export function enclosingName(lines: string[], line: number, path = ""): string | null {
+  const closures = TRAILING_CLOSURE_RE.test(path);
+  const unnamed = closures ? UNNAMED_SCOPE_CLOSURE_RE : UNNAMED_SCOPE_RE;
+  const res = closures ? ENCLOSING_DECL_RE : ENCLOSING_RE;
+  for (let i = Math.min(lines.length, line) - 1; i >= 0; i -= 1) {
+    if (unnamed.test(lines[i])) return null;
+    for (const re of res) {
+      const m = re.exec(lines[i]);
+      if (m && !CALL_STOP.has(m[1])) return m[1];
+    }
+  }
+  return null;
+}
+
+/** 0-based lines of `lines` (the file at `path`) that call or render `name` (its own definition line excluded). */
+function callSiteLines(lines: string[], name: string, path: string): number[] {
+  const n = name.replace(/[$]/g, "\\$");
+  const use = new RegExp(`(?<![\\w$])${n}\\s*\\(|<${n}[\\s/>]`);
+  const decl = DECL_RE(n, path);
+  return lines.flatMap((l, i) => (use.test(l) && !decl.test(l) ? [i] : []));
+}
+
+/** Definition windows, from files outside the feature's `files`, of the names its added lines call: the
+ * callee code one feature turn would otherwise know only from a one-line PR map summary. No Swift/Kotlin
+ * call site counts as a definition (a framework view such as `Text(` has none, and a call of it in another
+ * file is not its code); a function the feature declares itself and a window inside one already shown are
+ * left out. */
+export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: number): string {
+  if (maxChars < 400) return "";
+  const own = new Set(files);
+  const patches = patchesByPath(sample.diff);
+  const addedIn = files.map((p) => (patches.get(p) ?? "").split("\n").filter((l) => l.startsWith("+")).join("\n"));
+  const added = addedIn.join("\n");
+  const corpus: [string, string[]][] = [...sample.files, ...(sample.referenceFiles ?? [])]
+    .filter((f) => !own.has(f.path))
+    .map((f) => [f.path, f.content.split("\n")]);
+  const content = new Map(sample.files.map((f) => [f.path, f.content]));
+  const callsIn = addedIn.map(calledNames);
+  const ownLines = files.map((p) => [p, (content.get(p) ?? "").split("\n")] as const);
+  const blocks: string[] = [];
+  const shown: [string, number, number][] = [];
+  let used = 0;
+  for (const name of calledNames(added).slice(0, 24)) {
+    // A function the feature declares itself is its own: another file's same-named function is not what it
+    // calls. A type or extension it declares is not (`extension Draft` and a call of `Draft(`'s initializer).
+    const n = name.replace(/[$]/g, "\\$");
+    const ownDecl = FUNC_DECL_RE(n);
+    const ownHeader = DECL_HEADER_RE(n);
+    if (ownLines.some(([p, lines]) => lines.some((l) => ownDecl.test(l) || (!TRAILING_CLOSURE_RE.test(p) && ownHeader.test(l))))) continue;
+    // The feature file whose added lines call it: its own imports decide between same-named definitions.
+    const caller = files[callsIn.findIndex((c) => c.includes(name))];
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
+    if (!found) continue;
+    const [path, i] = found;
+    const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
+    const from = Math.max(1, i - 1);
+    const to = Math.min(lines.length, i + 14);
+    if (shown.some(([p, a, b]) => p === path && a <= from && to <= b)) continue;
+    const w = gutter(path, lines, from, to);
+    if (used + w.length + 2 <= maxChars) { blocks.push(w); used += w.length + 2; shown.push([path, from, to]); }
+  }
+  return blocks.length ? `<<<CALLEE_DEFINITIONS (code in other files that this feature's added lines call; not shown elsewhere in this turn)>>>\n${blocks.join("\n\n")}\n<<<END>>>` : "";
+}
 
 /** A hunk cut to `maxChars` around RIGHT-side `line` (the removed lines just before it included), with
  * its header and a note for each side left out: a large hunk's prefix would miss the cited change. */
@@ -699,11 +872,39 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
   for (const m of f.evidence.matchAll(/([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+):(\d+)/g)) addCode(m[1], Number(m[2]), 10, 10);
   const changed = new Set(sample.changedPaths);
   let defs = 0;
+  // What the cited code calls: the definition of each name called on the cited lines or in the
+  // candidate's quotes, wherever it lives (another changed file, an unchanged imported one).
+  const fileLines = corpus.get(f.file) ?? [];
+  const citedCode = [
+    ...fileLines.slice(Math.max(0, f.line - 3), f.line + 2),
+    ...[...f.evidence.matchAll(/`([^`]+)`/g)].map((m) => m[1]),
+  ].join("\n");
+  const prefer = definitionOrder(f.file, fileLines.join("\n"));
+  for (const name of calledNames(citedCode).slice(0, 8)) {
+    if (defs >= 6) break;
+    const found = findDefinition(corpus, name, prefer);
+    if (found) { addCode(found[0], found[1] + 1, 3, 15); defs += 1; }
+  }
+  // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
+  // call site (aicc: a component only rendered for an existing row).
+  const enclosing = enclosingName(fileLines, f.line, f.file);
+  if (enclosing) {
+    let callers = 0;
+    for (const [path, lines] of corpus) {
+      for (const i of callSiteLines(lines, enclosing, path)) {
+        if (callers >= 3) break;
+        if (path === f.file && Math.abs(i + 1 - f.line) <= 30) continue;
+        addCode(path, i + 1, 4, 6);
+        callers += 1;
+      }
+      if (callers >= 3) break;
+    }
+  }
   let uses = 0;
   for (const name of namedSymbols(f)) {
     const def = DEF_RE(name.replace(/[$]/g, "\\$"));
     for (const [path, lines] of corpus) {
-      if (defs >= 4) break;
+      if (defs >= 8) break;
       const i = lines.findIndex((l) => def.test(l));
       if (i >= 0) { addCode(path, i + 1, 3, 15); defs += 1; }
     }
@@ -941,14 +1142,43 @@ export function pipelineSummary(s: PipelineStats): string {
   return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
 }
 
+/** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
+function promptBudget(settings: BotSettings, t: LoopTuning): { capTokens: number; promptChars: number } {
+  const caps = [t.ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
+  const capTokens = caps.length ? Math.min(...caps) : 24_000;
+  return {
+    capTokens,
+    promptChars: Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * LOCAL_CHARS_PER_TOKEN) || Math.floor(capTokens * 0.75 * LOCAL_CHARS_PER_TOKEN),
+  };
+}
+
+/** The per-feature budget in chars: a PR whose reviewable patches fit it is reviewed in one turn. */
+function featureBudget(settings: BotSettings, t: LoopTuning): number {
+  return Math.min(t.groupMaxChars, Math.floor(promptBudget(settings, t).promptChars * 0.5));
+}
+
+/** Whether the pipeline reviews this PR as one whole-PR feature (no map, a handful of turns). */
+export function fitsOneTurn(sample: SamplePr, settings: BotSettings): boolean {
+  const patches = patchesByPath(sample.diff);
+  return reviewTargets(sample).reduce((n, p) => n + (patches.get(p)?.length ?? 0) + 200, 0) <= featureBudget(settings, tuning());
+}
+
+/** A failed whole-PR turn split-retries per file, so only a few files bound how long a small holder runs. */
+export const SMALL_REVIEW_MAX_FILES = 4;
+
+/** A small review: fits one turn and has at most SMALL_REVIEW_MAX_FILES review targets. Harbor queues it
+ * in the lease's "small" lane, ahead of large reviews. */
+export function isSmallReview(sample: SamplePr, settings: BotSettings): boolean {
+  return reviewTargets(sample).length <= SMALL_REVIEW_MAX_FILES && fitsOneTurn(sample, settings);
+}
+
 function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): Ctx {
   const route = createLocalModelRouter(
     parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority),
     deps.request ?? requestLocalJson,
     { rateLimits: settings.localLlmModelRateLimits },
   );
-  const caps = [t.ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
-  const capTokens = caps.length ? Math.min(...caps) : 24_000;
+  const { capTokens, promptChars } = promptBudget(settings, t);
   return {
     settings,
     deps,
@@ -956,7 +1186,7 @@ function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): C
     baseUrl: settings.localLlmBaseUrl.trim().replace(/\/$/, ""),
     apiKey: settings.localLlmApiKey.trim() || "local",
     capTokens,
-    promptChars: Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * LOCAL_CHARS_PER_TOKEN) || Math.floor(capTokens * 0.75 * LOCAL_CHARS_PER_TOKEN),
+    promptChars,
     turns: 0,
   };
 }
@@ -1141,10 +1371,9 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
-    const budget = Math.min(t.groupMaxChars, Math.floor(ctx.promptChars * 0.5));
+    const budget = featureBudget(settings, t);
     const targets = reviewTargets(sample);
-    const patches = patchesByPath(sample.diff);
-    const whole = targets.reduce((n, p) => n + (patches.get(p)?.length ?? 0) + 200, 0) <= budget;
+    const whole = fitsOneTurn(sample, settings);
     let map: Map<string, MapEntry>;
     let groups: string[][];
     if (whole) {
@@ -1192,7 +1421,6 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
         reportedUnreviewed.push(...gated.unreviewed);
         if (!anyOk) {
           safe.push(...gated.safe);
-          coverage.push(...gated.coverage);
         }
         assumptions.push(...gated.assumptions);
         anyOk = true;
@@ -1233,6 +1461,13 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
     stats.turns = ctx.turns;
     stats.minutes = Math.round((Date.now() - startedAt) / 60_000);
     const unreviewed = [...new Set([...failed, ...reportedUnreviewed, ...unreviewablePaths(sample)])];
+    // Coverage is Ashlar's own record, not the model's self-assessment: a file whose feature turn returned
+    // a usable review is cleared; one whose turn failed, that the reply marked unreviewed, or that has no
+    // usable diff is not. (The model's own labels marked nearly every file not_cleared — 7 of 7 on a review
+    // whose every candidate was refuted — so they said nothing about what was actually reviewed.)
+    for (const file of reviewTargets(sample)) {
+      if (!unreviewed.includes(file)) coverage.push({ file, status: "cleared", reason: "reviewed in a feature turn" });
+    }
     for (const file of unreviewed) {
       const reason = failed.includes(file) ? "feature review failed" : reportedUnreviewed.includes(file) ? "the reviewer reported it unreviewed" : "no usable diff";
       coverage.push({ file, status: "not_cleared", reason });

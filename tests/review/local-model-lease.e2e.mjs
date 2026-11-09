@@ -239,3 +239,116 @@ test('short lane: a holding review lends the model to a waiting short job at its
   await answer(app,2,final);
   await eventually(()=>job(app,b)?.status==='posted','B did not post');
 });
+
+// ── Small reviews and re-requests (2026-11-09: small PRs waited 50–90 minutes behind large reviews; a
+// re-request went to the back of the queue) ──
+
+async function pipelineFixture(t,github={}){
+  let leaseModule;
+  const wrap={'src/lib/local-model-lease.ts':real=>{leaseModule=real;return real;}};
+  const app=await appFixture({reviewChatgpt:false,localReviewPipeline:true,localJsonRepairEnabled:false,localPipelineLenses:1},{...github,wrap});
+  t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  return {app,lease:()=>leaseModule.localModelLease()};
+}
+const prOf=body=>/fixture\/fixture#(\d+)/.exec(JSON.stringify(body))?.[1];
+/** A reply that fits the request's pipeline stage (map, verify, select or a feature turn). */
+function stageReply(res,body){
+  const sys=body.messages?.[0]?.content??'';
+  const user=body.messages?.[1]?.content??'';
+  const content=sys.startsWith('You summarize')
+    ? JSON.stringify({files:[...user.matchAll(/=== FILE: (\S+)/g)].map(m=>({file:m[1],summary:'s',guards:[],effects:[]}))})
+    : sys.startsWith('You rank') ? JSON.stringify({selected:[]})
+    : /ONE reported defect/.test(sys) ? JSON.stringify({trace:'t',blocking_code:'',verdict:'uncertain',proof_quote:'',severity:'P2'})
+    : clean;
+  res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content}}],usage:{prompt_tokens:10}}));
+}
+/** Answer every request from index `from` on as it arrives; returns a stop function. */
+function answerAll(app,from=0){
+  const done=new Set();
+  const timer=setInterval(()=>{
+    for(let i=from;i<app.localRequests.length;i++){
+      if(done.has(i))continue;
+      done.add(i);
+      stageReply(app.localResponses[i],app.localRequests[i]);
+    }
+  },20);
+  return ()=>clearInterval(timer);
+}
+
+test('small lane: a PR reviewed in one turn queues ahead of a waiting large review, and a running large review lends it the model', async t=>{
+  const {app,lease}=await pipelineFixture(t);
+  // PR 1 is "large": a feature budget below its diff makes the pipeline split it (map + features).
+  app.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS='20';
+  const a=await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  delete app.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS;
+  // A large review already waiting (a manual review-lane waiter), then the small PR 2.
+  let manual;
+  const queued=lease().acquire('manual-large',{}).then(h=>{manual=h;});
+  const b=await started(app,2);
+  await eventually(()=>lease().snapshot().queued.includes(b),'B not queued');
+  assert.deepEqual([...lease().snapshot().queued],[b,'manual-large'],'the small review waits ahead of the large one');
+  // A1 completes; at A's next turn boundary the model is lent to B, before A2 and the waiting large review.
+  stageReply(app.localResponses[0],app.localRequests[0]);
+  await eventually(()=>app.localRequests.length===2,'no request after A1');
+  assert.equal(prOf(app.localRequests[1]),'2','the request after A1 is the small review\'s');
+  const stop=answerAll(app,1);
+  t.after(stop);
+  await eventually(()=>job(app,b)?.status==='posted','B did not post while A was running');
+  assert.equal(manual,undefined,'the waiting large review still waits while A runs');
+  await eventually(()=>['posted','failed'].includes(job(app,a)?.status),'A did not finish');
+  await queued; manual.release();
+});
+
+test('re-request: a job that supersedes a queued one for the same PR keeps its place in the queue', async t=>{
+  const {app,lease}=await pipelineFixture(t);
+  app.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS='20'; // every PR "large": one lane, ordered by queue time
+  // The fixture's clock is frozen; real requests arrive at different times.
+  await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  app.clock.now+=60_000;
+  const b=await started(app,2);
+  await eventually(()=>lease().snapshot().queued.includes(b),'B not queued');
+  app.clock.now+=60_000;
+  const c=await started(app,3);
+  await eventually(()=>lease().snapshot().queued.includes(c),'C not queued');
+  app.clock.now+=60_000;
+  // PR 2 is requested again (a new head or a manual re-request): its new job must stay ahead of PR 3.
+  const out=await app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'lease-pr-2-again',event:'issue_comment',payload:{action:'created',installation:{id:1},
+    repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'PR 2'},comment:{id:999,body:'@ashlar-bot review'}}});
+  await eventually(()=>lease().snapshot().queued.includes(out.jobId),'the re-request is not queued');
+  assert.deepEqual([...lease().snapshot().queued],[out.jobId,c],'the re-request keeps PR 2\'s place ahead of PR 3');
+  t.after(answerAll(app,0));
+});
+
+test('re-request: the superseding job keeps the time the old job queued for the model, not when it was created', async t=>{
+  // The old job for PR 2 is created first but its local leg queues last (here its head lookup is slow;
+  // in verify mode the local leg starts only after the chat leg). Its re-request must not jump ahead of
+  // PR 3, which queued before it.
+  let holdHead=false,releaseHead=()=>{};
+  const headGate=new Promise(resolve=>{releaseHead=resolve;});
+  const {app,lease}=await pipelineFixture(t,{beforeHead:()=>holdHead?headGate:undefined});
+  t.after(()=>releaseHead());
+  app.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS='20'; // every PR "large": one lane, ordered by queue time
+  await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  app.clock.now+=60_000;
+  holdHead=true;
+  const b=(await mentionPr(app,2)).jobId; // created now, but held before its snapshot
+  await eventually(()=>app.githubCalls.head>=2,'PR 2 head lookup did not start');
+  holdHead=false;
+  app.clock.now+=60_000;
+  const c=await started(app,3);
+  await eventually(()=>lease().snapshot().queued.includes(c),'C not queued');
+  app.clock.now+=60_000;
+  releaseHead();
+  await eventually(()=>lease().snapshot().queued.includes(b),'B not queued');
+  assert.deepEqual([...lease().snapshot().queued],[c,b],'B queued after C');
+  app.clock.now+=60_000;
+  const out=await app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'lease-pr-2-again',event:'issue_comment',payload:{action:'created',installation:{id:1},
+    repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'PR 2'},comment:{id:998,body:'@ashlar-bot review'}}});
+  await eventually(()=>lease().snapshot().queued.includes(out.jobId),'the re-request is not queued');
+  assert.deepEqual([...lease().snapshot().queued],[c,out.jobId],'the re-request keeps B\'s place behind C');
+  t.after(answerAll(app,0));
+});

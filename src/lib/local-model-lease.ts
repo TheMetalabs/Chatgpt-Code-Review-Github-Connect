@@ -14,23 +14,39 @@
  * unchanged. Capacity (how many holders at once) is Settings `localLeaseCapacity` /
  * ASHLAR_LOCAL_LEASE_CAPACITY, default 1, clamped 1–8 — match the model server (e.g. oMLX concurrent=3).
  *
- * Lanes: a waiter joins the queue in its lane and is granted before every waiter of a lower lane, FIFO
- * within a lane: "short" (JSON repair: 1-3 small calls) before "fix" (one call that unblocks a PR)
- * before "review" (can take hours). A lane never preempts: the holder keeps the model until it
- * releases — except that a review holder calls checkpoint() at each turn boundary, which lends the
- * model to waiting "short" jobs (at most `cap` per checkpoint) and then gives it back to that same
- * review, ahead of every other queued job.
+ * Lanes: a waiter joins the queue in its lane and is granted before every waiter of a lower lane, in
+ * order of its `since` time within a lane (FIFO unless a waiter inherits an earlier time): "short"
+ * (JSON repair: 1-3 small calls) before "fix" (one call that unblocks a PR) before "small" (a review
+ * whose whole PR fits one turn in a few files: minutes) before "review" (can take hours). A lane never preempts: the
+ * holder keeps the model until it releases — except that a review holder calls checkpoint() at each
+ * turn boundary, which lends the model to waiting "short" jobs (at most `cap` per checkpoint) and, for
+ * a "review" holder, to waiting "small" reviews (at most `smallCap`), and then gives it back to that
+ * same review, ahead of every other queued job. (A small PR used to wait behind every queued large
+ * review: 1-2 minutes of work after 50-90 minutes in the queue.)
  */
 
 /** Queue lane; a lower rank is granted first. */
-export type LocalModelLane = "short" | "fix" | "review";
-const LANE_RANK: Record<LocalModelLane, number> = { short: 0, fix: 1, review: 2 };
+export type LocalModelLane = "short" | "fix" | "small" | "review";
+const LANE_RANK: Record<LocalModelLane, number> = { short: 0, fix: 1, small: 2, review: 3 };
 const lanePrecedes = (a: LocalModelLane, b: LocalModelLane): boolean => LANE_RANK[a] < LANE_RANK[b];
 
 /** Short jobs a holder lends the model to per checkpoint unless the caller says otherwise. */
 export const DEFAULT_SHORT_PER_CHECKPOINT = 2;
 /** Safety ceiling for one checkpoint so an operator setting cannot starve the review holder. */
 export const MAX_SHORT_PER_CHECKPOINT = 16;
+/** Small reviews a large review lends the model to per checkpoint unless the caller says otherwise. */
+export const DEFAULT_SMALL_PER_CHECKPOINT = 1;
+
+/** ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: small reviews (a whole PR in one turn) a large review lends
+ * the model to at each turn boundary. Default 1, capped at 4; 0 turns it off (small reviews then wait). */
+export function smallReviewsPerCheckpoint(
+  env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): number {
+  const raw = env?.ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT;
+  if (raw == null || raw.trim() === "") return DEFAULT_SMALL_PER_CHECKPOINT;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 4) : DEFAULT_SMALL_PER_CHECKPOINT;
+}
 
 /** ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: short jobs (JSON repairs) a review lends the model to at
  * each turn boundary. Default 2, capped at 16; 0 turns lending off (repairs then wait for the review
@@ -74,6 +90,9 @@ export type LocalModelLeaseWait = {
   signal?: AbortSignal;
   /** Queue lane (default "review"). */
   lane?: LocalModelLane;
+  /** Queue time (ms) that orders this waiter within its lane (default now). A job that supersedes a
+   * waiting or running job for the same PR passes that job's time, so a re-request keeps its place. */
+  since?: number;
   /** Called with the 1-based queue position while waiting (only when it changes). Never throws out. */
   onPosition?: (position: number) => void;
 };
@@ -82,6 +101,7 @@ type Waiter = {
   id: number;
   owner: string;
   lane: LocalModelLane;
+  since: number;
   lastPosition: number;
   onPosition?: (position: number) => void;
   resolve: (handle: LocalModelLeaseHandle) => void;
@@ -106,6 +126,8 @@ function abortReason(signal: AbortSignal): unknown {
 export class LocalModelLease {
   private seq = 0;
   private readonly active = new Map<number, string>();
+  /** Lane of each holder (active or parked): only a "review" holder lends to small reviews. */
+  private readonly holderLane = new Map<number, LocalModelLane>();
   /** Holders whose slot is lent out (id → owner); they still occupy capacity. */
   private readonly parked = new Map<number, Parked>();
   /** Short job id → the parked holder id whose slot it runs on. */
@@ -141,19 +163,20 @@ export class LocalModelLease {
     const signal = opts.signal;
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     const id = ++this.seq;
-    if (!this.queue.length && this.occupied() < this.capacity) return Promise.resolve(this.grant(id, owner));
+    const lane = opts.lane ?? "review";
+    if (!this.queue.length && this.occupied() < this.capacity) return Promise.resolve(this.grant(id, owner, lane));
     return new Promise<LocalModelLeaseHandle>((resolve, reject) => {
       const onAbort = () => {
         if (this.drop(id)) reject(abortReason(signal as AbortSignal));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
-      const lane = opts.lane ?? "review";
+      const since = Number.isFinite(opts.since) ? (opts.since as number) : Date.now();
       const waiter: Waiter = {
-        id, owner, lane, lastPosition: 0, onPosition: opts.onPosition, resolve, reject,
+        id, owner, lane, since, lastPosition: 0, onPosition: opts.onPosition, resolve, reject,
         detach: () => signal?.removeEventListener("abort", onAbort),
       };
-      // Insert before the first waiter this lane precedes; equal lanes stay FIFO.
-      const at = this.queue.findIndex((w) => lanePrecedes(lane, w.lane));
+      // Insert before the first waiter this lane precedes, or (same lane) that queued later than `since`.
+      const at = this.queue.findIndex((w) => lanePrecedes(lane, w.lane) || (w.lane === lane && w.since > since));
       this.queue.splice(at < 0 ? this.queue.length : at, 0, waiter);
       this.notifyPositions();
     });
@@ -167,13 +190,20 @@ export class LocalModelLease {
    * keeps running and the slot goes to the next waiter when it finishes. `signal` (the holder's own
    * cancellation) is honored before lending and while lent: an abort revokes the parked holder and
    * returns at once, leaving the borrower active on its slot until its own release.
+   * A holder that is itself a borrower (a small review on a lent slot) never lends: revocation does not
+   * chain, so its lender would stay parked forever if it were revoked while parked.
    */
-  async checkpoint(handle: LocalModelLeaseHandle, cap = DEFAULT_SHORT_PER_CHECKPOINT, signal?: AbortSignal): Promise<number> {
+  async checkpoint(handle: LocalModelLeaseHandle, cap = DEFAULT_SHORT_PER_CHECKPOINT, signal?: AbortSignal, smallCap = 0): Promise<number> {
     const holderId = this.ids.get(handle);
+    if (holderId !== undefined && this.lends.has(holderId)) return 0;
     let served = 0;
-    while (
-      holderId !== undefined && served < cap && !signal?.aborted && this.active.has(holderId) && this.queue[0]?.lane === "short"
-    ) {
+    let shortServed = 0;
+    let smallServed = 0;
+    const lendable = (w: Waiter | undefined) =>
+      w !== undefined &&
+      ((w.lane === "short" && shortServed < cap) ||
+        (w.lane === "small" && smallServed < smallCap && holderId !== undefined && this.holderLane.get(holderId) === "review"));
+    while (holderId !== undefined && !signal?.aborted && this.active.has(holderId) && lendable(this.queue[0])) {
       const owner = this.active.get(holderId) as string;
       const waiter = this.queue.shift() as Waiter;
       waiter.detach();
@@ -182,7 +212,9 @@ export class LocalModelLease {
         this.parked.set(holderId, { owner, wake });
       });
       this.lends.set(waiter.id, holderId);
-      waiter.resolve(this.grant(waiter.id, waiter.owner));
+      if (waiter.lane === "small") smallServed += 1;
+      else shortServed += 1;
+      waiter.resolve(this.grant(waiter.id, waiter.owner, waiter.lane));
       this.notifyPositions();
       const onAbort = () => { this.unpark(holderId); this.pump(); };
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -240,8 +272,9 @@ export class LocalModelLease {
     return this.active.size + idle;
   }
 
-  private grant(id: number, owner: string): LocalModelLeaseHandle {
+  private grant(id: number, owner: string, lane: LocalModelLane): LocalModelLeaseHandle {
     this.active.set(id, owner);
+    this.holderLane.set(id, lane);
     const handle: LocalModelLeaseHandle = {
       owner,
       release: () => {
@@ -257,6 +290,7 @@ export class LocalModelLease {
    * parked holder (no pump: nobody else may take it); otherwise the queue advances when `pump`. */
   private free(id: number, pump: boolean) {
     if (!this.active.delete(id)) return;
+    this.holderLane.delete(id);
     const lender = this.lends.get(id);
     if (lender !== undefined) {
       this.lends.delete(id);
@@ -279,6 +313,7 @@ export class LocalModelLease {
     const parked = this.parked.get(id);
     if (!parked) return;
     this.parked.delete(id);
+    this.holderLane.delete(id);
     for (const [shortId, lender] of this.lends) if (lender === id) this.lends.delete(shortId);
     parked.wake();
   }
@@ -298,7 +333,7 @@ export class LocalModelLease {
     while (this.queue.length && this.occupied() < this.capacity) {
       const waiter = this.queue.shift() as Waiter;
       waiter.detach();
-      waiter.resolve(this.grant(waiter.id, waiter.owner));
+      waiter.resolve(this.grant(waiter.id, waiter.owner, waiter.lane));
       granted = true;
     }
     if (granted) this.notifyPositions();

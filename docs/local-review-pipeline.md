@@ -82,7 +82,7 @@ Precision is enforced by the refute stage, so generation is now tuned for recall
 - A verdict is `confirmed`, `refuted` or `uncertain`.
 - A refutation must quote the code or doc text that prevents the defect. One without such a quote counts as uncertain.
 - A quote that is not verbatim still matches when its identifiers, literals and operators appear on one line of the code as one contiguous run, in order and with their case. Brackets, separators, string quotes and whitespace may differ. A different identifier, a changed case or an added or removed operator (`!isAdmin` for `isAdmin`) never matches.
-- An uncertain candidate is posted at P2 only when its own evidence quotes real code (`local_review.pipeline_keep_uncertain`, default on).
+- An uncertain candidate is posted at P2 only when `local_review.pipeline_keep_uncertain` is on (default off since 2026-11-09) and its own evidence quotes real code.
 
 **Downstream gate**
 - The posted findings the verifier confirmed, or kept as uncertain, are handed to the leg gate as **trusted verified keys** (`FindingGateExtras.verifiedKeys`), and the gate does not re-judge their hedges and evidence.
@@ -135,6 +135,26 @@ On WalkieBoard #569 Codex found one valid defect: `roomToRun` checks its deadlin
 - `VERIFY_RULES` check 3: a guard prevents a failure only if it runs on the failing path after the state it checks could change; a check before a wait does not cover what happens during it.
 - A multi-file feature group that returns no usable review (after its own retry) is retried one file at a time, up to `MAX_SPLIT_RETRY_FILES` (8) files per review. Files that still fail are unreviewed, and the ops line names them, for example `(1 failed, 3 file(s) retried alone, unreviewed: A.swift, B.swift)`.
 
+## Context from other files, coverage, uncertain findings (2026-11-09)
+
+After #183, aicc-center and WalkieBoard got 17 posted local findings, and none was valid. 10 were false positives, and 8 of those were refuted by code in another file: a callee (for example `revert(in:)`, or a request helper's signature), a caller that only renders a component for an existing row, a DTO length limit, a registry list, and the database collation. At least 4 posted findings were verifier-"uncertain". The model also marked nearly every file not_cleared (7 of 7 on a review whose every candidate was refuted).
+
+- **Coverage is Ashlar's record.** A file whose feature turn returned a usable review is cleared. A file whose turn failed, that the reply marked unreviewed, or that has no usable diff is not_cleared. The candidate prompt no longer asks the model for a coverage list.
+- **Feature turns get `CALLEE_DEFINITIONS`.** These are the definitions, in other files, of the names the feature's added lines call or render (`calledNames`), up to `CALLEE_DEFINITIONS_MAX_CHARS` (6,000). A TypeScript/JavaScript whole-PR turn already carries its imported definitions and does not get the block.
+- **The verifier's evidence adds two things.** First, the definition of every name the cited lines and the candidate's quotes call, including plain lower-case methods. Second, up to three call sites of the function that holds the cited line (`enclosingName`), in any changed or reference file.
+- **`VERIFY_RULES` check 6.** A failure that depends on what a caller passes, a client sends, the database or a library does, or a config or registry list holds is real only if the evidence shows a path that supplies it. It is refuted when the callers shown never pass it, or when validation, a schema, a constraint or a list rules it out. With no such path shown it is uncertain, never confirmed.
+- **`local_review.pipeline_keep_uncertain` defaults to off.** An undecided candidate is not posted. A value already saved in Settings is kept.
+
+On #566's and #569's real diffs (mock model) this adds about 7–8% prompt text, with the same number of turns.
+
+## Small PRs in the queue (2026-11-09)
+
+On aicc-center, small PRs took 1–2 minutes of pipeline time but 50–90 minutes from request to result. The extra time was spent waiting for the local model: the lease was one FIFO, and a large review held the model for 30–50 minutes.
+
+- **Small lane.** A PR the pipeline reviews as one whole-PR feature (`fitsOneTurn`) with at most 4 reviewable files (`SMALL_REVIEW_MAX_FILES`, `isSmallReview`) waits in the lease's `small` lane: after short (JSON repair) and fix work, before large reviews. The file limit exists because a failed whole-PR turn split-retries per file: a PR that fit one turn but had many files took 23 turns while holding the small lane, so few files bound how long a small review holds the model.
+- **Lending to small reviews.** At each turn boundary a large review lends the model to up to `ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT` (default 1) waiting small reviews, then resumes ahead of every other queued job. oMLX keeps KV blocks on SSD, so the large review's prompt cache survives the lend.
+- **Re-requests keep their place.** A job that supersedes a waiting or running job for the same PR keeps that job's queue time (`since`) instead of going to the back of the queue.
+
 ## Settings
 
 | Field | Default | Meaning |
@@ -143,7 +163,7 @@ On WalkieBoard #569 Codex found one valid defect: `roomToRun` checks its deadlin
 | `local_review.pipeline_max_findings` | 5 | 1–8: the selection's cap. |
 | `local_review.pipeline_verify_votes` | 1 | 1–3: refute turns per candidate. All must confirm. |
 | `local_review.pipeline_lenses` | 3 | 1–3: candidate passes for a PR reviewed in one turn (1 = one combined pass). A PR split into features always gets one pass per feature. |
-| `local_review.pipeline_keep_uncertain` | on | Post an undecided candidate at P2 when its own quote is real code. |
+| `local_review.pipeline_keep_uncertain` | off | Post an undecided candidate at P2 when its own quote is real code. |
 
 ## Measuring it with the real model
 

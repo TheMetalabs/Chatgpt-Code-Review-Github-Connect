@@ -545,7 +545,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localPipelineMaxFindings: 5,
   localPipelineVerifyVotes: 1,
   localPipelineLenses: 3,
-  localPipelineKeepUncertain: true,
+  localPipelineKeepUncertain: false,
   localLeaseCapacity: 1,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,

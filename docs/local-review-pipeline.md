@@ -147,6 +147,14 @@ After #183, aicc-center and WalkieBoard got 17 posted local findings, and none w
 
 On #566's and #569's real diffs (mock model) this adds about 7–8% prompt text, with the same number of turns.
 
+## Small PRs in the queue (2026-11-09)
+
+On aicc-center, small PRs took 1–2 minutes of pipeline time but 50–90 minutes from request to result. The extra time was spent waiting for the local model: the lease was one FIFO, and a large review held the model for 30–50 minutes.
+
+- **Small lane.** A PR the pipeline reviews as one whole-PR feature (`fitsOneTurn`) waits in the lease's `small` lane: after short (JSON repair) and fix work, before large reviews.
+- **Lending to small reviews.** At each turn boundary a large review lends the model to up to `ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT` (default 1) waiting small reviews, then resumes ahead of every other queued job. oMLX keeps KV blocks on SSD, so the large review's prompt cache survives the lend.
+- **Re-requests keep their place.** A job that supersedes a waiting or running job for the same PR keeps that job's queue time (`since`) instead of going to the back of the queue.
+
 ## Settings
 
 | Field | Default | Meaning |

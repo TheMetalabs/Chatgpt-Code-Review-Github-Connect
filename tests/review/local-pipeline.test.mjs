@@ -21,6 +21,7 @@ import {
   PART_NON_CODE_MAX_CHARS,
   calledNames,
   enclosingName,
+  fitsOneTurn,
 } from "../../src/lib/local-pipeline.server.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
@@ -864,5 +865,15 @@ test("feature turn: CALLEE_DEFINITIONS carries the code its added lines call in 
   } finally {
     process.env.ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS = before;
   }
+});
+
+test("fitsOneTurn: the PR the pipeline reviews as one whole-PR feature is a small review (harbor's lease lane)", async () => {
+  assert.equal(fitsOneTurn(sample(), settings), false, "the two-feature sample is split");
+  await wholePr(async () => {
+    assert.equal(fitsOneTurn(sample(), settings), true);
+    const m = model({ review: reviewFor({}), verify: refute });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request, log: () => {} });
+    assert.match(out.pipelineSummary, /1 feature group\(s\)/, "and the pipeline reviews it in one feature");
+  });
 });
 

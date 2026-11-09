@@ -1055,14 +1055,35 @@ export function pipelineSummary(s: PipelineStats): string {
   return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})`;
 }
 
+/** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
+function promptBudget(settings: BotSettings, t: LoopTuning): { capTokens: number; promptChars: number } {
+  const caps = [t.ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
+  const capTokens = caps.length ? Math.min(...caps) : 24_000;
+  return {
+    capTokens,
+    promptChars: Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * LOCAL_CHARS_PER_TOKEN) || Math.floor(capTokens * 0.75 * LOCAL_CHARS_PER_TOKEN),
+  };
+}
+
+/** The per-feature budget in chars: a PR whose reviewable patches fit it is reviewed in one turn. */
+function featureBudget(settings: BotSettings, t: LoopTuning): number {
+  return Math.min(t.groupMaxChars, Math.floor(promptBudget(settings, t).promptChars * 0.5));
+}
+
+/** Whether the pipeline reviews this PR as one whole-PR feature (no map, a handful of turns): a small
+ * review. Harbor queues it in the lease's "small" lane, ahead of large reviews. */
+export function fitsOneTurn(sample: SamplePr, settings: BotSettings): boolean {
+  const patches = patchesByPath(sample.diff);
+  return reviewTargets(sample).reduce((n, p) => n + (patches.get(p)?.length ?? 0) + 200, 0) <= featureBudget(settings, tuning());
+}
+
 function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): Ctx {
   const route = createLocalModelRouter(
     parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority),
     deps.request ?? requestLocalJson,
     { rateLimits: settings.localLlmModelRateLimits },
   );
-  const caps = [t.ctxCapTokens, settings.localReviewSingleTurnMaxTokens].filter((n) => Number.isFinite(n) && n > 0);
-  const capTokens = caps.length ? Math.min(...caps) : 24_000;
+  const { capTokens, promptChars } = promptBudget(settings, t);
   return {
     settings,
     deps,
@@ -1070,7 +1091,7 @@ function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): C
     baseUrl: settings.localLlmBaseUrl.trim().replace(/\/$/, ""),
     apiKey: settings.localLlmApiKey.trim() || "local",
     capTokens,
-    promptChars: Math.floor(localFirstTurnBudgetTokens(settings, t.ctxCapTokens) * LOCAL_CHARS_PER_TOKEN) || Math.floor(capTokens * 0.75 * LOCAL_CHARS_PER_TOKEN),
+    promptChars,
     turns: 0,
   };
 }
@@ -1255,10 +1276,9 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
-    const budget = Math.min(t.groupMaxChars, Math.floor(ctx.promptChars * 0.5));
+    const budget = featureBudget(settings, t);
     const targets = reviewTargets(sample);
-    const patches = patchesByPath(sample.diff);
-    const whole = targets.reduce((n, p) => n + (patches.get(p)?.length ?? 0) + 200, 0) <= budget;
+    const whole = fitsOneTurn(sample, settings);
     let map: Map<string, MapEntry>;
     let groups: string[][];
     if (whole) {

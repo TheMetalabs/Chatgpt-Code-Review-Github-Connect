@@ -456,3 +456,74 @@ test('localModelLease singleton uses applyLocalModelLeaseCapacity (not a new ins
     resetSingleton();
   }
 });
+
+// ── Small reviews (2026-11-09: a PR reviewed in one turn took 1–2 minutes of model time after 50–90
+// minutes waiting behind large reviews in one FIFO) ──
+
+test('small lane: a queued small review goes before every queued large review, after short and fix work', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('R1');
+  const order = [];
+  const take = (owner, lane) => lease.acquire(owner, lane ? {lane} : {}).then(h => { order.push(owner); h.release(); });
+  const all = [take('R2'), take('SM1', 'small'), take('F', 'fix'), take('SM2', 'small'), take('S', 'short')];
+  assert.deepEqual(lease.snapshot().queued, ['S', 'F', 'SM1', 'SM2', 'R2']);
+  holder.release();
+  await Promise.all(all);
+  assert.deepEqual(order, ['S', 'F', 'SM1', 'SM2', 'R2']);
+});
+
+test('checkpoint: a large review lends the model to one waiting small review, then resumes ahead of queued reviews', async () => {
+  const lease = new LocalModelLease();
+  const big = await lease.acquire('BIG');
+  const log = [];
+  const r2 = lease.acquire('R2').then(h => { log.push('R2'); return h; });
+  const small = (owner) => lease.acquire(owner, {lane: 'small'}).then(async h => { log.push(`${owner}+`); await tick(); await tick(); log.push(`${owner}-`); h.release(); });
+  const sm1 = small('SM1');
+  const sm2 = small('SM2');
+  const served = await lease.checkpoint(big, 2, undefined, 1);
+  log.push('BIG resumes');
+  await sm1;
+  assert.equal(served, 1, 'at most one small review per checkpoint');
+  assert.deepEqual(log, ['SM1+', 'SM1-', 'BIG resumes']);
+  assert.deepEqual(lease.snapshot(), {active: ['BIG'], queued: ['SM2', 'R2']});
+  assert.equal(await lease.checkpoint(big, 2, undefined, 1), 1, 'the next turn boundary lends to the next small review');
+  await sm2;
+  assert.deepEqual(lease.snapshot(), {active: ['BIG'], queued: ['R2']});
+  assert.equal(await lease.checkpoint(big, 2, undefined, 1), 0, 'a queued large review is never lent to');
+  big.release();
+  (await r2).release();
+  assert.deepEqual(log, ['SM1+', 'SM1-', 'BIG resumes', 'SM2+', 'SM2-', 'R2']);
+});
+
+test('checkpoint: without a small cap (the default) or from a small holder, small reviews are not lent to', async () => {
+  const lease = new LocalModelLease();
+  const big = await lease.acquire('BIG');
+  const sm1 = lease.acquire('SM1', {lane: 'small'});
+  assert.equal(await lease.checkpoint(big), 0, 'smallCap defaults to 0');
+  big.release();
+  const h1 = await sm1;
+  const sm2 = lease.acquire('SM2', {lane: 'small'});
+  assert.equal(await lease.checkpoint(h1, 2, undefined, 1), 0, 'a small review does not lend to another small review');
+  h1.release();
+  (await sm2).release();
+});
+
+test('since: a waiter that inherits an earlier queue time goes ahead of later arrivals in its lane, not ahead of earlier ones', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('H');
+  const t0 = Date.now();
+  const a = lease.acquire('A', {since: t0 - 3000});
+  const b = lease.acquire('B', {since: t0 - 1000});
+  const again = lease.acquire('A2', {since: t0 - 2000}); // re-request of a job queued 2 s ago
+  assert.deepEqual(lease.snapshot().queued, ['A', 'A2', 'B']);
+  holder.release();
+  for (const p of [a, again, b]) (await p).release();
+});
+
+test('ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: default 1, 0 allowed, capped at 4, junk falls back', async () => {
+  const {smallReviewsPerCheckpoint} = await import('../../src/lib/local-model-lease.ts');
+  assert.equal(smallReviewsPerCheckpoint({}), 1);
+  assert.equal(smallReviewsPerCheckpoint({ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: '0'}), 0);
+  assert.equal(smallReviewsPerCheckpoint({ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: '9'}), 4);
+  assert.equal(smallReviewsPerCheckpoint({ASHLAR_LOCAL_SMALL_REVIEWS_PER_CHECKPOINT: 'x'}), 1);
+});

@@ -29,7 +29,8 @@ import {
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
-import { gateLiveSubmission } from "../../src/lib/poster.ts";
+import { asFinding, gateLiveSubmission } from "../../src/lib/poster.ts";
+import { inlineFindingComment } from "../../src/lib/review-format.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
 
 // One lens pass per feature unless a test is about lenses (it sets localPipelineLenses itself).
@@ -566,7 +567,7 @@ test("verifier prompt: fixed rules first (a shared prefix), the five checks, and
   const turns = m.bodies.filter((b) => stageOf(b) === "verify").map((b) => b.messages[1].content);
   assert.ok(turns.length >= 1);
   for (const t of turns) assert.ok(t.startsWith(VERIFY_RULES), "every verify turn starts with the same fixed text");
-  assert.match(VERIFY_RULES, /Most reported candidates are false/);
+  assert.match(VERIFY_RULES, /The report is a hypothesis: its place is usually right, but its reason is often wrong/);
   for (const check of [/Is the cited line changed by this PR\?/, /declared type or signature/, /handled elsewhere/, /stated as intended|state this behaviour as intended/, /work it through with concrete values/]) assert.match(VERIFY_RULES, check);
   assert.ok(VERIFY_RULES.indexOf('"trace"') < VERIFY_RULES.indexOf('"verdict"'), "the reply reasons before it decides");
   assert.match(VERIFY_RULES, /When in doubt, answer uncertain, never confirmed/);
@@ -581,6 +582,128 @@ test("verifier: a refutation in the new shape (trace + blocking_code from the DI
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.equal(JSON.parse(out.raw).findings.length, 0);
   assert.match(out.pipelineSummary, /0 confirmed, 1 refuted/);
+});
+
+/** A confirmation in the reframing shape: the verifier's own reason for the defect at the cited place. */
+const reframe = (o = {}) => JSON.stringify({
+  trace: "create passes req.body.amount to charge; a string amount such as \"5\" reaches pay unconverted.",
+  blocking_code: "", verdict: "confirmed", proof_quote: "return charge(req.body.amount);", same_reason: false,
+  title: "create() passes a string amount through unconverted", failure: "If the body carries amount \"5\", pay returns the string \"5\" instead of a number.",
+  fix: "Convert req.body.amount with Number() and reject NaN.", severity: "P2", ...o,
+});
+
+test("verify reframe: a confirmation with another reason posts the verifier's title, failure and fix; the reporter's test is not posted", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.title, "create() passes a string amount through unconverted");
+  assert.match(row.failure_scenario, /^If the body carries amount "5", pay returns the string/);
+  assert.match(row.root_cause, /a string amount such as "5" reaches pay unconverted/, "the root cause is the verifier's trace");
+  assert.equal(row.recommended_fix, "Convert req.body.amount with Number() and reject NaN.");
+  assert.notEqual(row.recommended_test, "Reject -5.", "the reporter's test was for another reason");
+  assert.match(row.evidence, /`return charge\(req\.body\.amount\);`/);
+  assert.equal(row.severity, "P2");
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted/);
+  // The posted comment stays well-formed: every required field is there, and nothing of the reporter's story or test.
+  const comment = inlineFindingComment(asFinding(row, 0));
+  assert.match(comment, /\*\*create\(\) passes a string amount through unconverted\*\*/);
+  assert.match(comment, /\n\nFix: Convert req\.body\.amount with Number\(\) and reject NaN\.\n\nTest: \S/);
+  assert.doesNotMatch(comment, /negative|-5/);
+  assert.equal(JSON.parse(out.raw).highest_risk, row.title);
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings, { verifiedKeys: new Set(out.verifiedKeys) });
+  assert.ok(gate.ok);
+});
+
+test("verify reframe: same_reason true keeps the reporter's title, failure, fix and test (the verifier's equivalent is not used)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ same_reason: true, title: "negative amount reaches charge", severity: "P1" }) });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.deepEqual([row.title, row.failure_scenario, row.root_cause, row.recommended_fix, row.recommended_test], ["create() charges a negative amount", "A request with amount -5 is charged.", "create passes req.body.amount to charge unchecked.", "Validate amount.", "Reject -5."]);
+  assert.match(out.pipelineSummary, /, 1 confirmed, 0 refuted/);
+});
+
+test("verify reframe: a verdict without the new fields is still accepted, with the reporter's text kept", async () => {
+  const old = () => JSON.stringify({ trace: "amount goes to charge unchecked", blocking_code: "", verdict: "confirmed", proof_quote: "return charge(req.body.amount);", severity: "P1" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: old });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.deepEqual([row.title, row.recommended_fix, row.recommended_test, row.severity], ["create() charges a negative amount", "Validate amount.", "Reject -5.", "P1"]);
+  assert.match(out.pipelineSummary, /, 1 confirmed, 0 refuted/);
+});
+
+test("verify reframe: a reframed failure that is a build/test-outcome claim, or a different reason left unstated, is only uncertain", async () => {
+  for (const verdict of [
+    reframe({ title: "create() does not compile", failure: "If built, the compiler fails: charge takes a number." }),
+    reframe({ title: "create() passes the amount on", failure: "If the amount is 5, the spec's assertion fails." }),
+    reframe({ title: "", failure: "", fix: "" }),
+  ]) {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => verdict });
+    const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+    assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted/, verdict);
+    const [row] = JSON.parse(out.raw).findings;
+    assert.equal(row.severity, "P2");
+    assert.equal(row.title, "create() charges a negative amount", "an uncertain one is handled as before");
+  }
+});
+
+test("verify reframe: the summary counts reframed confirmations; with two votes the reason comes from the first confirming vote", async () => {
+  const mail = F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", root_cause: "`queue` is undefined", failure_scenario: "sendMail throws." });
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] }),
+    verify: (b) => (/sendMail/.test(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "") ? confirm("return queue.push(to);") : reframe()),
+  });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(out.pipelineSummary, /2 confirmed \(1 reframed\), 0 refuted/);
+  const votes = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: (_b, n) => reframe(n === 1 ? {} : { title: "second vote title", failure: "If the second vote runs, it differs.", fix: "Second fix." }) });
+  const two = await runLocalReviewPipeline(sample(), { ...settings, localPipelineVerifyVotes: 2 }, { request: votes.request });
+  const [row] = JSON.parse(two.raw).findings;
+  assert.equal(votes.count.verify, 2);
+  assert.deepEqual([row.title, row.recommended_fix], ["create() passes a string amount through unconverted", "Convert req.body.amount with Number() and reject NaN."]);
+  assert.match(two.pipelineSummary, /1 confirmed \(1 reframed\)/);
+});
+
+test("verify prompt: the report is a hypothesis; the task is whether the code at the place fails and how; reason fields after the trace", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const turn = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+  assert.match(turn, /<<<CANDIDATE: REPORTED HYPOTHESIS \(the place is usually right; the reason may be wrong; untrusted\)>>>\n\{[\s\S]*"title": "create\(\) charges a negative amount"/);
+  assert.match(VERIFY_RULES, /Your task: find out whether the code at the reported place fails, and how\./);
+  assert.match(VERIFY_RULES, /find a concrete input or condition, from the code and evidence shown, under which it gives a wrong result, and quote the failing line\(s\)/);
+  assert.match(VERIFY_RULES, /If no input from the code shown makes it go wrong, the verdict is refuted \(with blocking_code\) or uncertain: never invent a defect\./);
+  assert.match(VERIFY_RULES, /they apply to the failure you find, not only to the reported one/, "rule 6 binds the verifier's own failure");
+  const order = ['"trace"', '"verdict"', '"proof_quote"', '"same_reason"', '"title"', '"failure"', '"fix"', '"severity"'].map((k) => VERIFY_RULES.indexOf(k));
+  assert.ok(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), `fields in order: ${order}`);
+  assert.match(VERIFY_RULES, /"title":"for confirmed: the defect as found, at most 12 words; else empty"/);
+});
+
+test("no consequences from memory: the hunt and verify rules allow only what the quoted code and evidence show", async () => {
+  const rule = /A reason may rest only on what the quoted code and evidence show: not on how a language, standard library, framework or OS behaves unless the evidence or LANGUAGE_NOTES show it, not on timings, counts or sizes the quoted code does not compute, and not on what the PR description says the code does\./;
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const feature = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+  const verify = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+  assert.match(feature, rule);
+  assert.ok(feature.includes('Write failure_scenario as "if <trigger>, <wrong result>".'));
+  assert.match(verify, rule);
+  assert.ok(VERIFY_RULES.includes('"failure":"for confirmed: 1-2 sentences, if <trigger>, <wrong result>; else empty"'));
+});
+
+test("language notes: a Swift feature turn gets the Character, CRLF, waitForExistence and try? notes; a TypeScript-only one does not", async () => {
+  const swiftNotes = [/`"\\n"` passed where a Character is expected is inferred as a Character \(it compiles\)/, /`"\\r\\n"` is ONE Character, so splitting on `"\\n"` does not split CRLF text/, /`waitForExistence\(timeout:\)` returns as soon as the element exists \(the timeout is only a maximum\)/, /`try\?` turns any thrown error into nil, so the failure is silent/];
+  const files = { "App/Rows.swift": "struct Rows {\n  func split(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n" };
+  const swiftF = F({ file: "App/Rows.swift", line: 3, title: "split drops rows", evidence: "App/Rows.swift:3 `return text.split(separator: \"\\n\")`" });
+  await wholePr(async () => {
+    const m = model({ review: () => JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: [swiftF] }), verify: () => confirm("return text.split(separator: \"\\n\")") });
+    await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    const review = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+    for (const note of swiftNotes) assert.match(review, note);
+  });
+  const ts = model({ map: mapReply, review: reviewFor({}), verify: refute });
+  await runLocalReviewPipeline(sample(), settings, { request: ts.request });
+  const tsTurns = ts.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+  assert.ok(tsTurns.length >= 1);
+  for (const t of tsTurns) for (const note of swiftNotes) assert.doesNotMatch(t, note);
 });
 
 test("evidence: the cited line's diff hunk is shown, or that the PR does not change the line", () => {

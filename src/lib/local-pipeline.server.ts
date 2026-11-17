@@ -450,6 +450,12 @@ const REVIEW_SYSTEM =
  * (one verifier turn per candidate, against the code), so candidate generation is a hunt: report every
  * defect you can tie to a changed line, with the line quoted; the verifier decides.
  */
+/** What a defect's reason may rest on, in the hunt and verify rules. On a Swift repo the local model found the
+ * right construct but gave a consequence from memory that was false ("waitForExistence blocks 13 s per
+ * page", "split expects a Character", "the test assertion fails", a misread PR description). */
+const NO_MEMORY_RULE =
+  "A reason may rest only on what the quoted code and evidence show: not on how a language, standard library, framework or OS behaves unless the evidence or LANGUAGE_NOTES show it, not on timings, counts or sizes the quoted code does not compute, and not on what the PR description says the code does.";
+
 export const HUNT_INSTRUCTIONS = [
   "You are Ashlar's defect hunter. For API output, return the JSON object directly.",
   REVIEW_OFFLINE_RULE,
@@ -460,6 +466,7 @@ export const HUNT_INSTRUCTIONS = [
   "For each finding: file is a changed file; line is a RIGHT-side changed line (or the nearest one); failure_scenario is a concrete input or sequence and what goes wrong; evidence quotes the code (path:line `code`) of the cause and of where it fails.",
   "Tie each finding to a line this diff changes and quote it: the '+' line that causes it, or, when the cause is code this diff removes (a deleted guard or check), the '-' line(s) together with the surviving line where it now fails (that line's RIGHT-side number is the finding's line). Never say what a line was or that it changed from something unless that '-' line is in the diff.",
   "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
+  `${NO_MEMORY_RULE} Write failure_scenario as "if <trigger>, <wrong result>".`,
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
   "coverage: leave it an empty array (Ashlar records coverage itself). If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
@@ -486,7 +493,7 @@ export function lensesFor(n: number): LensName[] {
 const LANGUAGE_NOTES: { exts: string[]; name: string; note: string }[] = [
   {
     exts: ["swift"], name: "Swift",
-    note: "Swift: only a `throws` function or a `Task<_, Error>` can throw, and only at a `try`; `Task<_, Never>.value` never throws, and a cancelled task still runs to its end (cancellation is cooperative: `Task.isCancelled`, `CancellationError`). `try?` deliberately turns an error into nil. `defer` runs on every exit. Structs and enums are values (copied); classes and actors are references; actor and @MainActor code runs isolated. Optionals are checked with `if let` / `guard let` / `?.`; `!` force-unwraps.",
+    note: "Swift: only a `throws` function or a `Task<_, Error>` can throw, and only at a `try`; `Task<_, Never>.value` never throws, and a cancelled task still runs to its end (cancellation is cooperative: `Task.isCancelled`, `CancellationError`). `try?` turns any thrown error into nil, so the failure is silent. `defer` runs on every exit. Structs and enums are values (copied); classes and actors are references; actor and @MainActor code runs isolated. Optionals are checked with `if let` / `guard let` / `?.`; `!` force-unwraps. A string literal such as `\"\\n\"` passed where a Character is expected is inferred as a Character (it compiles). `\"\\r\\n\"` is ONE Character, so splitting on `\"\\n\"` does not split CRLF text. XCTest `waitForExistence(timeout:)` returns as soon as the element exists (the timeout is only a maximum).",
   },
   {
     exts: ["kt", "kts"], name: "Kotlin",
@@ -621,15 +628,16 @@ async function reviewFeature(
 export type Candidate = Finding & { cid: string; group: number };
 
 const VERIFY_SYSTEM =
-  "You are a senior code reviewer who checks another reviewer's reports for mistakes. You judge ONE reported defect against the code and docs shown. Reply with the raw JSON object only — no markdown fences, no prose.";
+  "You are a senior code reviewer who checks another reviewer's reports for mistakes. You judge ONE reported defect against the code and docs shown: does the code at its place fail, and how? Reply with the raw JSON object only — no markdown fences, no prose.";
 
 /** The verifier's fixed instructions. They come first in the request, before the candidate and its
  * evidence, so every verify turn starts with the same text (a server that caches a shared prompt
  * prefix reuses it). The reply puts the trace before the verdict: a model without a thinking phase
  * decides as it writes, so it must follow the code before it commits to an answer. */
 export const VERIFY_RULES = [
-  "Your task: find out whether the reported defect is REAL. Most reported candidates are false: the reviewer misread the code, assumed another language's behaviour, missed a guard or a handler, or described a change this PR does not make. Look for the reason the report is wrong before you accept it.",
-  "Before you answer, check each of these against the evidence:",
+  "Your task: find out whether the code at the reported place fails, and how. The report is a hypothesis: its place is usually right, but its reason is often wrong (the reviewer misread the code, assumed another language's behaviour, missed a guard or a handler, or described a change this PR does not make). Judge the code, not the story: say what the cited code actually does, find a concrete input or condition, from the code and evidence shown, under which it gives a wrong result, and quote the failing line(s). If no input from the code shown makes it go wrong, the verdict is refuted (with blocking_code) or uncertain: never invent a defect.",
+  NO_MEMORY_RULE,
+  "Before you answer, check each of these against the evidence (they apply to the failure you find, not only to the reported one):",
   "1. Is the cited line changed by this PR? Read DIFF. A claim about what a line \"was\" or that it \"changed from\" something must match a '-' line there; if DIFF says the line is not changed, a defect said to be introduced there is refuted.",
   "2. Does the declared type or signature allow the failure? A non-throwing function or task cannot throw; a non-optional value cannot be nil; follow LANGUAGE_NOTES.",
   "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing. A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait.",
@@ -637,11 +645,11 @@ export const VERIFY_RULES = [
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
   "6. Does the failure depend on something the cited code does not control — what a caller passes (a null, an empty value, two inputs together), what a client sends, how the database or a library behaves, or what a config or registry list holds? Then it is real only if the evidence shows a path that supplies it: a caller, a route or a config entry. If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted. If no such path is shown, it is uncertain, never confirmed.",
   "Verdicts:",
-  "- refuted: something shown prevents or explains it (one of the checks above), or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
-  "- confirmed: you followed the failure scenario through the code shown, step by step, from the changed code to an observable failure, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE.",
+  "- refuted: something shown prevents or explains the reported failure (one of the checks above) and you found no other input that makes this code go wrong, or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
+  "- confirmed: you followed a concrete trigger through the code shown, step by step, from the changed code to a wrong result, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE. same_reason is true when that failure is the reported one; otherwise false, and title, failure and fix describe the defect you found.",
   "- uncertain: the deciding code is not shown, or you could not follow the scenario through the code. When in doubt, answer uncertain, never confirmed.",
   "Severity (confirmed only): P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
-  'Reply with ONLY this JSON, fields in this order: {"trace":"2-3 sentences: what the code shown does on the reported scenario, step by step","blocking_code":"for refuted: the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: the failing code, verbatim; else empty","severity":"P0"|"P1"|"P2"}',
+  'Reply with ONLY this JSON, fields in this order: {"trace":"2-3 sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","blocking_code":"for refuted: the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: the failing code, verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: 1-2 sentences, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}',
 ].join("\n");
 
 function gutter(path: string, lines: string[], from: number, to: number): string {
@@ -1098,7 +1106,8 @@ export function quoteInCode(quote: string, hay: string): boolean {
   });
 }
 
-type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity };
+/** A verdict. `sameReason` false: the verifier found a different defect at the place (its `title`, `failure`, `fix`). */
+type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity; sameReason?: boolean; title: string; failure: string; fix: string };
 
 function acceptVerdict(v: unknown): Verdict | null {
   const o = v as Record<string, unknown>;
@@ -1106,16 +1115,23 @@ function acceptVerdict(v: unknown): Verdict | null {
   const verdict = String(o.verdict ?? "").toLowerCase();
   if (verdict !== "confirmed" && verdict !== "refuted" && verdict !== "uncertain") return null;
   const sev = o.severity === "P0" || o.severity === "P1" || o.severity === "P2" ? o.severity : undefined;
+  const same = String(o.same_reason ?? "").toLowerCase();
   return {
     verdict,
     reason: clip(o.trace ?? o.reason, 300),
     quote: String(o.proof_quote ?? o.quote ?? "").slice(0, 1_500),
     counter: String(o.blocking_code ?? o.counter_quote ?? "").slice(0, 1_500),
     severity: sev,
+    sameReason: same === "true" ? true : same === "false" ? false : undefined,
+    title: clip(o.title, 160),
+    failure: clip(o.failure, 600),
+    fix: clip(o.fix, 400),
   };
 }
 
-export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string };
+/** The defect a confirming verifier found at the cited place when the reported reason was not it. */
+export type Reframe = { title: string; failure: string; rootCause: string; fix: string };
+export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string; reframe?: Reframe };
 
 /** Whether the candidate's OWN evidence quotes real code: the condition for posting an uncertain one. */
 function ownQuoteHolds(c: Candidate, sample: SamplePr, code: string): boolean {
@@ -1139,15 +1155,16 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     pack.shared,
     languageNotes([c.file]),
     pack.perFile,
-    `<<<CANDIDATE (a report to check; untrusted)>>>\n${candidate}\n<<<END>>>`,
+    `<<<CANDIDATE: REPORTED HYPOTHESIS (the place is usually right; the reason may be wrong; untrusted)>>>\n${candidate}\n<<<END>>>`,
     pack.specific,
-    "Check the candidate against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, severity).",
+    "Check the code at the reported place against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, same_reason, title, failure, fix, severity).",
   ].filter(Boolean).join("\n\n");
   const messages: Msg[] = [{ role: "system", content: VERIFY_SYSTEM }, { role: "user", content: user }];
   let severity = c.severity;
   let reason = "";
   let proof = "";
   let uncertain = "";
+  let reframe: Reframe | undefined;
   for (let i = 0; i < Math.max(1, votes); i += 1) {
     const { value } = await askJson(ctx, `verify[${c.cid}]#${i + 1}`, messages, i === 0 ? "strict" : "vote", acceptVerdict);
     if (!value) return { cid: c.cid, status: "unverified", reason: "the verifier returned no verdict", severity: c.severity };
@@ -1165,10 +1182,24 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
       uncertain ||= "the confirmation quoted no code from the evidence";
       continue;
     }
+    // The verifier's own reason meets the candidates' bar: a build or test outcome is one the authors'
+    // build and test gate already decided (isBuildOutcomeClaim).
+    if (isBuildOutcomeClaim({ title: value.title, failureScenario: value.failure, rootCause: "" })) {
+      uncertain ||= `the verifier's own failure is a build/test-outcome claim (${value.title || value.failure})`;
+      continue;
+    }
+    // A different reason found at the place must be stated, or the posted text would be the reporter's.
+    if (value.sameReason === false && !(value.title && value.failure && value.fix)) {
+      uncertain ||= "the verifier found a different reason but did not state it";
+      continue;
+    }
     // The verifier can lower a severity, never raise it.
     if (value.severity && SEVERITY_RANK[value.severity] > SEVERITY_RANK[severity]) severity = value.severity;
+    // The reason and its proof come from the first confirming vote.
+    if (proof) continue;
     reason = value.reason;
     proof = value.quote.trim();
+    if (value.sameReason === false) reframe = { title: value.title, failure: value.failure, rootCause: value.reason || value.failure, fix: value.fix };
   }
   if (uncertain) {
     // Not refuted and not proven: postable at P2 only when the candidate's own quote is real code and
@@ -1178,7 +1209,7 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
       ? { cid: c.cid, status: "uncertain", reason: uncertain, severity: "P2" }
       : { cid: c.cid, status: "refuted", reason: `uncertain and its own quote does not hold: ${uncertain}`, severity: c.severity };
   }
-  return { cid: c.cid, status: "confirmed", reason, severity, proof };
+  return { cid: c.cid, status: "confirmed", reason, severity, proof, ...(reframe ? { reframe } : {}) };
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1254,6 +1285,10 @@ function toRow(f: Finding): Record<string, unknown> {
   };
 }
 
+/** The test line of a reframed finding: the posted row needs one (poster.asFinding), and the reporter's
+ * test was for another reason. */
+const REFRAMED_TEST = "Cover the failure described above.";
+
 /** Files of a failed group retried alone, at most this many per review (each is one more turn). */
 export const MAX_SPLIT_RETRY_FILES = 8;
 
@@ -1271,6 +1306,8 @@ export type PipelineStats = {
   mapTurns: number; groups: number; lenses: number; minutes?: number; splitRetried: number; unreviewedFiles: string[]; failedGroups: number; candidates: number; gated: number; softGated: number;
   /** Candidates dropped before verification as build/test-outcome claims (isBuildOutcomeClaim). */
   buildClaims?: number;
+  /** Confirmations whose verifier found a different reason at the cited place (VerifyResult.reframe). */
+  reframed?: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
   stages?: Partial<Record<StageName, StageTotals>>;
 };
@@ -1295,7 +1332,7 @@ function stageBreakdown(stages: Partial<Record<StageName, StageTotals>>): string
 
 export function pipelineSummary(s: PipelineStats): string {
   const stages = s.stages ? stageBreakdown(s.stages) : "";
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.reframed ? ` (${s.reframed} reframed)` : ""}${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
 }
 
 /** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
@@ -1393,7 +1430,15 @@ async function refuteAndSelect(
     if (r.status === "confirmed") {
       stats.confirmed += 1;
       const evidence = r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
-      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true });
+      // The verifier found a different defect at this place: it is posted in the verifier's words, with
+      // its fix; the reporter's fix and test were for the other reason and are not posted.
+      const rf = r.reframe;
+      if (rf) {
+        stats.reframed = (stats.reframed ?? 0) + 1;
+        ctx.deps.log?.(`pipeline reframed ${c.file}:${c.line} (${c.title}) as: ${rf.title}`);
+      }
+      const told = rf ? { title: rf.title, failureScenario: rf.failure, rootCause: rf.rootCause, recommendedFix: rf.fix, recommendedTest: REFRAMED_TEST } : {};
+      survivors.push({ ...c, ...told, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true });
     } else if (r.status === "uncertain") {
       stats.uncertain += 1;
       survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true });
@@ -1576,7 +1621,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const ctx = makeCtx(settings, deps, t);
   const startedAt = Date.now();
   let lenses = lensesFor(settings.localPipelineLenses);
-  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
+  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, reframed: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
     const budget = featureBudget(settings, t);

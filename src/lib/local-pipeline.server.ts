@@ -38,8 +38,8 @@ import {
   type LocalReviewDeps,
   type LoopTuning,
 } from "./local-review-loop.server.ts";
-import { applyFindingGate, gateLiveSubmission } from "./poster.ts";
-import { unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
+import { applyFindingGate, FINDING_EVIDENCE_MAX_CHARS, gateLiveSubmission } from "./poster.ts";
+import { REPORTED_AS, unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
 import { isCodePath, orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, Finding, SamplePr, Severity } from "./types.ts";
 
@@ -450,6 +450,12 @@ const REVIEW_SYSTEM =
  * (one verifier turn per candidate, against the code), so candidate generation is a hunt: report every
  * defect you can tie to a changed line, with the line quoted; the verifier decides.
  */
+/** What a defect's reason may rest on, in the hunt and verify rules. On a Swift repo the local model found the
+ * right construct but gave a consequence from memory that was false ("waitForExistence blocks 13 s per
+ * page", "split expects a Character", "the test assertion fails", a misread PR description). */
+const NO_MEMORY_RULE =
+  "A reason may rest only on what the quoted code and evidence show: not on how a language, standard library, framework or OS behaves unless the evidence or LANGUAGE_NOTES show it, not on timings, counts or sizes the quoted code does not compute, and not on what the PR description says the code does.";
+
 export const HUNT_INSTRUCTIONS = [
   "You are Ashlar's defect hunter. For API output, return the JSON object directly.",
   REVIEW_OFFLINE_RULE,
@@ -460,6 +466,7 @@ export const HUNT_INSTRUCTIONS = [
   "For each finding: file is a changed file; line is a RIGHT-side changed line (or the nearest one); failure_scenario is a concrete input or sequence and what goes wrong; evidence quotes the code (path:line `code`) of the cause and of where it fails.",
   "Tie each finding to a line this diff changes and quote it: the '+' line that causes it, or, when the cause is code this diff removes (a deleted guard or check), the '-' line(s) together with the surviving line where it now fails (that line's RIGHT-side number is the finding's line). Never say what a line was or that it changed from something unless that '-' line is in the diff.",
   "In failure_scenario use concrete values or a concrete call order, and name the guard or handler you looked for and did not find. Use the semantics of the file's language (LANGUAGE_NOTES), not those of another language.",
+  `${NO_MEMORY_RULE} Write failure_scenario as "if <trigger>, <wrong result>".`,
   "Not findings (omit them): documentation or comments, naming, formatting, style or lint, log wording, hard-coded text or i18n, and advice to add tests.",
   "Intended behaviour the PR description or module docs (ashlar-policy.md) document is not a defect.",
   "coverage: leave it an empty array (Ashlar records coverage itself). If you find nothing, return findings:[] and list each changed file in investigated_safe with what you checked.",
@@ -486,7 +493,7 @@ export function lensesFor(n: number): LensName[] {
 const LANGUAGE_NOTES: { exts: string[]; name: string; note: string }[] = [
   {
     exts: ["swift"], name: "Swift",
-    note: "Swift: only a `throws` function or a `Task<_, Error>` can throw, and only at a `try`; `Task<_, Never>.value` never throws, and a cancelled task still runs to its end (cancellation is cooperative: `Task.isCancelled`, `CancellationError`). `try?` deliberately turns an error into nil. `defer` runs on every exit. Structs and enums are values (copied); classes and actors are references; actor and @MainActor code runs isolated. Optionals are checked with `if let` / `guard let` / `?.`; `!` force-unwraps.",
+    note: "Swift: only a `throws` function or a `Task<_, Error>` can throw, and only at a `try`; `Task<_, Never>.value` never throws, and a cancelled task still runs to its end (cancellation is cooperative: `Task.isCancelled`, `CancellationError`). `try?` turns any thrown error into nil, so the failure is silent. `defer` runs on every exit. Structs and enums are values (copied); classes and actors are references; actor and @MainActor code runs isolated. Optionals are checked with `if let` / `guard let` / `?.`; `!` force-unwraps. An out-of-range subscript or range traps at runtime; `!` on nil traps. A string literal such as `\"\\n\"` passed where a Character is expected is inferred as a Character (it compiles). `\"\\r\\n\"` is ONE Character, so splitting on `\"\\n\"` does not split CRLF text. XCTest `waitForExistence(timeout:)` returns as soon as the element exists (the timeout is only a maximum).",
   },
   {
     exts: ["kt", "kts"], name: "Kotlin",
@@ -621,15 +628,16 @@ async function reviewFeature(
 export type Candidate = Finding & { cid: string; group: number };
 
 const VERIFY_SYSTEM =
-  "You are a senior code reviewer who checks another reviewer's reports for mistakes. You judge ONE reported defect against the code and docs shown. Reply with the raw JSON object only — no markdown fences, no prose.";
+  "You are a senior code reviewer who checks another reviewer's reports for mistakes. You judge ONE reported defect against the code and docs shown: does the code at its place fail, and how? Reply with the raw JSON object only — no markdown fences, no prose.";
 
 /** The verifier's fixed instructions. They come first in the request, before the candidate and its
  * evidence, so every verify turn starts with the same text (a server that caches a shared prompt
  * prefix reuses it). The reply puts the trace before the verdict: a model without a thinking phase
  * decides as it writes, so it must follow the code before it commits to an answer. */
 export const VERIFY_RULES = [
-  "Your task: find out whether the reported defect is REAL. Most reported candidates are false: the reviewer misread the code, assumed another language's behaviour, missed a guard or a handler, or described a change this PR does not make. Look for the reason the report is wrong before you accept it.",
-  "Before you answer, check each of these against the evidence:",
+  "Your task: find out whether the code at the reported place fails, and how. The report is a hypothesis: its place is usually right, but its reason is often wrong (the reviewer misread the code, assumed another language's behaviour, missed a guard or a handler, or described a change this PR does not make). Judge the code, not the story: say what the cited code actually does, find a concrete input or condition, from the code and evidence shown, under which it gives a wrong result, and quote the failing line(s). If no input from the code shown makes it go wrong, the verdict is refuted (with blocking_code) or uncertain: never invent a defect.",
+  NO_MEMORY_RULE,
+  "Before you answer, check each of these against the evidence (they apply to the failure you find, not only to the reported one):",
   "1. Is the cited line changed by this PR? Read DIFF. A claim about what a line \"was\" or that it \"changed from\" something must match a '-' line there; if DIFF says the line is not changed, a defect said to be introduced there is refuted.",
   "2. Does the declared type or signature allow the failure? A non-throwing function or task cannot throw; a non-optional value cannot be nil; follow LANGUAGE_NOTES.",
   "3. Is the failure handled elsewhere: a guard, a catch, a caller, or a helper whose definition is shown? Read that definition before you assume it does nothing. A guard prevents the failure only if it runs on the failing path after the state it checks could change: a check made before an await, sleep or lock does not cover what happens during the wait.",
@@ -637,11 +645,11 @@ export const VERIFY_RULES = [
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
   "6. Does the failure depend on something the cited code does not control — what a caller passes (a null, an empty value, two inputs together), what a client sends, how the database or a library behaves, or what a config or registry list holds? Then it is real only if the evidence shows a path that supplies it: a caller, a route or a config entry. If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted. If no such path is shown, it is uncertain, never confirmed.",
   "Verdicts:",
-  "- refuted: something shown prevents or explains it (one of the checks above), or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
-  "- confirmed: you followed the failure scenario through the code shown, step by step, from the changed code to an observable failure, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE.",
+  "- refuted: something shown prevents or explains the reported failure (one of the checks above) and you found no other input that makes this code go wrong, or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
+  "- confirmed: you followed a concrete trigger through the code shown, step by step, from the changed code to a wrong result, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE. same_reason is true when that failure is the reported one; otherwise false, and title, failure and fix describe the defect you found.",
   "- uncertain: the deciding code is not shown, or you could not follow the scenario through the code. When in doubt, answer uncertain, never confirmed.",
   "Severity (confirmed only): P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
-  'Reply with ONLY this JSON, fields in this order: {"trace":"2-3 sentences: what the code shown does on the reported scenario, step by step","blocking_code":"for refuted: the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: the failing code, verbatim; else empty","severity":"P0"|"P1"|"P2"}',
+  'Reply with ONLY this JSON, fields in this order: {"trace":"2-3 sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","blocking_code":"for refuted: the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: the failing code, verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: 1-2 sentences, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}',
 ].join("\n");
 
 function gutter(path: string, lines: string[], from: number, to: number): string {
@@ -686,12 +694,28 @@ const CALL_STOP = new Set([
  * confirmed a claim that body refutes (WalkieBoard #570). */
 export function calledNames(code: string): string[] {
   const out = new Set<string>();
-  for (const m of code.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
+  // Comments are not calls (`// TODO: refresh() later`); literals stay, as a call in an interpolation
+  // (`${format(x)}`, `"\(format(x))"`) is one.
+  for (const m of nonCode(code, true).matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
     const name = m[1] ?? m[2] ?? "";
     if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name)) continue;
     out.add(name);
   }
   return [...out];
+}
+
+/** The type qualifiers of each qualified call in `code`: `Hub.lines(` gives lines → [Hub], several in the
+ * order the calls appear. Only a capitalised qualifier (a type, not an instance such as `store.save(`)
+ * counts, and only in code: `// Legacy.lines() used to run here` or a string naming it is no call (codeOnly).
+ * calledNames keeps the bare name; findDefinition then prefers the declaration inside that type (scopedDefinition). */
+export function callQualifiers(code: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const m of nonCode(code).matchAll(/(?<![\w$])([A-Z][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const quals = out.get(m[2]) ?? [];
+    if (!quals.includes(m[1])) quals.push(m[1]);
+    out.set(m[2], quals);
+  }
+  return out;
 }
 
 /** Swift and Kotlin declare every function and initializer with a keyword (func, fun, init): there a
@@ -715,15 +739,135 @@ const DECL_HEADER_RE = (name: string) =>
 const DECL_RE = (name: string, path: string) =>
   TRAILING_CLOSURE_RE.test(path) ? DECL_KEYWORD_RE(name) : new RegExp(`${DECL_KEYWORD_RE(name).source}|${DECL_HEADER_RE(name).source}`);
 
+/** The headers of a type body that can hold a qualified call's callee, per language: Swift types and
+ * extensions, Kotlin classes, objects and interfaces, TypeScript/JavaScript classes and namespaces. */
+const SCOPE_HEADER_RE = (qualifier: string, path: string) =>
+  /\.swift$/.test(path)
+    ? new RegExp(`\\b(?:enum|struct|class|actor|protocol|extension)\\s+${qualifier}(?![\\w$.])`)
+    : /\.(?:kt|kts)$/.test(path)
+      ? new RegExp(`\\b(?:class|object|interface)\\s+${qualifier}(?![\\w$.])`)
+      : /\.(?:[cm]?[jt]sx?)$/.test(path)
+        ? new RegExp(`\\b(?:class|namespace)\\s+${qualifier}(?![\\w$.])`)
+        : null;
+
+/** `line` with its comments and string and character literals blanked, so a brace or a type header in
+ * one is not code. `state` carries a `/* … *\/` comment and a `"""` string (Swift, Kotlin) across lines;
+ * a literal ends on its line, and a quote not closed on its line is code (`Don't` in JSX text, `/["']/`, a
+ * template literal over several lines). A `//` or `/*` after a backslash is in a regex (`/\/*$/`). With
+ * `keepLiterals` only the comments are blanked; literals are copied as they are. */
+function codeOnly(line: string, state: { block: boolean; triple: boolean }, keepLiterals = false): string {
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    if (state.block) {
+      const end = line.indexOf("*/", i);
+      if (end < 0) return out;
+      state.block = false;
+      i = end + 2;
+      out += " ";
+    } else if (state.triple) {
+      const end = line.indexOf('"""', i);
+      if (end < 0) return keepLiterals ? out + line.slice(i) : out;
+      state.triple = false;
+      out += keepLiterals ? line.slice(i, end + 3) : " ";
+      i = end + 3;
+    } else if (line.startsWith("//", i) && line[i - 1] !== "\\") {
+      return out;
+    } else if (line.startsWith("/*", i) && line[i - 1] !== "\\") {
+      state.block = true;
+      i += 2;
+    } else if (line.startsWith('"""', i)) {
+      state.triple = true;
+      if (keepLiterals) out += '"""';
+      i += 3;
+    } else if (line[i] === '"' || line[i] === "'" || line[i] === "`") {
+      const quote = line[i];
+      let j = i + 1;
+      while (j < line.length && line[j] !== quote) j += line[j] === "\\" ? 2 : 1;
+      if (j >= line.length) {
+        // No closing quote on the line: an apostrophe in JSX text, a quote in a regex, a template literal
+        // that runs over lines. The quote is read as code.
+        out += quote;
+        i += 1;
+        continue;
+      }
+      out += keepLiterals ? line.slice(i, j + 1) : " ";
+      i = j + 1;
+    } else {
+      out += line[i];
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/** `code` read line by line with codeOnly: its comments blanked, and its literals too unless `keepLiterals`. */
+function nonCode(code: string, keepLiterals = false): string {
+  const state = { block: false, triple: false };
+  return code.split("\n").map((l) => codeOnly(l, state, keepLiterals)).join("\n");
+}
+
+/** Where `name` is declared inside the body of a type or extension called `qualifier` (or, in Kotlin, as
+ * an extension function `fun Qualifier.name(`), searched in `all`'s order. The body is approximate: from
+ * the header line (its `{` on that line or opening the next non-blank one) to where the brace depth returns
+ * to zero, read without comments and string or character literals (codeOnly). A member declared in the
+ * body itself wins over one in a type nested inside it (`enum Hub { struct Reader { func lines` is
+ * Reader's); the nested one is the answer only when no body declares `name` itself. One pass over each file. */
+function scopedDefinition(all: [string, string[]][], name: string, qualifier: string): [string, number] | null {
+  const q = qualifier.replace(/[$]/g, "\\$");
+  const keyword = DECL_KEYWORD_RE(name);
+  const header = DECL_HEADER_RE(name);
+  const ktExtension = new RegExp(`\\bfun\\s+(?:<[^>]*>\\s*)?${q}\\s*\\.\\s*${name}\\b`);
+  let nested: [string, number] | null = null;
+  for (const [path, lines] of all) {
+    const scope = SCOPE_HEADER_RE(q, path);
+    if (!scope) continue;
+    const closures = TRAILING_CLOSURE_RE.test(path);
+    const kotlin = /\.(?:kt|kts)$/.test(path);
+    const state = { block: false, triple: false };
+    // depth > 0: inside a body; pending: a header seen whose body has not opened yet.
+    let depth = 0;
+    let pending = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = codeOnly(lines[i], state);
+      if (kotlin && ktExtension.test(line)) return [path, i];
+      let from = 0;
+      if (depth === 0) {
+        const m = scope.exec(line);
+        if (m) { pending = true; from = m.index + m[0].length; }
+        else if (pending && line.trim() && !line.trim().startsWith("{")) pending = false;
+        if (!pending) continue;
+      }
+      const at = depth;
+      for (const ch of line.slice(from)) {
+        if (ch === "{") { depth += 1; pending = false; }
+        else if (ch === "}" && depth > 0) depth -= 1;
+      }
+      if ((at > 0 || depth > 0) && (keyword.test(line) || (!closures && header.test(line)))) {
+        // at 0: the header line itself; at 1: the body's own member; deeper: a nested type's (or a local) one.
+        if (at <= 1) return [path, i];
+        nested ??= [path, i];
+      }
+    }
+  }
+  return nested;
+}
+
 /** Where `name` is declared among `files`: the first declaration proper in any file (within a file a
  * keyword declaration or binding before a header-only match), else (only when no file declares it) the
  * first looser DEF_RE match outside Swift/Kotlin (a multi-line signature, a class-property arrow; there an
  * indented `VStack(` is a call). Within each pass the `prefer` paths are searched first, in order (see
- * definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based line] or null. */
-function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
+ * definitionOrder), so a same-named function in an unrelated module loses. Before all that, a name called
+ * qualified by a type (`Hub.lines(`, `qualifiers` from callQualifiers) is looked up inside that type's body
+ * (scopedDefinition): another type's same-named function is not what it calls. [path, 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = [], qualifiers: string[] = []): [string, number] | null {
   const n = name.replace(/[$]/g, "\\$");
   const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
   const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
+  for (const q of qualifiers) {
+    const scoped = scopedDefinition(all, n, q);
+    if (scoped) return scoped;
+  }
   const keyword = DECL_KEYWORD_RE(n);
   const header = DECL_HEADER_RE(n);
   for (const [path, lines] of all) {
@@ -804,6 +948,7 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     .map((f) => [f.path, f.content.split("\n")]);
   const content = new Map(sample.files.map((f) => [f.path, f.content]));
   const callsIn = addedIn.map(calledNames);
+  const qualifiers = callQualifiers(added);
   const ownLines = files.map((p) => [p, (content.get(p) ?? "").split("\n")] as const);
   const blocks: string[] = [];
   const shown: [string, number, number][] = [];
@@ -817,7 +962,7 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     if (ownLines.some(([p, lines]) => lines.some((l) => ownDecl.test(l) || (!TRAILING_CLOSURE_RE.test(p) && ownHeader.test(l))))) continue;
     // The feature file whose added lines call it: its own imports decide between same-named definitions.
     const caller = files[callsIn.findIndex((c) => c.includes(name))];
-    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : [], qualifiers.get(name));
     if (!found) continue;
     const [path, i] = found;
     const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
@@ -937,9 +1082,10 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
     ...[...f.evidence.matchAll(/`([^`]+)`/g)].map((m) => m[1]),
   ].join("\n");
   const prefer = definitionOrder(f.file, fileLines.join("\n"));
+  const qualifiers = callQualifiers(citedCode);
   for (const name of calledNames(citedCode).slice(0, 8)) {
     if (defs >= 6) break;
-    const found = findDefinition(corpus, name, prefer);
+    const found = findDefinition(corpus, name, prefer, qualifiers.get(name));
     if (found) { addCode(found[0], found[1] + 1, 3, 15); defs += 1; }
   }
   // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
@@ -1028,7 +1174,8 @@ export function quoteInCode(quote: string, hay: string): boolean {
   });
 }
 
-type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity };
+/** A verdict. `sameReason` false: the verifier found a different defect at the place (its `title`, `failure`, `fix`). */
+type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity; sameReason?: boolean; title: string; failure: string; fix: string };
 
 function acceptVerdict(v: unknown): Verdict | null {
   const o = v as Record<string, unknown>;
@@ -1036,16 +1183,24 @@ function acceptVerdict(v: unknown): Verdict | null {
   const verdict = String(o.verdict ?? "").toLowerCase();
   if (verdict !== "confirmed" && verdict !== "refuted" && verdict !== "uncertain") return null;
   const sev = o.severity === "P0" || o.severity === "P1" || o.severity === "P2" ? o.severity : undefined;
+  // A model writes the flag as a boolean, a 0/1 number or a word ("no", "False ").
+  const same = String(o.same_reason ?? "").trim();
   return {
     verdict,
     reason: clip(o.trace ?? o.reason, 300),
     quote: String(o.proof_quote ?? o.quote ?? "").slice(0, 1_500),
     counter: String(o.blocking_code ?? o.counter_quote ?? "").slice(0, 1_500),
     severity: sev,
+    sameReason: /^(?:true|yes|1)$/i.test(same) ? true : /^(?:false|no|0)$/i.test(same) ? false : undefined,
+    title: clip(o.title, 160),
+    failure: clip(o.failure, 600),
+    fix: clip(o.fix, 400),
   };
 }
 
-export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string };
+/** The defect a confirming verifier found at the cited place when the reported reason was not it. */
+export type Reframe = { title: string; failure: string; rootCause: string; fix: string };
+export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string; reframe?: Reframe };
 
 /** Whether the candidate's OWN evidence quotes real code: the condition for posting an uncertain one. */
 function ownQuoteHolds(c: Candidate, sample: SamplePr, code: string): boolean {
@@ -1054,6 +1209,9 @@ function ownQuoteHolds(c: Candidate, sample: SamplePr, code: string): boolean {
   const head = [code, ...sample.files.filter((f) => f.path === c.file).map((f) => f.content)].join("\n");
   return quotes.some((q) => quoteInCode(q, head));
 }
+
+/** How far from the cited line a different reason's proof may be (verifyCandidate). */
+const REFRAME_PROOF_LINES = 30;
 
 async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Map<string, MapEntry>, votes: number): Promise<VerifyResult> {
   const pack = evidencePack(sample, c, map, Math.floor(ctx.promptChars * 0.8));
@@ -1069,15 +1227,16 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     pack.shared,
     languageNotes([c.file]),
     pack.perFile,
-    `<<<CANDIDATE (a report to check; untrusted)>>>\n${candidate}\n<<<END>>>`,
+    `<<<CANDIDATE: REPORTED HYPOTHESIS (the place is usually right; the reason may be wrong; untrusted)>>>\n${candidate}\n<<<END>>>`,
     pack.specific,
-    "Check the candidate against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, severity).",
+    "Check the code at the reported place against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, same_reason, title, failure, fix, severity).",
   ].filter(Boolean).join("\n\n");
   const messages: Msg[] = [{ role: "system", content: VERIFY_SYSTEM }, { role: "user", content: user }];
-  let severity = c.severity;
-  let reason = "";
-  let proof = "";
+  // The cited file's head lines: a different reason's proof must be at the cited place (±REFRAME_PROOF_LINES).
+  const citedLines = (sample.files.find((f) => f.path === c.file) ?? sample.referenceFiles?.find((f) => f.path === c.file))?.content.split("\n") ?? [];
+  const nearCited = (quote: string) => quoteInCode(quote, citedLines.slice(Math.max(0, c.line - 1 - REFRAME_PROOF_LINES), c.line + REFRAME_PROOF_LINES).join("\n"));
   let uncertain = "";
+  const agreeing: Verdict[] = [];
   for (let i = 0; i < Math.max(1, votes); i += 1) {
     const { value } = await askJson(ctx, `verify[${c.cid}]#${i + 1}`, messages, i === 0 ? "strict" : "vote", acceptVerdict);
     if (!value) return { cid: c.cid, status: "unverified", reason: "the verifier returned no verdict", severity: c.severity };
@@ -1095,11 +1254,36 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
       uncertain ||= "the confirmation quoted no code from the evidence";
       continue;
     }
-    // The verifier can lower a severity, never raise it.
-    if (value.severity && SEVERITY_RANK[value.severity] > SEVERITY_RANK[severity]) severity = value.severity;
-    reason = value.reason;
-    proof = value.quote.trim();
+    // The verifier's own different reason meets the candidates' bar: a build or test outcome is one the
+    // authors' build and test gate already decided (isBuildOutcomeClaim, local_review.pipeline_drop_build_claims).
+    // With same_reason true the reporter's claim already passed (or skipped) that gate.
+    if (value.sameReason === false && ctx.settings.localPipelineDropBuildClaims !== false && isBuildOutcomeClaim({ title: value.title, failureScenario: value.failure, rootCause: "" })) {
+      uncertain ||= `the verifier's own failure is a build/test-outcome claim (${value.title || value.failure})`;
+      continue;
+    }
+    // A different reason found at the place must be stated, or the posted text would be the reporter's.
+    if (value.sameReason === false && !(value.title && value.failure && value.fix)) {
+      uncertain ||= "the verifier found a different reason but did not state it";
+      continue;
+    }
+    // A different reason is posted on the cited line: its proof must be there, not in another file.
+    if (value.sameReason === false && !nearCited(value.quote)) {
+      uncertain ||= `the different reason's proof is not within ${REFRAME_PROOF_LINES} lines of ${c.file}:${c.line}`;
+      continue;
+    }
+    agreeing.push(value);
   }
+  // With several votes every confirmation must be for the same defect: all the reported reason, or all one
+  // different reason (similar titles). Votes that disagree prove neither.
+  const reframes = agreeing.filter((v) => v.sameReason === false);
+  if (!uncertain && reframes.length && (reframes.length < agreeing.length || reframes.some((v) => titleJaccard(v.title, reframes[0].title) < 0.4))) {
+    uncertain = "the verify votes confirmed different defects";
+  }
+  // The verifier can lower a severity, never raise it.
+  let severity = c.severity;
+  for (const v of agreeing) if (v.severity && SEVERITY_RANK[v.severity] > SEVERITY_RANK[severity]) severity = v.severity;
+  // The reason and its proof come from the first confirming vote.
+  const first = agreeing[0];
   if (uncertain) {
     // Not refuted and not proven: postable at P2 only when the candidate's own quote is real code and
     // Settings keep uncertain candidates (local_review.pipeline_keep_uncertain).
@@ -1108,7 +1292,8 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
       ? { cid: c.cid, status: "uncertain", reason: uncertain, severity: "P2" }
       : { cid: c.cid, status: "refuted", reason: `uncertain and its own quote does not hold: ${uncertain}`, severity: c.severity };
   }
-  return { cid: c.cid, status: "confirmed", reason, severity, proof };
+  const reframe: Reframe | undefined = first.sameReason === false ? { title: first.title, failure: first.failure, rootCause: first.reason || first.failure, fix: first.fix } : undefined;
+  return { cid: c.cid, status: "confirmed", reason: first.reason, severity, proof: first.quote.trim(), ...(reframe ? { reframe } : {}) };
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1184,6 +1369,10 @@ function toRow(f: Finding): Record<string, unknown> {
   };
 }
 
+/** The test line of a reframed finding: the posted row needs one (poster.asFinding), and the reporter's
+ * test was for another reason. */
+const REFRAMED_TEST = "Cover the failure described above.";
+
 /** Files of a failed group retried alone, at most this many per review (each is one more turn). */
 export const MAX_SPLIT_RETRY_FILES = 8;
 
@@ -1199,6 +1388,10 @@ const failedNote = (s: Pick<PipelineStats, "failedGroups" | "splitRetried" | "un
 
 export type PipelineStats = {
   mapTurns: number; groups: number; lenses: number; minutes?: number; splitRetried: number; unreviewedFiles: string[]; failedGroups: number; candidates: number; gated: number; softGated: number;
+  /** Candidates dropped before verification as build/test-outcome claims (isBuildOutcomeClaim). */
+  buildClaims?: number;
+  /** Confirmations whose verifier found a different reason at the cited place (VerifyResult.reframe). */
+  reframed?: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
   stages?: Partial<Record<StageName, StageTotals>>;
 };
@@ -1223,7 +1416,7 @@ function stageBreakdown(stages: Partial<Record<StageName, StageTotals>>): string
 
 export function pipelineSummary(s: PipelineStats): string {
   const stages = s.stages ? stageBreakdown(s.stages) : "";
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.reframed ? ` (${s.reframed} reframed)` : ""}${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
 }
 
 /** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
@@ -1282,6 +1475,23 @@ function verifyOrder<T extends Pick<Finding, "file">>(rows: T[]): T[] {
   return [...new Set(rows.map((r) => r.file))].flatMap((file) => rows.filter((r) => r.file === file));
 }
 
+/** A reframed finding's evidence: the reporter's `code` quotes that appear verbatim in the cited file, each
+ * as a `path:line \`code\`` line, then the verifier's proof. The reporter's prose argued for the defect the
+ * verifier rejected, so it is not posted next to the verifier's one. */
+function reframedEvidence(sample: SamplePr, c: Candidate, proof: string): string {
+  const lines = (sample.files.find((f) => f.path === c.file) ?? sample.referenceFiles?.find((f) => f.path === c.file))?.content.split("\n") ?? [];
+  const kept = new Set<string>();
+  for (const m of c.evidence.matchAll(/`([^`\n]+)`/g)) {
+    const q = m[1].trim();
+    if (q.replace(/[^\w]/g, "").length < 8 || proof.includes(q)) continue;
+    // The line of the file holding it, the one nearest the cited line when several do.
+    let at = -1;
+    lines.forEach((l, i) => { if (l.includes(q) && (at < 0 || Math.abs(i + 1 - c.line) < Math.abs(at + 1 - c.line))) at = i; });
+    if (at >= 0) kept.add(`${c.file}:${at + 1} \`${q}\``);
+  }
+  return [...kept, `Verified against the code: \`${proof.replace(/`/g, "'").slice(0, 400)}\``].join("\n");
+}
+
 /** Stages 3 and 4 over the candidates: each verified, the survivors ranked and capped. `verifiedKeys` are
  * the posted findings the verifier confirmed (or left uncertain with a real own quote): the downstream
  * gate does not re-judge their hedges and evidence (finding-gate verifiedKey). */
@@ -1320,8 +1530,23 @@ async function refuteAndSelect(
     const r = results.get(c.cid) as VerifyResult;
     if (r.status === "confirmed") {
       stats.confirmed += 1;
-      const evidence = r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
-      survivors.push({ ...c, severity: r.severity, evidence: evidence.slice(0, 2_000), verifyReason: r.reason, verified: true });
+      // The verifier found a different defect at this place: it is posted in the verifier's words, with
+      // its fix and proof; the reporter's fix, test and evidence prose were for the other reason and are not posted.
+      const rf = r.reframe;
+      const evidence = rf
+        ? reframedEvidence(sample, c, r.proof ?? "")
+        : r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
+      if (rf) {
+        stats.reframed = (stats.reframed ?? 0) + 1;
+        ctx.deps.log?.(`pipeline reframed ${c.file}:${c.line} (${c.title}) as: ${rf.title}`);
+      }
+      const told = rf ? { title: rf.title, failureScenario: rf.failure, rootCause: rf.rootCause, recommendedFix: rf.fix, recommendedTest: REFRAMED_TEST } : {};
+      // A reframed finding keeps the reporter's title in its evidence: the next push's reporter states the
+      // same defect in its own words again, and the prior-findings dedupe matches it there (findPriorDuplicate).
+      const reported = rf ? `\n${REPORTED_AS}${c.title.replace(/`/g, "'").replace(/\s+/g, " ").slice(0, 160)}` : "";
+      // Cut to what the posted finding keeps (poster.asFinding), so the "Reported as:" line is never cut off.
+      const cap = rf ? FINDING_EVIDENCE_MAX_CHARS : 2_000;
+      survivors.push({ ...c, ...told, severity: r.severity, evidence: evidence.slice(0, cap - reported.length) + reported, verifyReason: r.reason, verified: true });
     } else if (r.status === "uncertain") {
       stats.uncertain += 1;
       survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true });
@@ -1361,6 +1586,66 @@ const GATE_ROWS = 8;
 /** Gate drops the refute stage decides instead: it reads the code for each candidate, so a hedge word or
  * a quote the gate could not match is a question for it, not a reason to drop the candidate unread. */
 const SOFT_DROPS = new Set(["speculative", "evidence_unverified", "evidence_unavailable"]);
+
+/** Wording a runtime defect shares with a build or test claim ("a type mismatch when decoding the
+ * response", "the assertion fails and crashes the app"): such text is not a build/test-outcome claim. */
+const RUNTIME_WORDS = /\b(?:run[- ]?time|crash\w*|rais(?:e|es|ed|ing)|throw\w*|thrown|exceptions?|traceback|panic\w*|trap\w*|abort\w*|terminat\w*|fatal|5\d\d|decod\w*|deserializ\w*|pars(?:e|es|ed|ing)|json|payload|response)\b/i;
+/** A test outcome that a passing run cannot disprove: a flaky or order-dependent test is a real defect. */
+const FLAKY_WORDS = /\b(?:flak\w*|intermittent\w*|sometimes|random\w*|race|racy|timing|order[- ]dependent|non-?deterministic\w*)\b/i;
+/** A build or test outcome as the trigger of a runtime defect, not the claim itself ("If the Docker build
+ * fails, deploy.sh still pushes the previous image", "when a health test fails the pod is not restarted"):
+ * the hunt asks for "if <trigger>, <wrong result>". The build/test word is the subject, at most two words
+ * after the trigger word: "After this change the build fails" and "When run on CI the tests fail" are claims.
+ * Removed before the patterns are matched. */
+const CONDITIONAL_TRIGGER = /\b(?:if|when|unless)\s+(?:[\w'’]+(?:\s+|-)){0,2}?(?:build\w*|compil\w*|tests?)\b[^,.;:!?\n]{0,30}?\bfail(?:s|ed|ing|ure)?\b/gi;
+/** Compile, build or type-check wording, which a static "type error" / "type mismatch" needs nearby. */
+const STATIC_CHECK = "(?:compil\\w*|build(?:s|ing)?|type[- ]?check\\w*)";
+/**
+ * Claims that the change does not build or that a test fails (local_review.pipeline_drop_build_claims). The
+ * authors run a build and test gate before review, so such a claim is noise the build already disproved:
+ * on a Swift repo three of five wrong local reasons were "Compile error: String.split expects a Character",
+ * "Compilation fails: lines takes 2 arguments" (another type's same-named function) and "Running the test
+ * causes the assertion to fail" — it built and the test passed. Matched against the title, failure scenario
+ * and root cause. Kept conservative: `TypeError` (one word, a Python/JS runtime crash) never matches, and a
+ * pattern with `unless` does not count when the text also has that runtime or flaky-test wording.
+ */
+const BUILD_CLAIM_PATTERNS: { claim: RegExp; unless?: RegExp }[] = [
+  // compile error, compilation fails, compiler error, compile-time error, compilation failure
+  { claim: /\bcompil(?:e|es|ing|ation|er)(?:[- ]time)?\s+(?:errors?|fail\w*|breaks?)\b/i },
+  // does not compile, won't build, fails to compile, no longer type-checks
+  { claim: /\b(?:(?:does|do|will|would|could)(?:\s+not|n['’]?t)|won['’]?t|can(?:not|['’]t)|no\s+longer|fail(?:s|ed)?\s+to|refuses?\s+to)\s+(?:compile|build|type-?check)\b/i },
+  // build fails, build failure, build error, breaks the build, the build is broken; linker error
+  { claim: /\bbuild\s+(?:will\s+|would\s+)?(?:fail\w*|breaks?|broke|errors?)\b|\bbreaks?\s+the\s+build\b|\bbuild\s+(?:is|was)\s+broken\b|\blinker\s+errors?\b/i },
+  // the compiler rejects, error TS2345, Swift "Cannot convert value of type"
+  { claim: /\bcompiler\s+(?:will\s+|would\s+)?rejects?\b|\berror\s+TS\d{4}\b|\bcannot\s+convert\s+value\s+of\s+type\b/i },
+  // fails type checking; Kotlin's "Unresolved reference: foo" (with its colon). Not "fails the type check for
+  // legacy rows, so every request returns 403" or "an unresolved reference, so the validator rejects" (runtime).
+  { claim: /\bfails?\s+type[- ]?checking\b/i, unless: RUNTIME_WORDS },
+  { claim: /\bUnresolved reference:/, unless: RUNTIME_WORDS },
+  // type error, type mismatch with compile/build/type-check wording nearby ("type mismatch compile error");
+  // alone it is as often a runtime defect (a str key that never matches an int one)
+  { claim: new RegExp(`\\btype\\s+(?:errors?|mismatch(?:es)?)\\b[^\\n]{0,40}?\\b${STATIC_CHECK}\\b|\\b${STATIC_CHECK}\\b[^\\n]{0,40}?\\btype\\s+(?:errors?|mismatch(?:es)?)\\b`, "i"), unless: RUNTIME_WORDS },
+  // testLogin will fail, OrderServiceTest would fail (a test named by its name)
+  { claim: /\b(?:test[A-Z0-9_]\w*|\w+Tests?)\s+(?:will|would)\s+fail\b/, unless: FLAKY_WORDS },
+  // test fails, tests will fail, causes the test to fail, failing test (not "fails to detect")
+  { claim: /\btests?\s+(?:case\s+|suite\s+)?(?:to\s+|will\s+|would\s+|now\s+)?(?:fail(?:s|ed|ing)?|breaks?|broke)\b(?!\s+to\b)|\bfailing\s+tests?\b/i, unless: FLAKY_WORDS },
+  // assertion fails, causes the assertion to fail, assertion failure (not an assert that crashes the app)
+  { claim: /\bassert(?:ion)?s?\s+(?:to\s+|will\s+|would\s+)?(?:fail(?:s|ed|ing|ure)?|trips?)\b(?!\s+to\b)/i, unless: new RegExp(`${RUNTIME_WORDS.source}|${FLAKY_WORDS.source}`, "i") },
+  // XCTAssertEqual fails, XCTAssertTrue(x) would fail
+  { claim: /\bXCTAssert\w*\b[^\n]{0,80}?\bfail(?:s|ed|ing|ure)?\b/i, unless: FLAKY_WORDS },
+];
+
+/** Whether a candidate's claimed failure is a build or test outcome (BUILD_CLAIM_PATTERNS). When the
+ * failure scenario or root cause uses a build or test failure as its trigger (CONDITIONAL_TRIGGER), the
+ * title's build/test wording names that same trigger ("Build failure still deploys the previous image"):
+ * the title then decides nothing, and the claim must be in the scenario or root cause outside the trigger. */
+export function isBuildOutcomeClaim(f: Pick<Finding, "title" | "failureScenario" | "rootCause">): boolean {
+  const text = [f.title, f.failureScenario, f.rootCause].join("\n");
+  const body = [f.failureScenario, f.rootCause].join("\n");
+  const bodyClaimed = body.replace(CONDITIONAL_TRIGGER, " ");
+  const claimed = bodyClaimed !== body ? bodyClaimed : text.replace(CONDITIONAL_TRIGGER, " ");
+  return BUILD_CLAIM_PATTERNS.some(({ claim, unless }) => claim.test(claimed) && !(unless && unless.test(text)));
+}
 
 /**
  * One review JSON's findings as candidates. The finding gate's hard drops (already reported, self-
@@ -1467,7 +1752,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const ctx = makeCtx(settings, deps, t);
   const startedAt = Date.now();
   let lenses = lensesFor(settings.localPipelineLenses);
-  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
+  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, reframed: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
     const budget = featureBudget(settings, t);
@@ -1554,7 +1839,17 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
       const unparsedText = evidence.length ? evidence.join("\n\n---\n\n") : undefined;
       return { ok: false, error: `local pipeline produced no review JSON (${groups.length} feature group(s) failed)`, ...(unparsedText ? { unparsedText } : {}) };
     }
-    const unique = dedupeCandidates(candidates);
+    // A claim that the change does not build or that a test fails is one the authors' build and test gate
+    // already disproved (local_review.pipeline_drop_build_claims): dropped before it costs a verify turn,
+    // and before the dedupe, so it never stands in for a runtime defect reported on the same line.
+    const dropBuildClaims = settings.localPipelineDropBuildClaims !== false;
+    const claims = candidates.filter((c) => {
+      if (!dropBuildClaims || !isBuildOutcomeClaim(c)) return true;
+      stats.buildClaims = (stats.buildClaims ?? 0) + 1;
+      deps.log?.(`pipeline dropped a build/test-outcome claim ${c.file}:${c.line} (${c.title})`);
+      return false;
+    });
+    const unique = dedupeCandidates(claims);
     stats.gated = unique.length;
     const { findings, assumptions: verifyNotes, verifiedKeys } = await refuteAndSelect(ctx, sample, unique, map, stats);
     stats.turns = ctx.turns;

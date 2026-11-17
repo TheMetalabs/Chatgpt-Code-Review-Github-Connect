@@ -214,6 +214,10 @@ export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], 
   };
 }
 
+/** The longest evidence a posted finding keeps (asFinding). A reframed local finding's evidence ends with its
+ * "Reported as:" line, so the pipeline fits its evidence to this cap (local-pipeline refuteAndSelect). */
+export const FINDING_EVIDENCE_MAX_CHARS = 800;
+
 /** One reviewer JSON finding row as a Finding (snake_case or camelCase keys), or null when a required
  * field is missing. Exported for the offline precision eval (scripts/eval-finding-precision.mjs). */
 export function asFinding(row: unknown, i: number): Finding | null {
@@ -242,7 +246,7 @@ export function asFinding(row: unknown, i: number): Finding | null {
     title: title.slice(0, 160),
     failureScenario: failureScenario.slice(0, 800),
     rootCause: rootCause.slice(0, 800),
-    evidence: evidence.slice(0, 800),
+    evidence: evidence.slice(0, FINDING_EVIDENCE_MAX_CHARS),
     recommendedFix: recommendedFix.slice(0, 800),
     recommendedTest: recommendedTest.slice(0, 400),
   };

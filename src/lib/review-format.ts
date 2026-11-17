@@ -277,8 +277,11 @@ function cleanBody(job: SummaryJob, p: SummaryParts): string {
 function unanchoredBlock(unanchored: Finding[]): string {
   if (!unanchored.length) return "";
   const rows = unanchored.map((f) => {
-    const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
-      .map((s) => s.trim())
+    // The evidence stays on one line: the prior-findings parser reads it (and its "Reported as:" title) from
+    // the line it starts on. In the other fields each line break becomes a continuation line of the list item
+    // (a blank line would end the row), so a fenced fix keeps its lines and renders inside the item.
+    const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence.trim().replace(/\s*\n\s*/g, " ")}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
+      .map((s) => s.trim().replace(/[ \t]*\n(?:[ \t]*\n)*/g, "\n  "))
       .filter(Boolean)
       .join(" — "));
     return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;

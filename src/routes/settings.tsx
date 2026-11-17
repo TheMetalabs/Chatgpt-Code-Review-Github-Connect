@@ -153,6 +153,7 @@ export function Settings() {
     saved.localPipelineVerifyVotes,
     saved.localPipelineLenses,
     saved.localPipelineKeepUncertain,
+    saved.localPipelineDropBuildClaims,
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
@@ -350,6 +351,17 @@ export function Settings() {
             Candidate passes (lenses) look at failure paths, data invariants and contracts; every candidate is then
             checked by its own verifier turn. A candidate the verifier neither proves nor refutes with a quote is posted
             at P2 when this is on.
+          </p>
+        </Field>
+        <Field label="local_review.pipeline_drop_build_claims">
+          <Toggle
+            label="drop a candidate that claims a build or test failure before it is verified"
+            checked={draft.localPipelineDropBuildClaims}
+            onChange={(v) => patch({ localPipelineDropBuildClaims: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            A candidate whose failure is a compile error, a type error or a failing test or assertion is noise when the
+            authors run a build and test gate before review. Turn this off for a repository without one.
           </p>
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -613,6 +625,7 @@ review:
   local_pipeline_verify_votes: ${draft.localPipelineVerifyVotes}
   local_pipeline_lenses: ${draft.localPipelineLenses}
   local_pipeline_keep_uncertain: ${draft.localPipelineKeepUncertain}
+  local_pipeline_drop_build_claims: ${draft.localPipelineDropBuildClaims}
   chatgpt_reasoning: ${draft.chatgptReasoning}
   grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]

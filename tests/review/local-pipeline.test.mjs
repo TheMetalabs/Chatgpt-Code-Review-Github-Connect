@@ -25,11 +25,15 @@ import {
   calleeDefinitions,
   isSmallReview,
   SMALL_REVIEW_MAX_FILES,
+  isBuildOutcomeClaim,
+  callQualifiers,
 } from "../../src/lib/local-pipeline.server.ts";
+import { collectPriorFindings, isPriorDuplicate } from "../../src/lib/prior-findings.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
-import { gateLiveSubmission } from "../../src/lib/poster.ts";
+import { asFinding, gateLiveSubmission } from "../../src/lib/poster.ts";
+import { inlineFindingComment } from "../../src/lib/review-format.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
 
 // One lens pass per feature unless a test is about lenses (it sets localPipelineLenses itself).
@@ -566,7 +570,7 @@ test("verifier prompt: fixed rules first (a shared prefix), the five checks, and
   const turns = m.bodies.filter((b) => stageOf(b) === "verify").map((b) => b.messages[1].content);
   assert.ok(turns.length >= 1);
   for (const t of turns) assert.ok(t.startsWith(VERIFY_RULES), "every verify turn starts with the same fixed text");
-  assert.match(VERIFY_RULES, /Most reported candidates are false/);
+  assert.match(VERIFY_RULES, /The report is a hypothesis: its place is usually right, but its reason is often wrong/);
   for (const check of [/Is the cited line changed by this PR\?/, /declared type or signature/, /handled elsewhere/, /stated as intended|state this behaviour as intended/, /work it through with concrete values/]) assert.match(VERIFY_RULES, check);
   assert.ok(VERIFY_RULES.indexOf('"trace"') < VERIFY_RULES.indexOf('"verdict"'), "the reply reasons before it decides");
   assert.match(VERIFY_RULES, /When in doubt, answer uncertain, never confirmed/);
@@ -581,6 +585,130 @@ test("verifier: a refutation in the new shape (trace + blocking_code from the DI
   const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.equal(JSON.parse(out.raw).findings.length, 0);
   assert.match(out.pipelineSummary, /0 confirmed, 1 refuted/);
+});
+
+/** A confirmation in the reframing shape: the verifier's own reason for the defect at the cited place. */
+const reframe = (o = {}) => JSON.stringify({
+  trace: "create passes req.body.amount to charge; a string amount such as \"5\" reaches pay unconverted.",
+  blocking_code: "", verdict: "confirmed", proof_quote: "return charge(req.body.amount);", same_reason: false,
+  title: "create() passes a string amount through unconverted", failure: "If the body carries amount \"5\", pay returns the string \"5\" instead of a number.",
+  fix: "Convert req.body.amount with Number() and reject NaN.", severity: "P2", ...o,
+});
+
+test("verify reframe: a confirmation with another reason posts the verifier's title, failure and fix; the reporter's test is not posted", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.title, "create() passes a string amount through unconverted");
+  assert.match(row.failure_scenario, /^If the body carries amount "5", pay returns the string/);
+  assert.match(row.root_cause, /a string amount such as "5" reaches pay unconverted/, "the root cause is the verifier's trace");
+  assert.equal(row.recommended_fix, "Convert req.body.amount with Number() and reject NaN.");
+  assert.notEqual(row.recommended_test, "Reject -5.", "the reporter's test was for another reason");
+  assert.match(row.evidence, /`return charge\(req\.body\.amount\);`/);
+  assert.equal(row.severity, "P2");
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted/);
+  // The posted comment stays well-formed: every required field is there, and nothing of the reporter's story or test.
+  const comment = inlineFindingComment(asFinding(row, 0));
+  assert.match(comment, /\*\*create\(\) passes a string amount through unconverted\*\*/);
+  assert.match(comment, /\n\nFix: Convert req\.body\.amount with Number\(\) and reject NaN\.\n\nTest: \S/);
+  // Of the reporter's text only its title is kept, as the evidence's last line (the prior-findings dedupe reads it).
+  assert.match(comment, /`return charge\(req\.body\.amount\);`\nReported as: create\(\) charges a negative amount\n\nFix: /);
+  assert.doesNotMatch(comment.replace("Reported as: create() charges a negative amount", ""), /negative|-5/);
+  assert.equal(JSON.parse(out.raw).highest_risk, row.title);
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings, { verifiedKeys: new Set(out.verifiedKeys) });
+  assert.ok(gate.ok);
+});
+
+test("verify reframe: same_reason true keeps the reporter's title, failure, fix and test (the verifier's equivalent is not used)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ same_reason: true, title: "negative amount reaches charge", severity: "P1" }) });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.deepEqual([row.title, row.failure_scenario, row.root_cause, row.recommended_fix, row.recommended_test], ["create() charges a negative amount", "A request with amount -5 is charged.", "create passes req.body.amount to charge unchecked.", "Validate amount.", "Reject -5."]);
+  assert.match(out.pipelineSummary, /, 1 confirmed, 0 refuted/);
+});
+
+test("verify reframe: a verdict without the new fields is still accepted, with the reporter's text kept", async () => {
+  const old = () => JSON.stringify({ trace: "amount goes to charge unchecked", blocking_code: "", verdict: "confirmed", proof_quote: "return charge(req.body.amount);", severity: "P1" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: old });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.deepEqual([row.title, row.recommended_fix, row.recommended_test, row.severity], ["create() charges a negative amount", "Validate amount.", "Reject -5.", "P1"]);
+  assert.match(out.pipelineSummary, /, 1 confirmed, 0 refuted/);
+});
+
+test("verify reframe: a reframed failure that is a build/test-outcome claim, or a different reason left unstated, is only uncertain", async () => {
+  for (const verdict of [
+    reframe({ title: "create() does not compile", failure: "If built, the compiler fails: charge takes a number." }),
+    reframe({ title: "create() passes the amount on", failure: "If the amount is 5, the spec's assertion fails." }),
+    reframe({ title: "", failure: "", fix: "" }),
+  ]) {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => verdict });
+    const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+    assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted/, verdict);
+    const [row] = JSON.parse(out.raw).findings;
+    assert.equal(row.severity, "P2");
+    assert.equal(row.title, "create() charges a negative amount", "an uncertain one is handled as before");
+  }
+});
+
+test("verify reframe: the summary counts reframed confirmations; with two agreeing votes the reason comes from the first confirming vote", async () => {
+  const mail = F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`", root_cause: "`queue` is undefined", failure_scenario: "sendMail throws." });
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] }),
+    verify: (b) => (/sendMail/.test(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "") ? confirm("return queue.push(to);") : reframe()),
+  });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(out.pipelineSummary, /2 confirmed \(1 reframed\), 0 refuted/);
+  const votes = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: (_b, n) => reframe(n === 1 ? {} : { title: "create() passes the string amount on unconverted", failure: "If the second vote runs, it differs.", fix: "Second fix." }) });
+  const two = await runLocalReviewPipeline(sample(), { ...settings, localPipelineVerifyVotes: 2 }, { request: votes.request });
+  const [row] = JSON.parse(two.raw).findings;
+  assert.equal(votes.count.verify, 2);
+  assert.deepEqual([row.title, row.recommended_fix], ["create() passes a string amount through unconverted", "Convert req.body.amount with Number() and reject NaN."]);
+  assert.match(two.pipelineSummary, /1 confirmed \(1 reframed\)/);
+});
+
+test("verify prompt: the report is a hypothesis; the task is whether the code at the place fails and how; reason fields after the trace", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const turn = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+  assert.match(turn, /<<<CANDIDATE: REPORTED HYPOTHESIS \(the place is usually right; the reason may be wrong; untrusted\)>>>\n\{[\s\S]*"title": "create\(\) charges a negative amount"/);
+  assert.match(VERIFY_RULES, /Your task: find out whether the code at the reported place fails, and how\./);
+  assert.match(VERIFY_RULES, /find a concrete input or condition, from the code and evidence shown, under which it gives a wrong result, and quote the failing line\(s\)/);
+  assert.match(VERIFY_RULES, /If no input from the code shown makes it go wrong, the verdict is refuted \(with blocking_code\) or uncertain: never invent a defect\./);
+  assert.match(VERIFY_RULES, /they apply to the failure you find, not only to the reported one/, "rule 6 binds the verifier's own failure");
+  const order = ['"trace"', '"verdict"', '"proof_quote"', '"same_reason"', '"title"', '"failure"', '"fix"', '"severity"'].map((k) => VERIFY_RULES.indexOf(k));
+  assert.ok(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), `fields in order: ${order}`);
+  assert.match(VERIFY_RULES, /"title":"for confirmed: the defect as found, at most 12 words; else empty"/);
+});
+
+test("no consequences from memory: the hunt and verify rules allow only what the quoted code and evidence show", async () => {
+  const rule = /A reason may rest only on what the quoted code and evidence show: not on how a language, standard library, framework or OS behaves unless the evidence or LANGUAGE_NOTES show it, not on timings, counts or sizes the quoted code does not compute, and not on what the PR description says the code does\./;
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const feature = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+  const verify = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+  assert.match(feature, rule);
+  assert.ok(feature.includes('Write failure_scenario as "if <trigger>, <wrong result>".'));
+  assert.match(verify, rule);
+  assert.ok(VERIFY_RULES.includes('"failure":"for confirmed: 1-2 sentences, if <trigger>, <wrong result>; else empty"'));
+});
+
+test("language notes: a Swift feature turn gets the Character, CRLF, waitForExistence and try? notes; a TypeScript-only one does not", async () => {
+  const swiftNotes = [/`"\\n"` passed where a Character is expected is inferred as a Character \(it compiles\)/, /`"\\r\\n"` is ONE Character, so splitting on `"\\n"` does not split CRLF text/, /`waitForExistence\(timeout:\)` returns as soon as the element exists \(the timeout is only a maximum\)/, /`try\?` turns any thrown error into nil, so the failure is silent/];
+  const files = { "App/Rows.swift": "struct Rows {\n  func split(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n" };
+  const swiftF = F({ file: "App/Rows.swift", line: 3, title: "split drops rows", evidence: "App/Rows.swift:3 `return text.split(separator: \"\\n\")`" });
+  await wholePr(async () => {
+    const m = model({ review: () => JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", investigated_safe: [], findings: [swiftF] }), verify: () => confirm("return text.split(separator: \"\\n\")") });
+    await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    const review = m.bodies.find((b) => stageOf(b) === "review").messages[1].content;
+    for (const note of swiftNotes) assert.match(review, note);
+  });
+  const ts = model({ map: mapReply, review: reviewFor({}), verify: refute });
+  await runLocalReviewPipeline(sample(), settings, { request: ts.request });
+  const tsTurns = ts.bodies.filter((b) => stageOf(b) === "review").map((b) => b.messages[1].content);
+  assert.ok(tsTurns.length >= 1);
+  for (const t of tsTurns) for (const note of swiftNotes) assert.doesNotMatch(t, note);
 });
 
 test("evidence: the cited line's diff hunk is shown, or that the PR does not change the line", () => {
@@ -1221,4 +1349,455 @@ test("prefix cache: verify turns go out grouped by file, files in severity order
   assert.match(out.pipelineSummary, /4 to verify, 2 confirmed, 2 refuted, 2 posted/);
   // Each candidate's own verdict decides: exactly the two confirmed titles are posted.
   assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["bravo bravoq", "alpha alphaq"]);
+});
+
+// ── 2026-11-17: build/test-outcome claims dropped before verification; a type-qualified call resolves to
+// that type's function ──
+
+const candidateTitle = (b) => /"title": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")?.[1];
+const OUTCOME_FILES = {
+  "app/rows.py": "def first_row(rows, through):\n    limit = through + 1\n    return rows[:limit]\n",
+  "App/Tasks.swift": "final class Tasks {\n  func name(of task: Task?) -> String {\n    return task!.name\n  }\n}\n",
+  "Sources/Hub/Split.swift": "extension Hub {\n  static func rows(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n",
+};
+const outcomeRow = (file, line, quote, title, failure_scenario, root_cause) => ({
+  severity: "P1", file, line, side: "RIGHT", title, failure_scenario, root_cause, evidence: `${file}:${line} \`${quote}\``, recommended_fix: "Fix it.", recommended_test: "Cover it.",
+});
+const OUTCOME_ROWS = {
+  "Sources/Hub/Split.swift": [
+    outcomeRow("Sources/Hub/Split.swift", 3, 'return text.split(separator: "\\n")', "Compile error: String.split expects a Character", "The module does not build: the separator literal is a String.", "split(separator:) takes a Character, not a String."),
+    outcomeRow("Sources/Hub/Split.swift", 2, "static func rows(_ text: String) -> [Substring] {", "Running the test causes the assertion to fail", "XCTAssertEqual(Hub.rows(\"a\\n\").count, 2) fails.", "Empty subsequences are omitted, so the count is 1."),
+  ],
+  "app/rows.py": [outcomeRow("app/rows.py", 2, "limit = through + 1", "TypeError crash when through is None", "first_row(rows, None) raises TypeError on None + 1.", "through + 1 runs with no None check.")],
+  "App/Tasks.swift": [outcomeRow("App/Tasks.swift", 3, "return task!.name", "Force unwrap crashes when task is nil", "name(of: nil) traps at the force unwrap.", "task! is unwrapped with no guard.")],
+};
+
+test("build/test claims: a compile-error and a test-failure claim are dropped before verification and counted; runtime crashes are verified", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineDropBuildClaims, true);
+  await wholePr(async () => {
+    const m = model({ review: reviewFor(OUTCOME_ROWS), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample(OUTCOME_FILES), settings, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    const verified = m.bodies.filter((b) => stageOf(b) === "verify").map(candidateTitle).sort();
+    assert.deepEqual(verified, ["Force unwrap crashes when task is nil", "TypeError crash when through is None"]);
+    assert.match(out.pipelineSummary, /4 candidate\(s\), 2 build\/test-outcome claim\(s\) dropped, 2 to verify/);
+  });
+});
+
+test("build/test claims: with local_review.pipeline_drop_build_claims off, every candidate is verified and none is counted as dropped", async () => {
+  await wholePr(async () => {
+    const m = model({ review: reviewFor(OUTCOME_ROWS), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample(OUTCOME_FILES), { ...settings, localPipelineDropBuildClaims: false }, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    assert.equal(m.bodies.filter((b) => stageOf(b) === "verify").length, 4);
+    assert.doesNotMatch(out.pipelineSummary, /build\/test-outcome/);
+    assert.match(out.pipelineSummary, /4 candidate\(s\), 4 to verify/);
+  });
+});
+
+test("build/test claims: other wordings (does not compile, type mismatch, build fails, test fails, XCTAssert fails) are dropped; runtime type and flaky-test wording is not", async () => {
+  const file = "Sources/Hub/Split.swift";
+  const row = (title, failure, root) => outcomeRow(file, 3, 'return text.split(separator: "\\n")', title, failure, root);
+  const dropped = [
+    row("Split does not compile", "x", "y"),
+    row("Separator has a type mismatch", "The compiler rejects the call.", "y"),
+    row("Splitting rows breaks", "The build fails on the new call.", "y"),
+    row("Rows count is off by one", "The existing test fails on the trailing newline.", "y"),
+    row("Rows lose the trailing empty line", "XCTAssertEqual(rows.count, 2) fails.", "y"),
+  ];
+  const kept = [
+    row("Decoding hits a type mismatch on rows", "The server sends a string, so decoding the payload fails.", "y"),
+    row("Row order differs between runs", "The test fails intermittently because the rows come from a set.", "y"),
+  ];
+  // Distinct lines so the dedupe keeps every row.
+  const rows = [...dropped, ...kept].map((r, i) => ({ ...r, line: (i % 3) + 1, title: `${r.title} ${"abcdefgh"[i]}${"abcdefgh"[i]}q` }));
+  const fileText = "extension Hub {\n  static func rows(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n";
+  const quotes = ["extension Hub {", "static func rows(_ text: String) -> [Substring] {", 'return text.split(separator: "\\n")'];
+  for (const r of rows) r.evidence = `${file}:${r.line} \`${quotes[r.line - 1]}\``;
+  await wholePr(async () => {
+    const m = model({ review: reviewFor({ [file]: rows }), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample({ [file]: fileText }), { ...settings, localPipelineMaxFindings: 8 }, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    const verified = m.bodies.filter((b) => stageOf(b) === "verify").map(candidateTitle).sort();
+    assert.deepEqual(verified, rows.slice(dropped.length).map((r) => r.title).sort());
+    assert.match(out.pipelineSummary, /5 build\/test-outcome claim\(s\) dropped/);
+  });
+});
+
+// Two Swift types declare a same-named static `lines`; the corpus lists the one the call does NOT name first.
+const QUALIFIED = {
+  changed: { "Sources/App/Loader.swift": "enum Loader {\n  static func rows(_ text: String) -> [Row] {\n    return Hub.lines(text, as: Row.self, what: \"x\")\n  }\n}\n" },
+  refs: [
+    { path: "Sources/Hub/HubArguments.swift", content: "enum HubArguments {\n  public static func lines<T>(_ file: String, as type: T.Type) -> (rows: [T], unreadable: Int) {\n    return (rows: [], unreadable: 1) // ARGUMENTS-LINES\n  }\n}\n" },
+    { path: "Sources/Hub/Hub+Lines.swift", content: "extension Hub {\n  static func lines<T>(_ text: String, as type: T.Type, what: String) -> [T] {\n    return [] // HUB-LINES\n  }\n}\n" },
+  ],
+};
+
+test("qualified call: calleeDefinitions shows the `lines` declared in Hub's extension, not another type's same-named `lines`", () => {
+  const block = calleeDefinitions(swiftSample(QUALIFIED.changed, { referenceFiles: QUALIFIED.refs }), ["Sources/App/Loader.swift"], 6_000);
+  assert.match(block, /--- Sources\/Hub\/Hub\+Lines\.swift[\s\S]*HUB-LINES/);
+  assert.doesNotMatch(block, /ARGUMENTS-LINES/);
+});
+
+test("qualified call: the verifier's evidence shows the `lines` declared in Hub's extension, not another type's", () => {
+  const s = swiftSample(QUALIFIED.changed, { referenceFiles: QUALIFIED.refs });
+  // No quote or symbol name in the finding text, so only the called-name lookup reaches either file.
+  const pack = evidencePack(s, finding("Sources/App/Loader.swift", 3, { title: "Rows are read with the wrong arguments", evidence: "Sources/App/Loader.swift:3" }), new Map(), 20_000);
+  assert.match(pack.code, /Sources\/Hub\/Hub\+Lines\.swift[\s\S]*HUB-LINES/);
+  assert.doesNotMatch(pack.code, /ARGUMENTS-LINES/);
+});
+
+test("qualified call: a lower-case qualifier (an instance) keeps the plain lookup; a type qualifier picks that class's method", () => {
+  const refs = [
+    { path: "src/archive.ts", content: "export class Archive {\n  save(item) {\n    return 'ARCHIVE-SAVE';\n  }\n}\n" },
+    { path: "src/store.ts", content: "export class Store {\n  static save(item) {\n    return 'STORE-SAVE';\n  }\n}\n" },
+  ];
+  const call = (line) => calleeDefinitions(sample({ "src/use.ts": `export function use(store, item) {\n  ${line}\n}\n` }, { referenceFiles: refs }), ["src/use.ts"], 6_000);
+  const instance = call("return store.save(item);");
+  assert.equal(instance, call("return save(item);"), "store.save( is looked up as save( was");
+  assert.match(instance, /ARCHIVE-SAVE/);
+  const typed = call("return Store.save(item);");
+  assert.match(typed, /--- src\/store\.ts[\s\S]*STORE-SAVE/);
+  assert.doesNotMatch(typed, /ARCHIVE-SAVE/);
+});
+
+test("qualified call: Kotlin `Foo.bar(` resolves to `object Foo { fun bar(`, and `Foo.baz(` to the extension `fun Foo.baz(`", () => {
+  const refs = [
+    { path: "app/src/Other.kt", content: "class Other {\n  fun bar(x: Int): Int {\n    return x * 2 // OTHER-BAR\n  }\n  fun baz(x: Int): Int {\n    return x * 3 // OTHER-BAZ\n  }\n}\n" },
+    { path: "app/src/Foo.kt", content: "object Foo {\n  fun bar(x: Int): Int {\n    return x + 1 // FOO-BAR\n  }\n}\n" },
+    { path: "app/src/FooExt.kt", content: "package app\n\nfun Foo.baz(x: Int): Int {\n  return x + 2 // FOO-BAZ\n}\n" },
+  ];
+  const s = { ...sample({ "app/src/Main.kt": "fun main() {\n  val y = Foo.bar(1) + Foo.baz(2)\n  println(y)\n}\n" }, { referenceFiles: refs }) };
+  const block = calleeDefinitions(s, ["app/src/Main.kt"], 6_000);
+  assert.match(block, /--- app\/src\/Foo\.kt[\s\S]*FOO-BAR/);
+  assert.match(block, /--- app\/src\/FooExt\.kt[\s\S]*FOO-BAZ/);
+  assert.doesNotMatch(block, /OTHER-BAR|OTHER-BAZ/);
+});
+
+test("qualified call: the scoped lookup stays linear on a large file with many type bodies", () => {
+  const big = Array.from({ length: 20_000 }, (_, i) => `struct Type${i} {\n  func lines(_ x: Int) -> Int {\n    return x\n  }\n}`).join("\n");
+  const refs = [{ path: "Sources/Big.swift", content: big }, { path: "Sources/Hub.swift", content: "enum Hub {\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" }];
+  const t0 = performance.now();
+  const block = calleeDefinitions(swiftSample({ "Sources/Use.swift": "let n = Hub.lines(1)\n" }, { referenceFiles: refs }), ["Sources/Use.swift"], 6_000);
+  const ms = performance.now() - t0;
+  assert.match(block, /HUB-LINES/);
+  assert.ok(ms < 1_500, `calleeDefinitions took ${Math.round(ms)}ms`);
+});
+
+// ── 2026-11-17 review fixes: conditional build/test triggers, verify-side gate, vote agreement, a
+// reframe's proof at the cited place, the reporter's title for the prior dedupe, same_reason words,
+// the Swift trap note, and comment/string-aware type scopes ──
+
+const claim = (title, failureScenario = "", rootCause = "") => isBuildOutcomeClaim({ title, failureScenario, rootCause });
+
+test("build/test claims: a build or test failure as the trigger of a runtime defect (if/when/after … fails) is kept", () => {
+  for (const [title, failure] of [
+    ["Deploy continues after a failed build", "If the Docker build fails, deploy.sh still pushes the previous image to production."],
+    ["Rollback deletes data", "if the smoke tests fail, rollback.sh drops the production database"],
+    ["Device reports OK", "if the self-test fails, the device still reports OK"],
+    ["Pod not restarted", "when a health test fails the pod is not restarted"],
+    ["Lock file stays", "if the build fails, cleanup is skipped and the lock file stays"],
+    ["Broken package published", "when the compile step fails, the script continues and publishes a broken package"],
+  ]) assert.equal(claim(title, failure), false, failure);
+  // A trigger that is not a build or test step leaves the claim a claim.
+  assert.equal(claim("x", "If the amount is 5, the spec's assertion fails."), true);
+  assert.equal(claim("x", "If the spec runs, the assertion fails."), true);
+  assert.equal(claim("x", "The unit test fails when the amount is 0."), true);
+});
+
+test("build/test claims: an assertion that traps, aborts, terminates, is fatal or returns 5xx is a runtime defect", () => {
+  for (const failure of [
+    "if texts has fewer than 5 items, the assertion fails and the app traps",
+    "the assertion fails on an empty array and aborts the app",
+    "precondition assert fails in release builds and the app terminates",
+    "the assertion fails with a fatal error in production",
+    "if user is None, the assert fails and the request returns 500",
+  ]) assert.equal(claim("x", failure), false, failure);
+});
+
+test("build/test claims: a type error or mismatch counts only with compile, build or type-check wording nearby", () => {
+  for (const failure of [
+    "Python: a type error when amount is None makes the endpoint return 500",
+    "if ids come from the query string, the type mismatch (str vs int) makes every cache lookup miss",
+    "the type mismatch (str vs int) makes every cache lookup miss",
+    "Type mismatch: expected Int but got String",
+  ]) assert.equal(claim("x", failure), false, failure);
+  for (const failure of ["a type mismatch compile error on the separator", "the type error breaks the build", "this fails type checking"]) assert.equal(claim("x", failure), true, failure);
+});
+
+test("build/test claims: named failing tests and compiler messages are claims", () => {
+  for (const text of [
+    "testLogin will fail since the mock returns nil",
+    "OrderServiceTest would fail",
+    "Swift: Cannot convert value of type 'String' to expected argument type 'Character'",
+    "Kotlin: Unresolved reference: foo",
+    "tsc reports error TS2345",
+    "the compiler rejects this",
+    "this fails type checking",
+    "the build is broken",
+  ]) assert.equal(claim(text), true, text);
+  // A name that only contains "test" is not a test name.
+  assert.equal(claim("the latestOrder will fail over to the replica"), false);
+});
+
+test("build/test claims: a candidate whose failure is 'if the build fails, <wrong result>' reaches the verifier", async () => {
+  const f = F({ title: "Deploy continues after a failed build", failure_scenario: "If the build fails, create() still charges the card.", root_cause: "no exit check" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [f] }), verify: () => confirm() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(m.count.verify, 1);
+  assert.doesNotMatch(out.pipelineSummary, /build\/test-outcome/);
+  assert.match(out.pipelineSummary, /1 confirmed/);
+});
+
+test("build/test claims: with the setting off, the verifier's same-reason confirmation of a test-failure claim is posted", async () => {
+  const f = F({ title: "create() makes the spec fail", failure_scenario: "Running the test causes the assertion to fail.", root_cause: "x" });
+  const verify = () => reframe({ same_reason: true, title: "the spec's assertion fails", failure: "If the spec runs, the assertion fails.", severity: "P1" });
+  const off = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [f] }), verify });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineDropBuildClaims: false }, { request: off.request });
+  assert.match(out.pipelineSummary, /1 confirmed, 0 refuted/);
+  assert.equal(JSON.parse(out.raw).findings.length, 1);
+  // With same_reason true the gate is the hunter's: a same-reason confirmation is not re-judged by the verifier's wording.
+  const g = F({ title: "create() charges a negative amount", failure_scenario: "A request with amount -5 is charged." });
+  const on = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [g] }), verify });
+  assert.match((await runLocalReviewPipeline(sample(), settings, { request: on.request })).pipelineSummary, /1 confirmed, 0 refuted/);
+});
+
+test("verify votes: a same-reason vote and a reframe vote disagree, so the candidate is only uncertain", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }),
+    verify: (_b, n) => (n === 1 ? reframe({ same_reason: true, severity: "P1" }) : reframe({ title: "unrelated defect B somewhere", severity: "P2" })) });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineVerifyVotes: 2, localPipelineKeepUncertain: true }, { request: m.request });
+  assert.equal(m.count.verify, 2);
+  assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain/);
+  const [row] = JSON.parse(out.raw).findings;
+  assert.deepEqual([row.title, row.severity], ["create() charges a negative amount", "P2"]);
+});
+
+test("verify votes: two reframes with different titles disagree (uncertain); two similar reframes agree (confirmed, severity from both)", async () => {
+  const run = async (second) => {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }),
+      verify: (_b, n) => (n === 1 ? reframe({ title: "defect A amount string", severity: "P1" }) : reframe(second)) });
+    return runLocalReviewPipeline(sample(), { ...settings, localPipelineVerifyVotes: 2, localPipelineKeepUncertain: true }, { request: m.request });
+  };
+  const differ = await run({ title: "defect B totally different", severity: "P1" });
+  assert.match(differ.pipelineSummary, /0 confirmed, 1 uncertain/);
+  const agree = await run({ title: "defect A: the amount string", severity: "P2" });
+  assert.match(agree.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted/);
+  const [row] = JSON.parse(agree.raw).findings;
+  assert.deepEqual([row.title, row.severity], ["defect A amount string", "P2"]);
+});
+
+test("verify reframe: a different reason's proof must be within 30 lines of the cited line in the cited file", async () => {
+  // The proof quotes the callee's file: the defect it shows is not at the cited controller line.
+  const xfile = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }),
+    verify: () => reframe({ proof_quote: "function pay(a) { return a; }", title: "pay() returns its input without paying", failure: "If charge(5) runs, pay returns 5 and charges nothing.", severity: "P2" }) });
+  const out = await runLocalReviewPipeline(sample(), { ...settings, localPipelineKeepUncertain: true }, { request: xfile.request });
+  assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain/);
+  assert.equal(JSON.parse(out.raw).findings[0].title, "create() charges a negative amount");
+  // The same file, 40 lines below: not at the place either; 1 line above: at the place.
+  const pad = Array.from({ length: 40 }, (_, i) => `// note ${i}`).join("\n");
+  const files = { ...FILES, "src/orders/orders.controller.ts": `import { charge } from './orders.service';\nexport function create(req) {\n  return charge(req.body.amount);\n}\n${pad}\nexport function audit(entry) { return entry.amount; }\n` };
+  for (const [proof, want] of [["export function audit(entry) { return entry.amount; }", /0 confirmed, 1 uncertain/], ["export function create(req) {", /1 confirmed \(1 reframed\)/]]) {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ proof_quote: proof }) });
+    await wholePr(async () => {
+      const r = await runLocalReviewPipeline(sample(files), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+      assert.match(r.pipelineSummary, want, proof);
+    });
+  }
+});
+
+test("verify reframe: the posted finding keeps the reporter's title, so the next push's same report is a prior duplicate", async () => {
+  // The reporter's title shares no word with the verifier's, so only the Reported-as line ties them.
+  const reported = F({ title: "Negative totals reach the card processor" });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [reported] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.title, "create() passes a string amount through unconverted");
+  assert.match(row.evidence, /\nReported as: Negative totals reach the card processor$/);
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings, { verifiedKeys: new Set(out.verifiedKeys) });
+  assert.ok(gate.ok);
+  const comment = inlineFindingComment(asFinding(row, 0));
+  const { findings: prior } = collectPriorFindings({ botLogin: "bot", reviews: [], comments: [{ id: 1, userLogin: "bot", path: row.file, line: row.line, commitId: "h", body: comment }] });
+  assert.equal(isPriorDuplicate({ file: reported.file, line: reported.line, title: reported.title, evidence: reported.evidence }, prior), true);
+  assert.equal(isPriorDuplicate({ file: reported.file, line: reported.line, title: "Mail queue drops recipients", evidence: reported.evidence }, prior), false);
+});
+
+test("verify reframe: same_reason as a word or a number (no/yes, 0/1, ' False ') is read", async () => {
+  for (const [flag, title] of [["no", "create() passes a string amount through unconverted"], [0, "create() passes a string amount through unconverted"], [" False ", "create() passes a string amount through unconverted"], ["yes", "create() charges a negative amount"], [1, "create() charges a negative amount"]]) {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ same_reason: flag }) });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    assert.equal(JSON.parse(out.raw).findings[0].title, title, String(flag));
+  }
+});
+
+test("language notes: the Swift note says an out-of-range subscript or range and `!` on nil trap", () => {
+  assert.ok(languageNotes(["App/Rows.swift"]).includes("An out-of-range subscript or range traps at runtime; `!` on nil traps."));
+});
+
+const scoped = (changed, refs, swift = true) => {
+  const s = swift ? swiftSample(changed, { referenceFiles: refs }) : sample(changed, { referenceFiles: refs });
+  return calleeDefinitions(s, Object.keys(changed), 6_000);
+};
+const USE_SWIFT = { "Sources/Use.swift": "let n = Hub.lines(1)\n" };
+const HUB_SWIFT = { path: "Sources/B.swift", content: "enum Hub {\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" };
+const OTHER_SWIFT = (head) => ({ path: "Sources/A.swift", content: `${head}\nstruct Other {\n  static func lines(_ x: Int) -> Int {\n    return x // WRONG-OTHER\n  }\n}\n` });
+
+test("qualified call: a type header inside a comment opens no scope", () => {
+  for (const head of ["// Lines are parsed in `extension Hub {` (Hub+Lines.swift)", "/* class Hub { */", "/// Like struct Hub { but cached", "/*\n struct Hub {\n*/"]) {
+    const block = scoped(USE_SWIFT, [OTHER_SWIFT(head), HUB_SWIFT]);
+    assert.match(block, /HUB-LINES/, head);
+    assert.doesNotMatch(block, /WRONG-OTHER/, head);
+  }
+});
+
+test("qualified call: a brace in a string, character or template literal does not unbalance the scope", () => {
+  const hub2 = { path: "src/hub2.ts", content: "export namespace Hub {\n  export function lines(x) {\n    return 'HUB-LINES';\n  }\n}\n" };
+  const other = (open) => ({ path: "src/a.ts", content: `export class Hub {\n  static open(s) { return ${open}; }\n}\nexport class Other {\n  static lines(x) {\n    return 'WRONG-OTHER';\n  }\n}\n` });
+  for (const open of ["'{' + s", "`${s}{`", "\"{\" + s"]) {
+    const block = scoped({ "src/use.ts": "export function use(x) {\n  return Hub.lines(x);\n}\n" }, [other(open), hub2], false);
+    assert.match(block, /HUB-LINES/, open);
+    assert.doesNotMatch(block, /WRONG-OTHER/, open);
+  }
+  const kt = scoped({ "app/Main.kt": "fun main() {\n  val y = Hub.lines(1)\n}\n" }, [
+    { path: "app/A.kt", content: "class Hub {\n  fun open(c: Char) = c == '{'\n}\nclass Other {\n  fun lines(x: Int): Int {\n    return x // WRONG-OTHER\n  }\n}\n" },
+    { path: "app/B.kt", content: "object Hub2 {}\nfun Hub.lines(x: Int): Int {\n  return x // HUB-LINES\n}\n" },
+  ]);
+  assert.match(kt, /HUB-LINES/);
+  assert.doesNotMatch(kt, /WRONG-OTHER/);
+  const multi = scoped(USE_SWIFT, [{ path: "Sources/A.swift", content: "struct Hub {\n  static let tpl = \"\"\"\n  { \"a\": 1\n  \"\"\"\n}\nstruct Other {\n  static func lines(_ x: Int) -> Int {\n    return x // WRONG-OTHER\n  }\n}\n" }, { ...HUB_SWIFT, content: HUB_SWIFT.content.replace("enum Hub", "extension Hub") }]);
+  assert.match(multi, /HUB-LINES/);
+  assert.doesNotMatch(multi, /WRONG-OTHER/);
+});
+
+test("qualified call: Hub's own member wins over a same-named member of a type nested inside Hub", () => {
+  const block = scoped(USE_SWIFT, [{ path: "Sources/B.swift", content: "enum Hub {\n  struct Reader {\n    static func lines(_ x: Int) -> Int {\n      return x // WRONG-NESTED\n    }\n  }\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" }]);
+  assert.match(block, /HUB-LINES/);
+  assert.doesNotMatch(block, /WRONG-NESTED/);
+  // Only a nested one (a Kotlin companion object): that one is still found.
+  const kt = scoped({ "app/Main.kt": "fun main() {\n  val y = Hub.lines(1)\n}\n" }, [
+    { path: "app/A.kt", content: "class Other {\n  fun lines(x: Int): Int {\n    return x // WRONG-OTHER\n  }\n}\n" },
+    { path: "app/B.kt", content: "class Hub(val a: Int) {\n  companion object {\n    fun lines(x: Int): Int {\n      return x // HUB-LINES\n    }\n  }\n}\n" },
+  ]);
+  assert.match(kt, /HUB-LINES/);
+  assert.doesNotMatch(kt, /WRONG-OTHER/);
+});
+
+// ── 2026-11-17 (PR review): qualifiers and called names come from code only; a build/test trigger named in
+// the title; a reframed finding's evidence drops the reporter's reasoning ──
+
+const QUAL_REFS = [
+  { path: "src/legacy.ts", content: "export class Legacy {\n  static lines(text) {\n    return 'LEGACY-LINES';\n  }\n}\n" },
+  { path: "src/current.ts", content: "export class Current {\n  static lines(text) {\n    return 'CURRENT-LINES';\n  }\n}\n" },
+];
+const qualUse = (mention) => `import { Current } from './current';\nexport function rows(text) {\n  ${mention}\n  return Current.lines(text);\n}\n`;
+const MENTIONS = ["// Legacy.lines() used to run here", "const note = \"Legacy.lines() used to run here\";", "/* Legacy.lines(text) */"];
+
+test("qualified call: a type named in a comment or string before the real call is no qualifier; the called type's member is shown", () => {
+  for (const mention of MENTIONS) {
+    const s = sample({ "src/rows.ts": qualUse(mention) }, { referenceFiles: QUAL_REFS });
+    const block = calleeDefinitions(s, ["src/rows.ts"], 6_000);
+    assert.match(block, /--- src\/current\.ts[\s\S]*CURRENT-LINES/, mention);
+    assert.doesNotMatch(block, /LEGACY-LINES/, mention);
+    const pack = evidencePack(s, finding("src/rows.ts", 4, { title: "Rows are read the wrong way", evidence: "src/rows.ts:4" }), new Map(), 20_000);
+    assert.match(pack.code, /src\/current\.ts[\s\S]*CURRENT-LINES/, mention);
+    assert.doesNotMatch(pack.code, /LEGACY-LINES/, mention);
+  }
+});
+
+test("callQualifiers: several qualifiers of one name follow the call positions; comments and literals add none", () => {
+  const code = "// Legacy.lines()\nconst a = Beta.lines(1) + Alpha.lines(2);\nconst s = 'Gamma.lines()';\nAlpha.lines(3); Delta.lines(4);";
+  assert.deepEqual([...callQualifiers(code)], [["lines", ["Beta", "Alpha", "Delta"]]]);
+});
+
+test("calledNames: a name only in a comment is not called; a call next to a URL or inside a string interpolation still is", () => {
+  const code = "// TODO: refreshCache() once the API settles\nconst url = \"https://host/path\"; load(url); /* oldLoad(url) */\nconst label = `Total: ${formatPrice(total)}`;\nlet t = \"\\(formatDate(d))\"";
+  assert.deepEqual(calledNames(code), ["load", "formatPrice", "formatDate"]);
+});
+
+test("build/test claims: a build or test failure used as the trigger keeps a runtime finding whose title names it; a real compile claim is still dropped", () => {
+  assert.equal(isBuildOutcomeClaim({ title: "Build failure still deploys the previous image", failureScenario: "If the Docker build fails, deploy.sh still pushes the previous image.", rootCause: "deploy.sh does not check the exit status of docker build." }), false);
+  assert.equal(isBuildOutcomeClaim({ title: "Tests fail and leave the lock file behind", failureScenario: "The lock file stays on disk and the next run waits forever.", rootCause: "When a test fails, cleanup() is skipped." }), false);
+  assert.equal(isBuildOutcomeClaim({ title: "Compile error: X", failureScenario: "The build fails because X takes a Character", rootCause: "" }), true);
+  // A trigger in the scenario does not excuse a claim the root cause makes outside it.
+  assert.equal(isBuildOutcomeClaim({ title: "Build failure", failureScenario: "If the build fails, the previous image is pushed.", rootCause: "The new call does not compile." }), true);
+});
+
+test("verify reframe: the posted evidence keeps the reporter's verbatim code quotes and the verifier's proof, not the reporter's rejected reasoning", async () => {
+  const reported = F({ evidence: "src/orders/orders.controller.ts:3 `return charge(req.body.amount);` - the quoted call deducts a negative charge from the account inside `export function create(req) {`, and `refund(amount)` runs after it." });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [reported] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted/);
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.evidence, "src/orders/orders.controller.ts:2 `export function create(req) {`\nVerified against the code: `return charge(req.body.amount);`\nReported as: create() charges a negative amount");
+  const comment = inlineFindingComment(asFinding(row, 0));
+  assert.doesNotMatch(comment, /negative charge|deducts|refund/);
+  assert.match(comment, /Verified against the code: `return charge\(req\.body\.amount\);`/);
+  assert.match(comment, /Reported as: create\(\) charges a negative amount/);
+  for (const verifiedKeys of [new Set(out.verifiedKeys), new Set()]) {
+    const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings, { verifiedKeys });
+    assert.ok(gate.ok, gate.error);
+    assert.equal(gate.findings.length, 1, `verified keys: ${verifiedKeys.size}`);
+  }
+});
+
+test("verify reframe: with long reporter evidence the Reported-as line survives the posted evidence cap, so the next push's same report is a duplicate", async () => {
+  const consts = Array.from({ length: 6 }, (_, i) => `export const RATE_${i} = { region: "region-${i}", tier: "standard-plus", minimum: ${i + 1}00 };`);
+  const controller = `${FILES["src/orders/orders.controller.ts"]}${consts.join("\n")}\n`;
+  const evidence = [
+    "src/orders/orders.controller.ts:3 `return charge(req.body.amount);`",
+    ...consts.map((c, i) => `src/orders/orders.controller.ts:${i + 5} \`${c}\``),
+  ].join("\n");
+  assert.ok(evidence.length > 760 && evidence.length < 800, `reporter evidence of ${evidence.length} chars`);
+  const reported = F({ title: "Negative totals reach the payment provider", evidence });
+  await wholePr(async () => {
+    const files = { ...FILES, "src/orders/orders.controller.ts": controller };
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [reported] }), verify: () => reframe() });
+    const out = await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\)/);
+    const [row] = JSON.parse(out.raw).findings;
+    const posted = asFinding(row, 0);
+    assert.match(posted.evidence, /\nReported as: Negative totals reach the payment provider$/);
+    const comment = inlineFindingComment(posted);
+    const prior = collectPriorFindings({ botLogin: "bot", comments: [{ id: 1, userLogin: "bot", path: posted.file, line: posted.line, commitId: "c1", body: comment }], reviews: [] }).findings;
+    assert.equal(isPriorDuplicate({ file: reported.file, line: reported.line, title: reported.title, evidence: reported.evidence }, prior), true);
+  });
+});
+
+const HUB_OTHER = { path: "src/a.ts", content: "export class Other {\n  static lines(x) {\n    return 2; // WRONG-OTHER\n  }\n}\n" };
+const hubWith = (body) => ({ path: "src/b.tsx", content: `export class Hub {\n  static open(s) {\n${body}\n  }\n  static lines(x) {\n    return 1; // HUB-LINES\n  }\n}\n` });
+
+test("qualified call: an unclosed quote on a line is code and a `/*` or `//` after a backslash is a regex, so Hub's scope stays balanced", () => {
+  const use = { "src/use.ts": "export function use(x) {\n  return Hub.lines(x);\n}\n" };
+  for (const body of [
+    "    return (<p>Don't panic</p>{s.map((x) => (\n      <i>{x}</i>\n    ))});",
+    "    const css = `.a {\n      color: red;\n    }`;\n    return css;",
+    "    if (/[\"']/.test(s)) {\n      s = s.trim();\n    }",
+    "    const t = s.replace(/\\/*$/, \"\");\n    if (t) { return t; }",
+    "    if (/\\//.test(s)) {\n      return s;\n    }",
+    // Literals that already worked: an apostrophe in a string, a brace in quotes, escaped quotes.
+    "    const a = \"it's {\"; const b = '{'; const c = '\\''; const d = \"say \\\"{\\\"\";\n    return a + b + c + d;",
+  ]) {
+    const block = scoped(use, [HUB_OTHER, hubWith(body)], false);
+    assert.match(block, /HUB-LINES/, body);
+    assert.doesNotMatch(block, /WRONG-OTHER/, body);
+  }
+  const swift = scoped(USE_SWIFT, [
+    { path: "Sources/A.swift", content: "struct Other {\n  static func lines(_ x: Int) -> Int {\n    return x // WRONG-OTHER\n  }\n}\n" },
+    { path: "Sources/B.swift", content: "struct Hub {\n  static let sep = #\"\\\"#; static func open() {\n  }\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" },
+  ]);
+  assert.match(swift, /HUB-LINES/);
+  assert.doesNotMatch(swift, /WRONG-OTHER/);
+});
+
+test("build/test claims: a build or test failure written after the trigger without a comma is still a claim", () => {
+  for (const text of ["After this change the build fails", "Once merged the tests fail on CI", "When run on CI the tests fail because the fixture was removed"]) {
+    assert.equal(claim(text), true, text);
+    assert.equal(claim("x", text), true, text);
+  }
+});
+
+test("build/test claims: a runtime type check or an unresolved schema reference is not a compiler message; Kotlin's is", () => {
+  assert.equal(claim("x", "isUser() fails the type check for legacy rows, so every request returns 403"), false);
+  assert.equal(claim("x", "The schema's $ref is an unresolved reference, so the validator rejects every request"), false);
+  assert.equal(claim("Unresolved reference: foo"), true);
+  assert.equal(claim("this fails type checking"), true);
 });

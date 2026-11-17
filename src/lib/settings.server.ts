@@ -110,6 +110,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (pipelineLenses !== undefined) o.localPipelineLenses = pipelineLenses;
   const keepUncertain = envFlag("ASHLAR_LOCAL_PIPELINE_KEEP_UNCERTAIN");
   if (keepUncertain !== undefined) o.localPipelineKeepUncertain = keepUncertain;
+  const dropBuildClaims = envFlag("ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS");
+  if (dropBuildClaims !== undefined) o.localPipelineDropBuildClaims = dropBuildClaims;
   const localLease = envNum("ASHLAR_LOCAL_LEASE_CAPACITY");
   if (localLease !== undefined) o.localLeaseCapacity = localLease;
   const order = envStr("ASHLAR_REVIEW_ORDER");
@@ -203,6 +205,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_PIPELINE_VERIFY_VOTES: String(s.localPipelineVerifyVotes),
     ASHLAR_LOCAL_PIPELINE_LENSES: String(s.localPipelineLenses),
     ASHLAR_LOCAL_PIPELINE_KEEP_UNCERTAIN: String(s.localPipelineKeepUncertain),
+    ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS: String(s.localPipelineDropBuildClaims),
     ASHLAR_LOCAL_LEASE_CAPACITY: String(s.localLeaseCapacity),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
@@ -315,6 +318,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localPipelineVerifyVotes: intField(p, "localPipelineVerifyVotes"),
     localPipelineLenses: intField(p, "localPipelineLenses"),
     localPipelineKeepUncertain: bool(p.localPipelineKeepUncertain, DEFAULT_SETTINGS.localPipelineKeepUncertain),
+    localPipelineDropBuildClaims: bool(p.localPipelineDropBuildClaims, DEFAULT_SETTINGS.localPipelineDropBuildClaims),
     localLeaseCapacity: intField(p, "localLeaseCapacity"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),

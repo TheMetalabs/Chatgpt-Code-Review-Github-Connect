@@ -364,6 +364,9 @@ export interface BotSettings {
   /** A candidate the verifier can neither confirm nor refute (with a quote) is posted at P2 when its own
    * evidence quotes real code. Off: such a candidate is dropped. */
   localPipelineKeepUncertain: boolean;
+  /** A candidate whose claimed failure is a build or test outcome ("compile error", "the test fails") is
+   * dropped before verification: the authors' build and test gate already disproved it. Off: verified. */
+  localPipelineDropBuildClaims: boolean;
   /** Concurrent holders of the process-wide local-model lease (match the model server, e.g. oMLX concurrent=3). */
   localLeaseCapacity: number;
   reviewOrder: ReviewProvider[];
@@ -546,6 +549,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localPipelineVerifyVotes: 1,
   localPipelineLenses: 3,
   localPipelineKeepUncertain: false,
+  localPipelineDropBuildClaims: true,
   localLeaseCapacity: 1,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,

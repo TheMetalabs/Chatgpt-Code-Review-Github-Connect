@@ -170,6 +170,22 @@ describe("sanitizeBotSettings", () => {
     }
   });
 
+  it("defaults localPipelineDropBuildClaims to on, keeps a saved off, and round-trips ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS", () => {
+    assert.equal(DEFAULT_SETTINGS.localPipelineDropBuildClaims, true);
+    assert.equal(sanitizeBotSettings({}).localPipelineDropBuildClaims, true);
+    assert.equal(sanitizeBotSettings({ localPipelineDropBuildClaims: false }).localPipelineDropBuildClaims, false);
+    assert.equal(sanitizeBotSettings({ localPipelineDropBuildClaims: "false" }).localPipelineDropBuildClaims, true);
+    assert.equal(botSettingsToEnv(sanitizeBotSettings({ localPipelineDropBuildClaims: false })).ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS, "false");
+    assert.equal(botSettingsToEnv(DEFAULT_SETTINGS).ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS, "true");
+    const prev = process.env.ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS;
+    try {
+      process.env.ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS = "false";
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localPipelineDropBuildClaims, false);
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS; else process.env.ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS = prev;
+    }
+  });
+
   it("finding precision: defaults on, normalizes stored values, validates saves strictly, and the saved value beats the env seed", () => {
     const d = sanitizeBotSettings({});
     assert.deepEqual(

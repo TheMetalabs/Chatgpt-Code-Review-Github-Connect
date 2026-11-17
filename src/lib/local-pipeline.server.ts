@@ -694,6 +694,19 @@ export function calledNames(code: string): string[] {
   return [...out];
 }
 
+/** The type qualifiers of each qualified call in `code`: `Hub.lines(` gives lines → [Hub]. Only a
+ * capitalised qualifier (a type, not an instance such as `store.save(`) counts. calledNames keeps the bare
+ * name; findDefinition then prefers the declaration inside that type (scopedDefinition). */
+export function callQualifiers(code: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const m of code.matchAll(/(?<![\w$])([A-Z][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const quals = out.get(m[2]) ?? [];
+    if (!quals.includes(m[1])) quals.push(m[1]);
+    out.set(m[2], quals);
+  }
+  return out;
+}
+
 /** Swift and Kotlin declare every function and initializer with a keyword (func, fun, init): there a
  * `name(args) {` line is a call with a trailing closure (`persist(item) {`, `VStack(spacing: 8) {`). */
 const TRAILING_CLOSURE_RE = /\.(?:swift|kt|kts)$/;
@@ -715,15 +728,70 @@ const DECL_HEADER_RE = (name: string) =>
 const DECL_RE = (name: string, path: string) =>
   TRAILING_CLOSURE_RE.test(path) ? DECL_KEYWORD_RE(name) : new RegExp(`${DECL_KEYWORD_RE(name).source}|${DECL_HEADER_RE(name).source}`);
 
+/** The headers of a type body that can hold a qualified call's callee, per language: Swift types and
+ * extensions, Kotlin classes, objects and interfaces, TypeScript/JavaScript classes and namespaces. */
+const SCOPE_HEADER_RE = (qualifier: string, path: string) =>
+  /\.swift$/.test(path)
+    ? new RegExp(`\\b(?:enum|struct|class|actor|protocol|extension)\\s+${qualifier}(?![\\w$.])`)
+    : /\.(?:kt|kts)$/.test(path)
+      ? new RegExp(`\\b(?:class|object|interface)\\s+${qualifier}(?![\\w$.])`)
+      : /\.(?:[cm]?[jt]sx?)$/.test(path)
+        ? new RegExp(`\\b(?:class|namespace)\\s+${qualifier}(?![\\w$.])`)
+        : null;
+
+/** Where `name` is declared inside the body of a type or extension called `qualifier` (or, in Kotlin, as
+ * an extension function `fun Qualifier.name(`), searched in `all`'s order. The body is approximate: from
+ * the header line (its `{` on that line or opening the next non-blank one) to where the brace depth returns
+ * to zero, braces in double-quoted strings and after `//` ignored. One pass over each file. */
+function scopedDefinition(all: [string, string[]][], name: string, qualifier: string): [string, number] | null {
+  const q = qualifier.replace(/[$]/g, "\\$");
+  const keyword = DECL_KEYWORD_RE(name);
+  const header = DECL_HEADER_RE(name);
+  const ktExtension = new RegExp(`\\bfun\\s+(?:<[^>]*>\\s*)?${q}\\s*\\.\\s*${name}\\b`);
+  for (const [path, lines] of all) {
+    const scope = SCOPE_HEADER_RE(q, path);
+    if (!scope) continue;
+    const closures = TRAILING_CLOSURE_RE.test(path);
+    const kotlin = /\.(?:kt|kts)$/.test(path);
+    // depth > 0: inside a body; pending: a header seen whose body has not opened yet.
+    let depth = 0;
+    let pending = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (kotlin && ktExtension.test(line)) return [path, i];
+      let from = 0;
+      if (depth === 0) {
+        const m = scope.exec(line);
+        if (m) { pending = true; from = m.index + m[0].length; }
+        else if (pending && line.trim() && !line.trim().startsWith("{")) pending = false;
+        if (!pending) continue;
+      }
+      const inside = depth > 0;
+      for (const ch of line.slice(from).replace(/"(?:[^"\\]|\\.)*"/g, "").replace(/\/\/.*$/, "")) {
+        if (ch === "{") { depth += 1; pending = false; }
+        else if (ch === "}" && depth > 0) depth -= 1;
+      }
+      if ((inside || depth > 0) && (keyword.test(line) || (!closures && header.test(line)))) return [path, i];
+    }
+  }
+  return null;
+}
+
 /** Where `name` is declared among `files`: the first declaration proper in any file (within a file a
  * keyword declaration or binding before a header-only match), else (only when no file declares it) the
  * first looser DEF_RE match outside Swift/Kotlin (a multi-line signature, a class-property arrow; there an
  * indented `VStack(` is a call). Within each pass the `prefer` paths are searched first, in order (see
- * definitionOrder), so a same-named function in an unrelated module loses. [path, 0-based line] or null. */
-function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = []): [string, number] | null {
+ * definitionOrder), so a same-named function in an unrelated module loses. Before all that, a name called
+ * qualified by a type (`Hub.lines(`, `qualifiers` from callQualifiers) is looked up inside that type's body
+ * (scopedDefinition): another type's same-named function is not what it calls. [path, 0-based line] or null. */
+function findDefinition(files: Iterable<[string, string[]]>, name: string, prefer: string[] = [], qualifiers: string[] = []): [string, number] | null {
   const n = name.replace(/[$]/g, "\\$");
   const rank = (p: string) => { const i = prefer.indexOf(p); return i < 0 ? prefer.length : i; };
   const all = [...files].sort(([a], [b]) => rank(a) - rank(b));
+  for (const q of qualifiers) {
+    const scoped = scopedDefinition(all, n, q);
+    if (scoped) return scoped;
+  }
   const keyword = DECL_KEYWORD_RE(n);
   const header = DECL_HEADER_RE(n);
   for (const [path, lines] of all) {
@@ -804,6 +872,7 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     .map((f) => [f.path, f.content.split("\n")]);
   const content = new Map(sample.files.map((f) => [f.path, f.content]));
   const callsIn = addedIn.map(calledNames);
+  const qualifiers = callQualifiers(added);
   const ownLines = files.map((p) => [p, (content.get(p) ?? "").split("\n")] as const);
   const blocks: string[] = [];
   const shown: [string, number, number][] = [];
@@ -817,7 +886,7 @@ export function calleeDefinitions(sample: SamplePr, files: string[], maxChars: n
     if (ownLines.some(([p, lines]) => lines.some((l) => ownDecl.test(l) || (!TRAILING_CLOSURE_RE.test(p) && ownHeader.test(l))))) continue;
     // The feature file whose added lines call it: its own imports decide between same-named definitions.
     const caller = files[callsIn.findIndex((c) => c.includes(name))];
-    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : []);
+    const found = findDefinition(corpus, name, caller ? definitionOrder(caller, content.get(caller) ?? "") : [], qualifiers.get(name));
     if (!found) continue;
     const [path, i] = found;
     const lines = corpus.find(([p]) => p === path)?.[1] ?? [];
@@ -937,9 +1006,10 @@ export function evidencePack(sample: SamplePr, f: Finding, map: Map<string, MapE
     ...[...f.evidence.matchAll(/`([^`]+)`/g)].map((m) => m[1]),
   ].join("\n");
   const prefer = definitionOrder(f.file, fileLines.join("\n"));
+  const qualifiers = callQualifiers(citedCode);
   for (const name of calledNames(citedCode).slice(0, 8)) {
     if (defs >= 6) break;
-    const found = findDefinition(corpus, name, prefer);
+    const found = findDefinition(corpus, name, prefer, qualifiers.get(name));
     if (found) { addCode(found[0], found[1] + 1, 3, 15); defs += 1; }
   }
   // Who calls the cited code: a claim about what a caller passes ("task may be null") is decided at the
@@ -1199,6 +1269,8 @@ const failedNote = (s: Pick<PipelineStats, "failedGroups" | "splitRetried" | "un
 
 export type PipelineStats = {
   mapTurns: number; groups: number; lenses: number; minutes?: number; splitRetried: number; unreviewedFiles: string[]; failedGroups: number; candidates: number; gated: number; softGated: number;
+  /** Candidates dropped before verification as build/test-outcome claims (isBuildOutcomeClaim). */
+  buildClaims?: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
   stages?: Partial<Record<StageName, StageTotals>>;
 };
@@ -1223,7 +1295,7 @@ function stageBreakdown(stages: Partial<Record<StageName, StageTotals>>): string
 
 export function pipelineSummary(s: PipelineStats): string {
   const stages = s.stages ? stageBreakdown(s.stages) : "";
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s), ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
 }
 
 /** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
@@ -1362,6 +1434,43 @@ const GATE_ROWS = 8;
  * a quote the gate could not match is a question for it, not a reason to drop the candidate unread. */
 const SOFT_DROPS = new Set(["speculative", "evidence_unverified", "evidence_unavailable"]);
 
+/** Wording a runtime defect shares with a build or test claim ("a type mismatch when decoding the
+ * response", "the assertion fails and crashes the app"): such text is not a build/test-outcome claim. */
+const RUNTIME_WORDS = /\b(?:run[- ]?time|crash\w*|rais(?:e|es|ed|ing)|throw\w*|thrown|exceptions?|traceback|panic\w*|decod\w*|deserializ\w*|pars(?:e|es|ed|ing)|json|payload|response)\b/i;
+/** A test outcome that a passing run cannot disprove: a flaky or order-dependent test is a real defect. */
+const FLAKY_WORDS = /\b(?:flak\w*|intermittent\w*|sometimes|random\w*|race|racy|timing|order[- ]dependent|non-?deterministic\w*)\b/i;
+/**
+ * Claims that the change does not build or that a test fails (local_review.pipeline_drop_build_claims). The
+ * authors run a build and test gate before review, so such a claim is noise the build already disproved:
+ * on a Swift repo three of five wrong local reasons were "Compile error: String.split expects a Character",
+ * "Compilation fails: lines takes 2 arguments" (another type's same-named function) and "Running the test
+ * causes the assertion to fail" — it built and the test passed. Matched against the title, failure scenario
+ * and root cause. Kept conservative: `TypeError` (one word, a Python/JS runtime crash) never matches, and a
+ * pattern with `unless` does not count when the text also has that runtime or flaky-test wording.
+ */
+const BUILD_CLAIM_PATTERNS: { claim: RegExp; unless?: RegExp }[] = [
+  // compile error, compilation fails, compiler error, compile-time error, compilation failure
+  { claim: /\bcompil(?:e|es|ing|ation|er)(?:[- ]time)?\s+(?:errors?|fail\w*|breaks?)\b/i },
+  // does not compile, won't build, fails to compile, no longer type-checks
+  { claim: /\b(?:(?:does|do|will|would|could)(?:\s+not|n['’]?t)|won['’]?t|can(?:not|['’]t)|no\s+longer|fail(?:s|ed)?\s+to|refuses?\s+to)\s+(?:compile|build|type-?check)\b/i },
+  // build fails, build failure, build error, breaks the build; linker error
+  { claim: /\bbuild\s+(?:will\s+|would\s+)?(?:fail\w*|breaks?|broke|errors?)\b|\bbreaks?\s+the\s+build\b|\blinker\s+errors?\b/i },
+  // type error, type mismatch (a static type check; not a runtime decoding or TypeError crash)
+  { claim: /\btype\s+(?:errors?|mismatch(?:es)?)\b/i, unless: RUNTIME_WORDS },
+  // test fails, tests will fail, causes the test to fail, failing test (not "fails to detect")
+  { claim: /\btests?\s+(?:case\s+|suite\s+)?(?:to\s+|will\s+|would\s+|now\s+)?(?:fail(?:s|ed|ing)?|breaks?|broke)\b(?!\s+to\b)|\bfailing\s+tests?\b/i, unless: FLAKY_WORDS },
+  // assertion fails, causes the assertion to fail, assertion failure (not an assert that crashes the app)
+  { claim: /\bassert(?:ion)?s?\s+(?:to\s+|will\s+|would\s+)?(?:fail(?:s|ed|ing|ure)?|trips?)\b(?!\s+to\b)/i, unless: new RegExp(`${RUNTIME_WORDS.source}|${FLAKY_WORDS.source}`, "i") },
+  // XCTAssertEqual fails, XCTAssertTrue(x) would fail
+  { claim: /\bXCTAssert\w*\b[^\n]{0,80}?\bfail(?:s|ed|ing|ure)?\b/i, unless: FLAKY_WORDS },
+];
+
+/** Whether a candidate's claimed failure is a build or test outcome (BUILD_CLAIM_PATTERNS). */
+export function isBuildOutcomeClaim(f: Pick<Finding, "title" | "failureScenario" | "rootCause">): boolean {
+  const text = [f.title, f.failureScenario, f.rootCause].join("\n");
+  return BUILD_CLAIM_PATTERNS.some(({ claim, unless }) => claim.test(text) && !(unless && unless.test(text)));
+}
+
 /**
  * One review JSON's findings as candidates. The finding gate's hard drops (already reported, self-
  * retracted, contradicted by the diff or by the reply itself) and its note routing (docs / style /
@@ -1467,7 +1576,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const ctx = makeCtx(settings, deps, t);
   const startedAt = Date.now();
   let lenses = lensesFor(settings.localPipelineLenses);
-  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
+  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
     const budget = featureBudget(settings, t);
@@ -1554,7 +1663,17 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
       const unparsedText = evidence.length ? evidence.join("\n\n---\n\n") : undefined;
       return { ok: false, error: `local pipeline produced no review JSON (${groups.length} feature group(s) failed)`, ...(unparsedText ? { unparsedText } : {}) };
     }
-    const unique = dedupeCandidates(candidates);
+    // A claim that the change does not build or that a test fails is one the authors' build and test gate
+    // already disproved (local_review.pipeline_drop_build_claims): dropped before it costs a verify turn,
+    // and before the dedupe, so it never stands in for a runtime defect reported on the same line.
+    const dropBuildClaims = settings.localPipelineDropBuildClaims !== false;
+    const claims = candidates.filter((c) => {
+      if (!dropBuildClaims || !isBuildOutcomeClaim(c)) return true;
+      stats.buildClaims = (stats.buildClaims ?? 0) + 1;
+      deps.log?.(`pipeline dropped a build/test-outcome claim ${c.file}:${c.line} (${c.title})`);
+      return false;
+    });
+    const unique = dedupeCandidates(claims);
     stats.gated = unique.length;
     const { findings, assumptions: verifyNotes, verifiedKeys } = await refuteAndSelect(ctx, sample, unique, map, stats);
     stats.turns = ctx.turns;

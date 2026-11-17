@@ -1222,3 +1222,136 @@ test("prefix cache: verify turns go out grouped by file, files in severity order
   // Each candidate's own verdict decides: exactly the two confirmed titles are posted.
   assert.deepEqual(JSON.parse(out.raw).findings.map((f) => f.title), ["bravo bravoq", "alpha alphaq"]);
 });
+
+// ── 2026-11-17: build/test-outcome claims dropped before verification; a type-qualified call resolves to
+// that type's function ──
+
+const candidateTitle = (b) => /"title": "([^"]+)"/.exec(/<<<CANDIDATE[^\n]*\n([\s\S]*?)\n<<<END>>>/.exec(b.messages[1].content)?.[1] ?? "")?.[1];
+const OUTCOME_FILES = {
+  "app/rows.py": "def first_row(rows, through):\n    limit = through + 1\n    return rows[:limit]\n",
+  "App/Tasks.swift": "final class Tasks {\n  func name(of task: Task?) -> String {\n    return task!.name\n  }\n}\n",
+  "Sources/Hub/Split.swift": "extension Hub {\n  static func rows(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n",
+};
+const outcomeRow = (file, line, quote, title, failure_scenario, root_cause) => ({
+  severity: "P1", file, line, side: "RIGHT", title, failure_scenario, root_cause, evidence: `${file}:${line} \`${quote}\``, recommended_fix: "Fix it.", recommended_test: "Cover it.",
+});
+const OUTCOME_ROWS = {
+  "Sources/Hub/Split.swift": [
+    outcomeRow("Sources/Hub/Split.swift", 3, 'return text.split(separator: "\\n")', "Compile error: String.split expects a Character", "The module does not build: the separator literal is a String.", "split(separator:) takes a Character, not a String."),
+    outcomeRow("Sources/Hub/Split.swift", 2, "static func rows(_ text: String) -> [Substring] {", "Running the test causes the assertion to fail", "XCTAssertEqual(Hub.rows(\"a\\n\").count, 2) fails.", "Empty subsequences are omitted, so the count is 1."),
+  ],
+  "app/rows.py": [outcomeRow("app/rows.py", 2, "limit = through + 1", "TypeError crash when through is None", "first_row(rows, None) raises TypeError on None + 1.", "through + 1 runs with no None check.")],
+  "App/Tasks.swift": [outcomeRow("App/Tasks.swift", 3, "return task!.name", "Force unwrap crashes when task is nil", "name(of: nil) traps at the force unwrap.", "task! is unwrapped with no guard.")],
+};
+
+test("build/test claims: a compile-error and a test-failure claim are dropped before verification and counted; runtime crashes are verified", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineDropBuildClaims, true);
+  await wholePr(async () => {
+    const m = model({ review: reviewFor(OUTCOME_ROWS), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample(OUTCOME_FILES), settings, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    const verified = m.bodies.filter((b) => stageOf(b) === "verify").map(candidateTitle).sort();
+    assert.deepEqual(verified, ["Force unwrap crashes when task is nil", "TypeError crash when through is None"]);
+    assert.match(out.pipelineSummary, /4 candidate\(s\), 2 build\/test-outcome claim\(s\) dropped, 2 to verify/);
+  });
+});
+
+test("build/test claims: with local_review.pipeline_drop_build_claims off, every candidate is verified and none is counted as dropped", async () => {
+  await wholePr(async () => {
+    const m = model({ review: reviewFor(OUTCOME_ROWS), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample(OUTCOME_FILES), { ...settings, localPipelineDropBuildClaims: false }, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    assert.equal(m.bodies.filter((b) => stageOf(b) === "verify").length, 4);
+    assert.doesNotMatch(out.pipelineSummary, /build\/test-outcome/);
+    assert.match(out.pipelineSummary, /4 candidate\(s\), 4 to verify/);
+  });
+});
+
+test("build/test claims: other wordings (does not compile, type mismatch, build fails, test fails, XCTAssert fails) are dropped; runtime type and flaky-test wording is not", async () => {
+  const file = "Sources/Hub/Split.swift";
+  const row = (title, failure, root) => outcomeRow(file, 3, 'return text.split(separator: "\\n")', title, failure, root);
+  const dropped = [
+    row("Split does not compile", "x", "y"),
+    row("Separator has a type mismatch", "The compiler rejects the call.", "y"),
+    row("Splitting rows breaks", "The build fails on the new call.", "y"),
+    row("Rows count is off by one", "The existing test fails on the trailing newline.", "y"),
+    row("Rows lose the trailing empty line", "XCTAssertEqual(rows.count, 2) fails.", "y"),
+  ];
+  const kept = [
+    row("Decoding hits a type mismatch on rows", "The server sends a string, so decoding the payload fails.", "y"),
+    row("Row order differs between runs", "The test fails intermittently because the rows come from a set.", "y"),
+  ];
+  // Distinct lines so the dedupe keeps every row.
+  const rows = [...dropped, ...kept].map((r, i) => ({ ...r, line: (i % 3) + 1, title: `${r.title} ${"abcdefgh"[i]}${"abcdefgh"[i]}q` }));
+  const fileText = "extension Hub {\n  static func rows(_ text: String) -> [Substring] {\n    return text.split(separator: \"\\n\")\n  }\n}\n";
+  const quotes = ["extension Hub {", "static func rows(_ text: String) -> [Substring] {", 'return text.split(separator: "\\n")'];
+  for (const r of rows) r.evidence = `${file}:${r.line} \`${quotes[r.line - 1]}\``;
+  await wholePr(async () => {
+    const m = model({ review: reviewFor({ [file]: rows }), verify: refute });
+    const out = await runLocalReviewPipeline(swiftSample({ [file]: fileText }), { ...settings, localPipelineMaxFindings: 8 }, { request: m.request });
+    assert.equal(out.ok, true, out.error);
+    const verified = m.bodies.filter((b) => stageOf(b) === "verify").map(candidateTitle).sort();
+    assert.deepEqual(verified, rows.slice(dropped.length).map((r) => r.title).sort());
+    assert.match(out.pipelineSummary, /5 build\/test-outcome claim\(s\) dropped/);
+  });
+});
+
+// Two Swift types declare a same-named static `lines`; the corpus lists the one the call does NOT name first.
+const QUALIFIED = {
+  changed: { "Sources/App/Loader.swift": "enum Loader {\n  static func rows(_ text: String) -> [Row] {\n    return Hub.lines(text, as: Row.self, what: \"x\")\n  }\n}\n" },
+  refs: [
+    { path: "Sources/Hub/HubArguments.swift", content: "enum HubArguments {\n  public static func lines<T>(_ file: String, as type: T.Type) -> (rows: [T], unreadable: Int) {\n    return (rows: [], unreadable: 1) // ARGUMENTS-LINES\n  }\n}\n" },
+    { path: "Sources/Hub/Hub+Lines.swift", content: "extension Hub {\n  static func lines<T>(_ text: String, as type: T.Type, what: String) -> [T] {\n    return [] // HUB-LINES\n  }\n}\n" },
+  ],
+};
+
+test("qualified call: calleeDefinitions shows the `lines` declared in Hub's extension, not another type's same-named `lines`", () => {
+  const block = calleeDefinitions(swiftSample(QUALIFIED.changed, { referenceFiles: QUALIFIED.refs }), ["Sources/App/Loader.swift"], 6_000);
+  assert.match(block, /--- Sources\/Hub\/Hub\+Lines\.swift[\s\S]*HUB-LINES/);
+  assert.doesNotMatch(block, /ARGUMENTS-LINES/);
+});
+
+test("qualified call: the verifier's evidence shows the `lines` declared in Hub's extension, not another type's", () => {
+  const s = swiftSample(QUALIFIED.changed, { referenceFiles: QUALIFIED.refs });
+  // No quote or symbol name in the finding text, so only the called-name lookup reaches either file.
+  const pack = evidencePack(s, finding("Sources/App/Loader.swift", 3, { title: "Rows are read with the wrong arguments", evidence: "Sources/App/Loader.swift:3" }), new Map(), 20_000);
+  assert.match(pack.code, /Sources\/Hub\/Hub\+Lines\.swift[\s\S]*HUB-LINES/);
+  assert.doesNotMatch(pack.code, /ARGUMENTS-LINES/);
+});
+
+test("qualified call: a lower-case qualifier (an instance) keeps the plain lookup; a type qualifier picks that class's method", () => {
+  const refs = [
+    { path: "src/archive.ts", content: "export class Archive {\n  save(item) {\n    return 'ARCHIVE-SAVE';\n  }\n}\n" },
+    { path: "src/store.ts", content: "export class Store {\n  static save(item) {\n    return 'STORE-SAVE';\n  }\n}\n" },
+  ];
+  const call = (line) => calleeDefinitions(sample({ "src/use.ts": `export function use(store, item) {\n  ${line}\n}\n` }, { referenceFiles: refs }), ["src/use.ts"], 6_000);
+  const instance = call("return store.save(item);");
+  assert.equal(instance, call("return save(item);"), "store.save( is looked up as save( was");
+  assert.match(instance, /ARCHIVE-SAVE/);
+  const typed = call("return Store.save(item);");
+  assert.match(typed, /--- src\/store\.ts[\s\S]*STORE-SAVE/);
+  assert.doesNotMatch(typed, /ARCHIVE-SAVE/);
+});
+
+test("qualified call: Kotlin `Foo.bar(` resolves to `object Foo { fun bar(`, and `Foo.baz(` to the extension `fun Foo.baz(`", () => {
+  const refs = [
+    { path: "app/src/Other.kt", content: "class Other {\n  fun bar(x: Int): Int {\n    return x * 2 // OTHER-BAR\n  }\n  fun baz(x: Int): Int {\n    return x * 3 // OTHER-BAZ\n  }\n}\n" },
+    { path: "app/src/Foo.kt", content: "object Foo {\n  fun bar(x: Int): Int {\n    return x + 1 // FOO-BAR\n  }\n}\n" },
+    { path: "app/src/FooExt.kt", content: "package app\n\nfun Foo.baz(x: Int): Int {\n  return x + 2 // FOO-BAZ\n}\n" },
+  ];
+  const s = { ...sample({ "app/src/Main.kt": "fun main() {\n  val y = Foo.bar(1) + Foo.baz(2)\n  println(y)\n}\n" }, { referenceFiles: refs }) };
+  const block = calleeDefinitions(s, ["app/src/Main.kt"], 6_000);
+  assert.match(block, /--- app\/src\/Foo\.kt[\s\S]*FOO-BAR/);
+  assert.match(block, /--- app\/src\/FooExt\.kt[\s\S]*FOO-BAZ/);
+  assert.doesNotMatch(block, /OTHER-BAR|OTHER-BAZ/);
+});
+
+test("qualified call: the scoped lookup stays linear on a large file with many type bodies", () => {
+  const big = Array.from({ length: 20_000 }, (_, i) => `struct Type${i} {\n  func lines(_ x: Int) -> Int {\n    return x\n  }\n}`).join("\n");
+  const refs = [{ path: "Sources/Big.swift", content: big }, { path: "Sources/Hub.swift", content: "enum Hub {\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" }];
+  const t0 = performance.now();
+  const block = calleeDefinitions(swiftSample({ "Sources/Use.swift": "let n = Hub.lines(1)\n" }, { referenceFiles: refs }), ["Sources/Use.swift"], 6_000);
+  const ms = performance.now() - t0;
+  assert.match(block, /HUB-LINES/);
+  assert.ok(ms < 1_500, `calleeDefinitions took ${Math.round(ms)}ms`);
+});

@@ -817,6 +817,16 @@ function sharedCount(a: Set<string>, b: Set<string>): number {
   return n;
 }
 
+/** The evidence line of a finding the local verifier posted in its own words (a reframe): the title the
+ * reporter gave it. The reporter states the same defect that way again on the next push. */
+export const REPORTED_AS = "Reported as: ";
+
+/** The reporter's titles a prior finding's evidence keeps (REPORTED_AS, the last line of the evidence; a
+ * review body's one-line detail has it after a space). */
+function reportedTitles(evidence: string | undefined): string[] {
+  return [...String(evidence ?? "").matchAll(/(?:^|\s)Reported as: (.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+}
+
 export function findPriorDuplicate(f: Pick<Finding, "file" | "title"> & { line?: number }, ctx: Pick<GateContext, "priorFindings">, verifiedQuotes: string[] = []): PriorFinding | undefined {
   const title = tokens(f.title);
   // The same quoted code (loose-normalized): equal or one containing the other, and the shorter a
@@ -826,22 +836,26 @@ export function findPriorDuplicate(f: Pick<Finding, "file" | "title"> & { line?:
   const contains = (a: string, b: string) => a === b || a.includes(b) || b.includes(a);
   for (const p of ctx.priorFindings ?? []) {
     if (!p || p.file !== f.file) continue;
-    const j = jaccard(title, tokens(p.title));
-    if (j >= 0.8) return p;
-    const sameLine = Boolean(p.line && p.line === f.line);
-    if (j >= 0.6 && sameLine) return p;
-    if (mine.length && p.evidence) {
-      const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
-      // The same substantial code AND a corroborating claim: two independent defects in one statement
-      // (an injection and a missing tenant filter on the same DELETE) are not a repeat.
-      if (sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => same(q, t)))) return p;
-      // A similar title quoting the same code (any length: the title already ties the subject).
-      if (j >= 0.6 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
-      // The same anchor and subject: posted on the same line of the same file, quoting the same code,
-      // and the titles share at least two content words. A short line (`id: string;`) ties two
-      // findings only together with the line it was posted on; a different claim about the same line
-      // (few shared title words) is new.
-      if (sameLine && sharedCount(title, tokens(p.title)) >= 2 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
+    // The prior's posted title, or a title its reporter gave it before the verifier reframed it.
+    for (const priorTitle of [p.title, ...reportedTitles(p.evidence)]) {
+      const theirTitle = tokens(priorTitle);
+      const j = jaccard(title, theirTitle);
+      if (j >= 0.8) return p;
+      const sameLine = Boolean(p.line && p.line === f.line);
+      if (j >= 0.6 && sameLine) return p;
+      if (mine.length && p.evidence) {
+        const theirs = extractEvidenceQuotes(p.evidence).filter((q) => q.length >= MIN_QUOTE).map(loose);
+        // The same substantial code AND a corroborating claim: two independent defects in one statement
+        // (an injection and a missing tenant filter on the same DELETE) are not a repeat.
+        if (sharedCount(title, theirTitle) >= 2 && mine.some((q) => theirs.some((t) => same(q, t)))) return p;
+        // A similar title quoting the same code (any length: the title already ties the subject).
+        if (j >= 0.6 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
+        // The same anchor and subject: posted on the same line of the same file, quoting the same code,
+        // and the titles share at least two content words. A short line (`id: string;`) ties two
+        // findings only together with the line it was posted on; a different claim about the same line
+        // (few shared title words) is new.
+        if (sameLine && sharedCount(title, theirTitle) >= 2 && mine.some((q) => theirs.some((t) => contains(q, t)))) return p;
+      }
     }
   }
   return undefined;

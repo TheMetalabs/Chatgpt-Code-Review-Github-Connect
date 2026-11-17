@@ -11,6 +11,7 @@ import {
   sameHeadRepost,
   sameSha,
 } from "./prior-findings.ts";
+import { findPriorDuplicate } from "./finding-gate.ts";
 import type { Finding } from "./types.ts";
 
 // Synthetic findings only (this repo is public): a cart service and a token cache.
@@ -144,5 +145,44 @@ describe("prior-findings: duplicates", () => {
     assert.equal(dedupePriorOn({}), true);
     assert.equal(postLatestHeadOnlyOn({ postLatestHeadOnly: false } as never), false);
     assert.equal(dedupePriorOn({ findingDedupePrior: false } as never), false);
+  });
+});
+
+// A finding the local verifier reframed is posted in its own words, with the reporter's title kept as the
+// evidence's last line ("Reported as: …"); the next push's reporter states the defect with that title again.
+describe("prior-findings: a reframed finding's reporter title", () => {
+  const quote = 'if !app.buttons["Next"].waitForExistence(timeout: 3) { continue }';
+  const reframed = finding({
+    file: "UITests/Capture.swift",
+    line: 42,
+    title: "Capture silently skipped when the 3 s timer fires first",
+    evidence: `UITests/Capture.swift:42 \`${quote}\`\nVerified against the code: \`${quote}\`\nReported as: waitForExistence blocks 13 s per page`,
+  });
+  const hunter = { file: "UITests/Capture.swift", line: 42, title: "waitForExistence blocks 13 s per page" };
+
+  it("findPriorDuplicate matches a new title against a prior's Reported-as title (same line, or moved)", () => {
+    const prior = { file: reframed.file, line: 42, title: reframed.title, evidence: reframed.evidence, commitId: "abc1234" };
+    assert.ok(findPriorDuplicate(hunter, { priorFindings: [prior] }, [quote]));
+    assert.ok(findPriorDuplicate({ ...hunter, line: 45 }, { priorFindings: [prior] }, [quote]));
+    // Without the line the two titles share nothing: the reframed prior is not found.
+    const bare = { ...prior, evidence: prior.evidence.replace(/\nReported as: .*$/, "") };
+    assert.equal(findPriorDuplicate(hunter, { priorFindings: [bare] }, [quote]), undefined);
+    // A different defect on the same line is still new.
+    assert.equal(findPriorDuplicate({ ...hunter, title: "Screenshot name collides across locales" }, { priorFindings: [prior] }, [quote]), undefined);
+  });
+
+  it("an inline comment and an unanchored review-body row both keep the Reported-as title readable and matchable", () => {
+    const inline = inlineFindingComment(reframed, { owner: "o", repo: "r", headSha: OLD });
+    assert.match(inline, /\nReported as: waitForExistence blocks 13 s per page\n\nFix: /);
+    const body = reviewSummaryBody({ ...summaryJob, reviewProviders: ["chatgpt"] }, [reframed, second], "ashlar-bot", [reframed, second]);
+    // The unanchored row stays one detail line, so the row after it is still read back.
+    const rows = parseReviewBodyFindings(body);
+    assert.deepEqual(rows.map((r) => r.title), [reframed.title, second.title]);
+    for (const prior of [
+      collectPriorFindings({ botLogin: BOT, comments: [{ id: 1, userLogin: BOT, path: reframed.file, line: 42, commitId: OLD, body: inline }], reviews: [] }).findings,
+      collectPriorFindings({ botLogin: BOT, comments: [], reviews: [{ userLogin: BOT, commitId: OLD, body }] }).findings,
+    ]) {
+      assert.equal(isPriorDuplicate({ ...hunter, evidence: `UITests/Capture.swift:42 \`${quote}\`` }, prior), true);
+    }
   });
 });

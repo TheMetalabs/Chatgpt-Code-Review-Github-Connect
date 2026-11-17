@@ -280,7 +280,9 @@ function unanchoredBlock(unanchored: Finding[]): string {
     const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
       .map((s) => s.trim())
       .filter(Boolean)
-      .join(" — "));
+      .join(" — ")
+      // One detail line: a line break in the evidence ("Verified against the code: …") would end the row.
+      .replace(/\s*\n\s*/g, " "));
     return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;
   });
   return `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${rows.join("\n")}\n`;

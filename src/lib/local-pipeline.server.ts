@@ -38,7 +38,7 @@ import {
   type LocalReviewDeps,
   type LoopTuning,
 } from "./local-review-loop.server.ts";
-import { applyFindingGate, gateLiveSubmission } from "./poster.ts";
+import { applyFindingGate, FINDING_EVIDENCE_MAX_CHARS, gateLiveSubmission } from "./poster.ts";
 import { REPORTED_AS, unprovenNoteCategory, verifiedKey } from "./finding-gate.ts";
 import { isCodePath, orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, Finding, SamplePr, Severity } from "./types.ts";
@@ -694,7 +694,9 @@ const CALL_STOP = new Set([
  * confirmed a claim that body refutes (WalkieBoard #570). */
 export function calledNames(code: string): string[] {
   const out = new Set<string>();
-  for (const m of code.matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
+  // Comments are not calls (`// TODO: refresh() later`); literals stay, as a call in an interpolation
+  // (`${format(x)}`, `"\(format(x))"`) is one.
+  for (const m of nonCode(code, true).matchAll(/(?<![\w$])([A-Za-z_$][\w$]*)\s*\(|<([A-Z][\w$]*)[\s/>]/g)) {
     const name = m[1] ?? m[2] ?? "";
     if (name.length < 3 || CALL_STOP.has(name) || /^XCT/.test(name)) continue;
     out.add(name);
@@ -702,12 +704,13 @@ export function calledNames(code: string): string[] {
   return [...out];
 }
 
-/** The type qualifiers of each qualified call in `code`: `Hub.lines(` gives lines → [Hub]. Only a
- * capitalised qualifier (a type, not an instance such as `store.save(`) counts. calledNames keeps the bare
- * name; findDefinition then prefers the declaration inside that type (scopedDefinition). */
+/** The type qualifiers of each qualified call in `code`: `Hub.lines(` gives lines → [Hub], several in the
+ * order the calls appear. Only a capitalised qualifier (a type, not an instance such as `store.save(`)
+ * counts, and only in code: `// Legacy.lines() used to run here` or a string naming it is no call (codeOnly).
+ * calledNames keeps the bare name; findDefinition then prefers the declaration inside that type (scopedDefinition). */
 export function callQualifiers(code: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
-  for (const m of code.matchAll(/(?<![\w$])([A-Z][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+  for (const m of nonCode(code).matchAll(/(?<![\w$])([A-Z][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
     const quals = out.get(m[2]) ?? [];
     if (!quals.includes(m[1])) quals.push(m[1]);
     out.set(m[2], quals);
@@ -749,8 +752,10 @@ const SCOPE_HEADER_RE = (qualifier: string, path: string) =>
 
 /** `line` with its comments and string and character literals blanked, so a brace or a type header in
  * one is not code. `state` carries a `/* … *\/` comment and a `"""` string (Swift, Kotlin) across lines;
- * a literal ends on its line (an unterminated one blanks the rest, as a multi-line template does). */
-function codeOnly(line: string, state: { block: boolean; triple: boolean }): string {
+ * a literal ends on its line, and a quote not closed on its line is code (`Don't` in JSX text, `/["']/`, a
+ * template literal over several lines). A `//` or `/*` after a backslash is in a regex (`/\/*$/`). With
+ * `keepLiterals` only the comments are blanked; literals are copied as they are. */
+function codeOnly(line: string, state: { block: boolean; triple: boolean }, keepLiterals = false): string {
   let out = "";
   let i = 0;
   while (i < line.length) {
@@ -762,30 +767,44 @@ function codeOnly(line: string, state: { block: boolean; triple: boolean }): str
       out += " ";
     } else if (state.triple) {
       const end = line.indexOf('"""', i);
-      if (end < 0) return out;
+      if (end < 0) return keepLiterals ? out + line.slice(i) : out;
       state.triple = false;
+      out += keepLiterals ? line.slice(i, end + 3) : " ";
       i = end + 3;
-      out += " ";
-    } else if (line.startsWith("//", i)) {
+    } else if (line.startsWith("//", i) && line[i - 1] !== "\\") {
       return out;
-    } else if (line.startsWith("/*", i)) {
+    } else if (line.startsWith("/*", i) && line[i - 1] !== "\\") {
       state.block = true;
       i += 2;
     } else if (line.startsWith('"""', i)) {
       state.triple = true;
+      if (keepLiterals) out += '"""';
       i += 3;
     } else if (line[i] === '"' || line[i] === "'" || line[i] === "`") {
       const quote = line[i];
       let j = i + 1;
       while (j < line.length && line[j] !== quote) j += line[j] === "\\" ? 2 : 1;
+      if (j >= line.length) {
+        // No closing quote on the line: an apostrophe in JSX text, a quote in a regex, a template literal
+        // that runs over lines. The quote is read as code.
+        out += quote;
+        i += 1;
+        continue;
+      }
+      out += keepLiterals ? line.slice(i, j + 1) : " ";
       i = j + 1;
-      out += " ";
     } else {
       out += line[i];
       i += 1;
     }
   }
   return out;
+}
+
+/** `code` read line by line with codeOnly: its comments blanked, and its literals too unless `keepLiterals`. */
+function nonCode(code: string, keepLiterals = false): string {
+  const state = { block: false, triple: false };
+  return code.split("\n").map((l) => codeOnly(l, state, keepLiterals)).join("\n");
 }
 
 /** Where `name` is declared inside the body of a type or extension called `qualifier` (or, in Kotlin, as
@@ -1456,6 +1475,23 @@ function verifyOrder<T extends Pick<Finding, "file">>(rows: T[]): T[] {
   return [...new Set(rows.map((r) => r.file))].flatMap((file) => rows.filter((r) => r.file === file));
 }
 
+/** A reframed finding's evidence: the reporter's `code` quotes that appear verbatim in the cited file, each
+ * as a `path:line \`code\`` line, then the verifier's proof. The reporter's prose argued for the defect the
+ * verifier rejected, so it is not posted next to the verifier's one. */
+function reframedEvidence(sample: SamplePr, c: Candidate, proof: string): string {
+  const lines = (sample.files.find((f) => f.path === c.file) ?? sample.referenceFiles?.find((f) => f.path === c.file))?.content.split("\n") ?? [];
+  const kept = new Set<string>();
+  for (const m of c.evidence.matchAll(/`([^`\n]+)`/g)) {
+    const q = m[1].trim();
+    if (q.replace(/[^\w]/g, "").length < 8 || proof.includes(q)) continue;
+    // The line of the file holding it, the one nearest the cited line when several do.
+    let at = -1;
+    lines.forEach((l, i) => { if (l.includes(q) && (at < 0 || Math.abs(i + 1 - c.line) < Math.abs(at + 1 - c.line))) at = i; });
+    if (at >= 0) kept.add(`${c.file}:${at + 1} \`${q}\``);
+  }
+  return [...kept, `Verified against the code: \`${proof.replace(/`/g, "'").slice(0, 400)}\``].join("\n");
+}
+
 /** Stages 3 and 4 over the candidates: each verified, the survivors ranked and capped. `verifiedKeys` are
  * the posted findings the verifier confirmed (or left uncertain with a real own quote): the downstream
  * gate does not re-judge their hedges and evidence (finding-gate verifiedKey). */
@@ -1494,10 +1530,12 @@ async function refuteAndSelect(
     const r = results.get(c.cid) as VerifyResult;
     if (r.status === "confirmed") {
       stats.confirmed += 1;
-      const evidence = r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
       // The verifier found a different defect at this place: it is posted in the verifier's words, with
-      // its fix; the reporter's fix and test were for the other reason and are not posted.
+      // its fix and proof; the reporter's fix, test and evidence prose were for the other reason and are not posted.
       const rf = r.reframe;
+      const evidence = rf
+        ? reframedEvidence(sample, c, r.proof ?? "")
+        : r.proof && !c.evidence.includes(r.proof) ? `${c.evidence}\nVerified against the code: \`${r.proof.replace(/`/g, "'").slice(0, 400)}\`` : c.evidence;
       if (rf) {
         stats.reframed = (stats.reframed ?? 0) + 1;
         ctx.deps.log?.(`pipeline reframed ${c.file}:${c.line} (${c.title}) as: ${rf.title}`);
@@ -1506,7 +1544,9 @@ async function refuteAndSelect(
       // A reframed finding keeps the reporter's title in its evidence: the next push's reporter states the
       // same defect in its own words again, and the prior-findings dedupe matches it there (findPriorDuplicate).
       const reported = rf ? `\n${REPORTED_AS}${c.title.replace(/`/g, "'").replace(/\s+/g, " ").slice(0, 160)}` : "";
-      survivors.push({ ...c, ...told, severity: r.severity, evidence: evidence.slice(0, 2_000 - reported.length) + reported, verifyReason: r.reason, verified: true });
+      // Cut to what the posted finding keeps (poster.asFinding), so the "Reported as:" line is never cut off.
+      const cap = rf ? FINDING_EVIDENCE_MAX_CHARS : 2_000;
+      survivors.push({ ...c, ...told, severity: r.severity, evidence: evidence.slice(0, cap - reported.length) + reported, verifyReason: r.reason, verified: true });
     } else if (r.status === "uncertain") {
       stats.uncertain += 1;
       survivors.push({ ...c, severity: "P2", verifyReason: `uncertain: ${r.reason}`, verified: true });
@@ -1554,8 +1594,10 @@ const RUNTIME_WORDS = /\b(?:run[- ]?time|crash\w*|rais(?:e|es|ed|ing)|throw\w*|t
 const FLAKY_WORDS = /\b(?:flak\w*|intermittent\w*|sometimes|random\w*|race|racy|timing|order[- ]dependent|non-?deterministic\w*)\b/i;
 /** A build or test outcome as the trigger of a runtime defect, not the claim itself ("If the Docker build
  * fails, deploy.sh still pushes the previous image", "when a health test fails the pod is not restarted"):
- * the hunt asks for "if <trigger>, <wrong result>". Removed before the patterns are matched. */
-const CONDITIONAL_TRIGGER = /\b(?:if|when|after|once|unless)\b[^,.;:!?\n]{0,60}?\b(?:build\w*|compil\w*|tests?)\b[^,.;:!?\n]{0,30}?\bfail(?:s|ed|ing|ure)?\b/gi;
+ * the hunt asks for "if <trigger>, <wrong result>". The build/test word is the subject, at most two words
+ * after the trigger word: "After this change the build fails" and "When run on CI the tests fail" are claims.
+ * Removed before the patterns are matched. */
+const CONDITIONAL_TRIGGER = /\b(?:if|when|unless)\s+(?:[\w'’]+(?:\s+|-)){0,2}?(?:build\w*|compil\w*|tests?)\b[^,.;:!?\n]{0,30}?\bfail(?:s|ed|ing|ure)?\b/gi;
 /** Compile, build or type-check wording, which a static "type error" / "type mismatch" needs nearby. */
 const STATIC_CHECK = "(?:compil\\w*|build(?:s|ing)?|type[- ]?check\\w*)";
 /**
@@ -1574,8 +1616,12 @@ const BUILD_CLAIM_PATTERNS: { claim: RegExp; unless?: RegExp }[] = [
   { claim: /\b(?:(?:does|do|will|would|could)(?:\s+not|n['’]?t)|won['’]?t|can(?:not|['’]t)|no\s+longer|fail(?:s|ed)?\s+to|refuses?\s+to)\s+(?:compile|build|type-?check)\b/i },
   // build fails, build failure, build error, breaks the build, the build is broken; linker error
   { claim: /\bbuild\s+(?:will\s+|would\s+)?(?:fail\w*|breaks?|broke|errors?)\b|\bbreaks?\s+the\s+build\b|\bbuild\s+(?:is|was)\s+broken\b|\blinker\s+errors?\b/i },
-  // the compiler rejects, fails type checking, error TS2345, Swift "Cannot convert value of type", Kotlin "Unresolved reference"
-  { claim: /\bcompiler\s+(?:will\s+|would\s+)?rejects?\b|\bfails?\s+(?:the\s+)?type[- ]?check(?:ing|s)?\b|\berror\s+TS\d{4}\b|\bcannot\s+convert\s+value\s+of\s+type\b|\bunresolved\s+reference\b/i },
+  // the compiler rejects, error TS2345, Swift "Cannot convert value of type"
+  { claim: /\bcompiler\s+(?:will\s+|would\s+)?rejects?\b|\berror\s+TS\d{4}\b|\bcannot\s+convert\s+value\s+of\s+type\b/i },
+  // fails type checking; Kotlin's "Unresolved reference: foo" (with its colon). Not "fails the type check for
+  // legacy rows, so every request returns 403" or "an unresolved reference, so the validator rejects" (runtime).
+  { claim: /\bfails?\s+type[- ]?checking\b/i, unless: RUNTIME_WORDS },
+  { claim: /\bUnresolved reference:/, unless: RUNTIME_WORDS },
   // type error, type mismatch with compile/build/type-check wording nearby ("type mismatch compile error");
   // alone it is as often a runtime defect (a str key that never matches an int one)
   { claim: new RegExp(`\\btype\\s+(?:errors?|mismatch(?:es)?)\\b[^\\n]{0,40}?\\b${STATIC_CHECK}\\b|\\b${STATIC_CHECK}\\b[^\\n]{0,40}?\\btype\\s+(?:errors?|mismatch(?:es)?)\\b`, "i"), unless: RUNTIME_WORDS },
@@ -1589,10 +1635,15 @@ const BUILD_CLAIM_PATTERNS: { claim: RegExp; unless?: RegExp }[] = [
   { claim: /\bXCTAssert\w*\b[^\n]{0,80}?\bfail(?:s|ed|ing|ure)?\b/i, unless: FLAKY_WORDS },
 ];
 
-/** Whether a candidate's claimed failure is a build or test outcome (BUILD_CLAIM_PATTERNS). */
+/** Whether a candidate's claimed failure is a build or test outcome (BUILD_CLAIM_PATTERNS). When the
+ * failure scenario or root cause uses a build or test failure as its trigger (CONDITIONAL_TRIGGER), the
+ * title's build/test wording names that same trigger ("Build failure still deploys the previous image"):
+ * the title then decides nothing, and the claim must be in the scenario or root cause outside the trigger. */
 export function isBuildOutcomeClaim(f: Pick<Finding, "title" | "failureScenario" | "rootCause">): boolean {
   const text = [f.title, f.failureScenario, f.rootCause].join("\n");
-  const claimed = text.replace(CONDITIONAL_TRIGGER, " ");
+  const body = [f.failureScenario, f.rootCause].join("\n");
+  const bodyClaimed = body.replace(CONDITIONAL_TRIGGER, " ");
+  const claimed = bodyClaimed !== body ? bodyClaimed : text.replace(CONDITIONAL_TRIGGER, " ");
   return BUILD_CLAIM_PATTERNS.some(({ claim, unless }) => claim.test(claimed) && !(unless && unless.test(text)));
 }
 

@@ -186,3 +186,21 @@ describe("prior-findings: a reframed finding's reporter title", () => {
     }
   });
 });
+
+describe("prior-findings: multi-line fields in the unanchored block", () => {
+  it("a multi-line fix keeps its lines, indented in the list item; every row is still read back with its evidence", () => {
+    const fenced = finding({
+      failureScenario: "A client retries applyCoupon.\n\nThe total drops twice.",
+      evidence: "src/cart/total.ts:12 `total -= coupon.amount;`\nVerified against the code: `total -= coupon.amount;`\nReported as: Coupon counted twice",
+      recommendedFix: "Record applied coupon ids:\n```ts\nif (applied.has(coupon.id)) {\n  return total;\n}\n```",
+    });
+    const body = reviewSummaryBody({ ...summaryJob, reviewProviders: ["chatgpt"] }, [fenced, second], "ashlar-bot", [fenced, second]);
+    assert.ok(body.includes("Fix: Record applied coupon ids:\n  ```ts\n  if (applied.has(coupon.id)) {\n    return total;\n  }\n  ```\n"), body);
+    assert.ok(body.includes("A client retries applyCoupon.\n  The total drops twice."), body);
+    const rows = parseReviewBodyFindings(body);
+    assert.deepEqual(rows.map((r) => [r.title, r.evidence]), [
+      [fenced.title, "src/cart/total.ts:12 `total -= coupon.amount;` Verified against the code: `total -= coupon.amount;` Reported as: Coupon counted twice"],
+      [second.title, second.evidence],
+    ]);
+  });
+});

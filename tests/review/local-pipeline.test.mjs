@@ -26,6 +26,7 @@ import {
   isSmallReview,
   SMALL_REVIEW_MAX_FILES,
   isBuildOutcomeClaim,
+  callQualifiers,
 } from "../../src/lib/local-pipeline.server.ts";
 import { collectPriorFindings, isPriorDuplicate } from "../../src/lib/prior-findings.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
@@ -1678,4 +1679,125 @@ test("qualified call: Hub's own member wins over a same-named member of a type n
   ]);
   assert.match(kt, /HUB-LINES/);
   assert.doesNotMatch(kt, /WRONG-OTHER/);
+});
+
+// ── 2026-11-17 (PR review): qualifiers and called names come from code only; a build/test trigger named in
+// the title; a reframed finding's evidence drops the reporter's reasoning ──
+
+const QUAL_REFS = [
+  { path: "src/legacy.ts", content: "export class Legacy {\n  static lines(text) {\n    return 'LEGACY-LINES';\n  }\n}\n" },
+  { path: "src/current.ts", content: "export class Current {\n  static lines(text) {\n    return 'CURRENT-LINES';\n  }\n}\n" },
+];
+const qualUse = (mention) => `import { Current } from './current';\nexport function rows(text) {\n  ${mention}\n  return Current.lines(text);\n}\n`;
+const MENTIONS = ["// Legacy.lines() used to run here", "const note = \"Legacy.lines() used to run here\";", "/* Legacy.lines(text) */"];
+
+test("qualified call: a type named in a comment or string before the real call is no qualifier; the called type's member is shown", () => {
+  for (const mention of MENTIONS) {
+    const s = sample({ "src/rows.ts": qualUse(mention) }, { referenceFiles: QUAL_REFS });
+    const block = calleeDefinitions(s, ["src/rows.ts"], 6_000);
+    assert.match(block, /--- src\/current\.ts[\s\S]*CURRENT-LINES/, mention);
+    assert.doesNotMatch(block, /LEGACY-LINES/, mention);
+    const pack = evidencePack(s, finding("src/rows.ts", 4, { title: "Rows are read the wrong way", evidence: "src/rows.ts:4" }), new Map(), 20_000);
+    assert.match(pack.code, /src\/current\.ts[\s\S]*CURRENT-LINES/, mention);
+    assert.doesNotMatch(pack.code, /LEGACY-LINES/, mention);
+  }
+});
+
+test("callQualifiers: several qualifiers of one name follow the call positions; comments and literals add none", () => {
+  const code = "// Legacy.lines()\nconst a = Beta.lines(1) + Alpha.lines(2);\nconst s = 'Gamma.lines()';\nAlpha.lines(3); Delta.lines(4);";
+  assert.deepEqual([...callQualifiers(code)], [["lines", ["Beta", "Alpha", "Delta"]]]);
+});
+
+test("calledNames: a name only in a comment is not called; a call next to a URL or inside a string interpolation still is", () => {
+  const code = "// TODO: refreshCache() once the API settles\nconst url = \"https://host/path\"; load(url); /* oldLoad(url) */\nconst label = `Total: ${formatPrice(total)}`;\nlet t = \"\\(formatDate(d))\"";
+  assert.deepEqual(calledNames(code), ["load", "formatPrice", "formatDate"]);
+});
+
+test("build/test claims: a build or test failure used as the trigger keeps a runtime finding whose title names it; a real compile claim is still dropped", () => {
+  assert.equal(isBuildOutcomeClaim({ title: "Build failure still deploys the previous image", failureScenario: "If the Docker build fails, deploy.sh still pushes the previous image.", rootCause: "deploy.sh does not check the exit status of docker build." }), false);
+  assert.equal(isBuildOutcomeClaim({ title: "Tests fail and leave the lock file behind", failureScenario: "The lock file stays on disk and the next run waits forever.", rootCause: "When a test fails, cleanup() is skipped." }), false);
+  assert.equal(isBuildOutcomeClaim({ title: "Compile error: X", failureScenario: "The build fails because X takes a Character", rootCause: "" }), true);
+  // A trigger in the scenario does not excuse a claim the root cause makes outside it.
+  assert.equal(isBuildOutcomeClaim({ title: "Build failure", failureScenario: "If the build fails, the previous image is pushed.", rootCause: "The new call does not compile." }), true);
+});
+
+test("verify reframe: the posted evidence keeps the reporter's verbatim code quotes and the verifier's proof, not the reporter's rejected reasoning", async () => {
+  const reported = F({ evidence: "src/orders/orders.controller.ts:3 `return charge(req.body.amount);` - the quoted call deducts a negative charge from the account inside `export function create(req) {`, and `refund(amount)` runs after it." });
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [reported] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted/);
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.evidence, "src/orders/orders.controller.ts:2 `export function create(req) {`\nVerified against the code: `return charge(req.body.amount);`\nReported as: create() charges a negative amount");
+  const comment = inlineFindingComment(asFinding(row, 0));
+  assert.doesNotMatch(comment, /negative charge|deducts|refund/);
+  assert.match(comment, /Verified against the code: `return charge\(req\.body\.amount\);`/);
+  assert.match(comment, /Reported as: create\(\) charges a negative amount/);
+  for (const verifiedKeys of [new Set(out.verifiedKeys), new Set()]) {
+    const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings, { verifiedKeys });
+    assert.ok(gate.ok, gate.error);
+    assert.equal(gate.findings.length, 1, `verified keys: ${verifiedKeys.size}`);
+  }
+});
+
+test("verify reframe: with long reporter evidence the Reported-as line survives the posted evidence cap, so the next push's same report is a duplicate", async () => {
+  const consts = Array.from({ length: 6 }, (_, i) => `export const RATE_${i} = { region: "region-${i}", tier: "standard-plus", minimum: ${i + 1}00 };`);
+  const controller = `${FILES["src/orders/orders.controller.ts"]}${consts.join("\n")}\n`;
+  const evidence = [
+    "src/orders/orders.controller.ts:3 `return charge(req.body.amount);`",
+    ...consts.map((c, i) => `src/orders/orders.controller.ts:${i + 5} \`${c}\``),
+  ].join("\n");
+  assert.ok(evidence.length > 760 && evidence.length < 800, `reporter evidence of ${evidence.length} chars`);
+  const reported = F({ title: "Negative totals reach the payment provider", evidence });
+  await wholePr(async () => {
+    const files = { ...FILES, "src/orders/orders.controller.ts": controller };
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [reported] }), verify: () => reframe() });
+    const out = await runLocalReviewPipeline(sample(files), settings, { request: m.request });
+    assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\)/);
+    const [row] = JSON.parse(out.raw).findings;
+    const posted = asFinding(row, 0);
+    assert.match(posted.evidence, /\nReported as: Negative totals reach the payment provider$/);
+    const comment = inlineFindingComment(posted);
+    const prior = collectPriorFindings({ botLogin: "bot", comments: [{ id: 1, userLogin: "bot", path: posted.file, line: posted.line, commitId: "c1", body: comment }], reviews: [] }).findings;
+    assert.equal(isPriorDuplicate({ file: reported.file, line: reported.line, title: reported.title, evidence: reported.evidence }, prior), true);
+  });
+});
+
+const HUB_OTHER = { path: "src/a.ts", content: "export class Other {\n  static lines(x) {\n    return 2; // WRONG-OTHER\n  }\n}\n" };
+const hubWith = (body) => ({ path: "src/b.tsx", content: `export class Hub {\n  static open(s) {\n${body}\n  }\n  static lines(x) {\n    return 1; // HUB-LINES\n  }\n}\n` });
+
+test("qualified call: an unclosed quote on a line is code and a `/*` or `//` after a backslash is a regex, so Hub's scope stays balanced", () => {
+  const use = { "src/use.ts": "export function use(x) {\n  return Hub.lines(x);\n}\n" };
+  for (const body of [
+    "    return (<p>Don't panic</p>{s.map((x) => (\n      <i>{x}</i>\n    ))});",
+    "    const css = `.a {\n      color: red;\n    }`;\n    return css;",
+    "    if (/[\"']/.test(s)) {\n      s = s.trim();\n    }",
+    "    const t = s.replace(/\\/*$/, \"\");\n    if (t) { return t; }",
+    "    if (/\\//.test(s)) {\n      return s;\n    }",
+    // Literals that already worked: an apostrophe in a string, a brace in quotes, escaped quotes.
+    "    const a = \"it's {\"; const b = '{'; const c = '\\''; const d = \"say \\\"{\\\"\";\n    return a + b + c + d;",
+  ]) {
+    const block = scoped(use, [HUB_OTHER, hubWith(body)], false);
+    assert.match(block, /HUB-LINES/, body);
+    assert.doesNotMatch(block, /WRONG-OTHER/, body);
+  }
+  const swift = scoped(USE_SWIFT, [
+    { path: "Sources/A.swift", content: "struct Other {\n  static func lines(_ x: Int) -> Int {\n    return x // WRONG-OTHER\n  }\n}\n" },
+    { path: "Sources/B.swift", content: "struct Hub {\n  static let sep = #\"\\\"#; static func open() {\n  }\n  static func lines(_ x: Int) -> Int {\n    return x // HUB-LINES\n  }\n}\n" },
+  ]);
+  assert.match(swift, /HUB-LINES/);
+  assert.doesNotMatch(swift, /WRONG-OTHER/);
+});
+
+test("build/test claims: a build or test failure written after the trigger without a comma is still a claim", () => {
+  for (const text of ["After this change the build fails", "Once merged the tests fail on CI", "When run on CI the tests fail because the fixture was removed"]) {
+    assert.equal(claim(text), true, text);
+    assert.equal(claim("x", text), true, text);
+  }
+});
+
+test("build/test claims: a runtime type check or an unresolved schema reference is not a compiler message; Kotlin's is", () => {
+  assert.equal(claim("x", "isUser() fails the type check for legacy rows, so every request returns 403"), false);
+  assert.equal(claim("x", "The schema's $ref is an unresolved reference, so the validator rejects every request"), false);
+  assert.equal(claim("Unresolved reference: foo"), true);
+  assert.equal(claim("this fails type checking"), true);
 });

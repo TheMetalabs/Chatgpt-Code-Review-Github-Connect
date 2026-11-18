@@ -607,19 +607,16 @@ export async function fetchPullSnapshot(
     ? vendoredPaths(allChanged, [await getFile(token, target.owner, target.repo, ".gitattributes", target.headSha).catch(() => null)])
     : [];
   const vendoredSet = new Set(vendored.map((v) => v.path));
-  // MAX_FILES bounds the content fetches. Files with a patch take the slots first (each group in the
-  // API's order): live, 55 binaries (no patch) listed ahead of the code filled every slot, so the review
-  // had no file to review. Binary, empty or too-large files come after them. A path past the cap is
-  // still a changed path (never silently lost): its content is not fetched and its patch is not in the
-  // diff, so a patched one is listed in diffDroppedPaths and the review counts it as not covered.
+  // MAX_FILES caps the changed paths. Files with a patch take the slots first (each group in the API's
+  // order): live, 55 binaries (no patch) listed ahead of the code filled every slot, so the review had
+  // no file to review. Binary, empty or too-large files come after them.
   const withPatch = new Set(rows.filter((f) => f.filename && f.patch).map((f) => f.filename as string));
   const kept = allChanged.filter((p) => !vendoredSet.has(p));
   const ordered = [...kept.filter((p) => withPatch.has(p)), ...kept.filter((p) => !withPatch.has(p))];
-  const fetchedPaths = ordered.slice(0, MAX_FILES);
-  const overCapPaths = ordered.slice(MAX_FILES);
-  const changedPaths = [...fetchedPaths, ...overCapPaths];
-  const policyPaths = policyPathsFor(fetchedPaths);
-  const toFetch = [...new Set([...fetchedPaths, ...policyPaths])];
+  // Paths past the cap are not in the snapshot: not changed paths, not fetched, not in the diff.
+  const changedPaths = ordered.slice(0, MAX_FILES);
+  const policyPaths = policyPathsFor(changedPaths);
+  const toFetch = [...new Set([...changedPaths, ...policyPaths])];
   const files: SnapshotFile[] = [];
   // A changed policy doc (the PR edits a module AGENTS.md/CLAUDE.md) is read twice: its BASE text stays
   // the policy authority (basePolicyFiles — a PR cannot rewrite the rules it is reviewed by), and its
@@ -647,19 +644,17 @@ export async function fetchPullSnapshot(
     target.owner,
     target.repo,
     target.headSha,
-    fetchedPaths,
+    changedPaths,
     new Map(files.map((f) => [f.path, f.content])),
     patchByPath,
     new Set(toFetch),
   );
-  const fetchedSet = new Set(fetchedPaths);
   const diffBlocks = rows
-    .filter((f) => f.filename && fetchedSet.has(f.filename))
+    .filter((f) => f.filename && changedPaths.includes(f.filename))
     .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: snapshotDiffBlock(f.filename as string, f.patch ?? "") }));
   const budgeted = applyBudget(diffBlocks, opts?.diffMaxChars ?? DEFAULT_SETTINGS.promptDiffMaxChars);
   const diff = budgeted.kept.map((b) => b.patch).join(SNAPSHOT_DIFF_SEP);
-  // Dropped by the prompt budget, then patched paths past the file cap (their patch is not in the diff).
-  const diffDroppedPaths = [...budgeted.dropped.map((b) => b.path), ...overCapPaths.filter((p) => withPatch.has(p))];
+  const diffDroppedPaths = budgeted.dropped.map((b) => b.path);
   let body = "";
   try {
     const pull = await fetchPullHead(token, target.owner, target.repo, target.pr);

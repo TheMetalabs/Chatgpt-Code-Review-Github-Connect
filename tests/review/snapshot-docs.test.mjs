@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { TLSSocket } from 'node:tls';
 import { loadTs } from './load-source.mjs';
 import { buildChatParts } from '../../src/lib/chat-prompt.ts';
-import { gateLiveSubmission } from '../../src/lib/poster.ts';
+import { gateLiveSubmission, inChangedPaths } from '../../src/lib/poster.ts';
 import { DEFAULT_SETTINGS } from '../../src/lib/types.ts';
 
 // The real fetchPullSnapshot -> gh -> HTTPS decoder; only DNS and the network stream are fakes. The
@@ -158,7 +158,7 @@ test('a linguist-vendored rule the PR removes from .gitattributes no longer leav
 
 // Live: a 65-file PR whose first 55 compare rows were images (added/removed, no patch) and whose 10 code
 // files came after them. The 50-file cap kept only images, the local pipeline had 0 review targets and
-// failed every time. Files with a patch take the cap's slots first; a path past the cap stays reported.
+// failed every time. Files with a patch take the cap's slots first; a path past the cap is not in the snapshot.
 const pad = (n) => String(n).padStart(2, '0');
 const BINARIES = Array.from({ length: 55 }, (_, i) => ({ filename: `assets/img-${pad(i + 1)}.png`, status: i % 2 ? 'removed' : 'added', changes: 0 }));
 const PATCHED = Array.from({ length: 10 }, (_, i) => ({ filename: `src/app/feature-${pad(i + 1)}.ts`, status: 'modified', changes: 2, patch: `@@ -1 +1 @@\n-export const v${i + 1} = 0;\n+export const v${i + 1} = 1;` }));
@@ -174,13 +174,15 @@ function assertPatchedFirst(sample, paths) {
     assert.ok(sample.diff.includes(`--- ${f.filename}\n${f.patch}`), `${f.filename} patch is in the diff`);
     assert.ok(sample.files.some((x) => x.path === f.filename), `${f.filename} content is fetched`);
   }
-  // 10 patched + 40 binaries fill the 50 content slots; the last 15 binaries are past the cap but still
-  // changed paths of the review, in compare order, and their content is never requested.
-  assert.equal(changed.length, 65, 'no changed path is silently lost');
-  assert.deepEqual(changed.slice(10, 50), BINARIES.slice(0, 40).map((f) => f.filename));
+  // 10 patched + 40 binaries fill the 50 slots; the last 15 binaries are past the cap: neither changed
+  // paths nor fetched.
+  assert.equal(changed.length, 50, 'changedPaths is the capped set');
+  assert.deepEqual(changed.slice(10), BINARIES.slice(0, 40).map((f) => f.filename));
   const overCap = BINARIES.slice(40).map((f) => f.filename);
-  assert.deepEqual(changed.slice(50), overCap, 'paths cut by the cap stay reported');
-  for (const p of overCap) assert.ok(!paths.some((q) => q.startsWith(`/repos/o/r/contents/${p}?`)), `${p} is not fetched`);
+  for (const p of overCap) {
+    assert.ok(!changed.includes(p), `${p} is not a changed path`);
+    assert.ok(!paths.some((q) => q.startsWith(`/repos/o/r/contents/${p}?`)), `${p} is not fetched`);
+  }
   assert.deepEqual(Array.from(sample.diffDroppedPaths), [], 'a cut binary has no patch to drop');
 }
 
@@ -196,14 +198,19 @@ test('the file cap keeps files with a patch first on the pulls/{pr}/files fallba
   assertPatchedFirst(sample, paths);
 });
 
-test('a patched file past the file cap is a changed path listed in diffDroppedPaths, not in the diff', async () => {
+// A path past the cap must stay out of changedPaths: that list is the publish scope (poster
+// inChangedPaths), so listing an unseen file would let a finding on it post as an unanchored body finding.
+test('a file past the cap is not a changed path, so a finding on it is out of the publish scope', async () => {
   const many = Array.from({ length: 52 }, (_, i) => ({ filename: `src/app/feature-${pad(i + 1)}.ts`, status: 'modified', patch: `@@ -1 +1 @@\n-a${i + 1}\n+b${i + 1}` }));
   const { api, paths } = fakeGithub(CAP_CONTENTS, { files: [BINARIES[0], ...many] });
   const sample = await api.fetchPullSnapshot('token', target);
   const cut = ['src/app/feature-51.ts', 'src/app/feature-52.ts'];
-  assert.deepEqual(Array.from(sample.changedPaths), [...many.map((f) => f.filename), BINARIES[0].filename]);
-  assert.deepEqual(Array.from(sample.diffDroppedPaths), cut);
+  assert.deepEqual(Array.from(sample.changedPaths), many.slice(0, 50).map((f) => f.filename), 'the 50 patched files take the cap; the binary and feature-51/52 are cut');
+  assert.deepEqual(Array.from(sample.diffDroppedPaths), [], 'diffDroppedPaths is only what the prompt budget dropped');
+  assert.equal(inChangedPaths(sample, 'src/app/feature-52.ts'), false, 'a finding on an over-cap file is out of the publish scope');
+  assert.equal(inChangedPaths(sample, 'src/app/feature-50.ts'), true);
   for (const p of cut) {
+    assert.ok(!sample.changedPaths.includes(p), `${p} is not a changed path`);
     assert.doesNotMatch(sample.diff, new RegExp(`^--- ${p.replace(/[.]/g, '\\.')}$`, 'm'), `${p} patch is not in the diff`);
     assert.ok(!paths.some((q) => q.startsWith(`/repos/o/r/contents/${p}?`)), `${p} is not fetched`);
   }

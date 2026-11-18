@@ -12,8 +12,8 @@ const stage=body=>{const s=JSON.parse(body).messages[0].content;return s.startsW
 const confirmed=JSON.stringify({verdict:'confirmed',reason:'the constant changed',proof_quote:'export const answer = 42;',severity:'P1'});
 const refuted=JSON.stringify({verdict:'refuted',reason:'documented change',counter_quote:'export const answer = 42;'});
 
-async function run(t,settings,answers,env={},respond=(res,content)=>res.end(reply(content))){
-  const app=await appFixture({reviewChatgpt:false,localJsonRepairEnabled:false,localReviewPipeline:true,localPipelineLenses:1,...settings});t.after(()=>app.close());
+async function run(t,settings,answers,env={},respond=(res,content)=>res.end(reply(content)),github={}){
+  const app=await appFixture({reviewChatgpt:false,localJsonRepairEnabled:false,localReviewPipeline:true,localPipelineLenses:1,...settings},github);t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   Object.assign(app.env,env);
   const out=await app.mention('pipeline-'+Object.values(settings).join('-'));
@@ -23,7 +23,7 @@ async function run(t,settings,answers,env={},respond=(res,content)=>res.end(repl
     while(answered<app.localResponses.length){
       const body=app.localRequests[answered].raw??JSON.stringify(app.localRequests[answered]);
       const s=stage(body);stages.push(s);
-      respond(app.localResponses[answered],answers[s](stages.filter(x=>x===s).length));answered++;
+      respond(app.localResponses[answered],answers[s](stages.filter(x=>x===s).length,body));answered++;
     }
     return ['posted','skipped','dlq','cancelled'].includes(job()?.status);
   },'the job never finished');
@@ -72,11 +72,12 @@ test('pipeline off: the grouped tool loop of before (no map, no verify turn)',as
   assert.deepEqual(stages,['review']);
 });
 
-test('a streamed reply: the turn log has its time to first token and token counts; the ops line sums them per stage',async t=>{
+test('a streamed reply: the turn log has its time to first token, token counts and reply/reasoning sizes; the ops line sums them per stage',async t=>{
   // An SSE reply in two content chunks, then the usage chunk (stream_options.include_usage).
   const sse=(res,content)=>{
     const data=o=>`data: ${JSON.stringify(o)}\n\n`;
     res.writeHead(200,{'content-type':'text/event-stream'});
+    res.write(data({choices:[{delta:{reasoning_content:'think'}}]}));
     res.write(data({choices:[{delta:{content:content.slice(0,5)}}]}));
     res.end(data({choices:[{delta:{content:content.slice(5)},finish_reason:'stop'}]})+data({choices:[],usage:{prompt_tokens:120,completion_tokens:30,prompt_tokens_details:{cached_tokens:60}}})+'data: [DONE]\n\n');
   };
@@ -85,6 +86,30 @@ test('a streamed reply: the turn log has its time to first token and token count
   const {app,stages}=await run(t,{localReviewMode:'single'},{review:()=>dirty,verify:()=>confirmed},{ASHLAR_LOCAL_LLM_STREAM:'true'},sse);
   console.info=info;
   assert.deepEqual(stages,['review','verify']);
-  assert.ok(lines.some(l=>/pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s ttft=[\d.]+s prompt=120 cached=60 out=30$/.test(l)),lines.filter(l=>/pipeline /.test(l)).join('\n'));
+  assert.ok(lines.some(l=>new RegExp(String.raw`pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s ttft=[\d.]+s prompt=120 cached=60 out=30 reply=${confirmed.length}c reasoning=5c$`).test(l)),lines.filter(l=>/pipeline /.test(l)).join('\n'));
   await eventually(()=>/1 posted \(2 turns, \d+ min\) · feature 1t [\d.]+m in 120 cached 50% out 30 · verify 1t [\d.]+m in 120 cached 50% out 30/.test(app.ops.at(-1)??''),'no per-stage breakdown in the ops comment');
+});
+
+test('a partial review with no finding (one feature cut off, the other only a build claim) posts as a review, never clean',async t=>{
+  // Two unrelated files, each its own feature. b.ts's turns are cut off at the output cap (no reply kept);
+  // a.ts reports only a compile-error claim, which the build-claim gate drops. Before 2026-11-18 the result
+  // had investigated_safe: [] and the poster rejected it, so the job failed and the run was thrown away.
+  const snapshot={changedPaths:['a.ts','b.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'},{path:'b.ts',content:'export const other = 1;\n',language:'ts'}],
+    diff:'--- a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n\n--- b.ts\n@@ -1 +1 @@\n-export const other = 0;\n+export const other = 1;'};
+  const map=JSON.stringify({files:[{file:'a.ts',summary:'changes the answer',guards:[],effects:[]},{file:'b.ts',summary:'changes other',guards:[],effects:[]}]});
+  const buildClaim=JSON.stringify({findings:[{...finding,title:'answer does not compile',failure_scenario:'The build fails with a compile error.'}],merge_recommendation:'REQUEST_CHANGES',investigated_safe:['a.ts: read']});
+  const cut={choices:[{finish_reason:'length',message:{content:'{"findings": ['}}]};
+  const review=(_n,body)=>/one feature of this PR: b\.ts\./.test(JSON.parse(body).messages[1].content)?cut:buildClaim;
+  const respond=(res,content)=>res.end(typeof content==='string'?reply(content):JSON.stringify(content));
+  const {app,job,stages}=await run(t,{localReviewMode:'multiturn'},{map:()=>map,review},{ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS:'50'},respond,{snapshot});
+  assert.ok(!stages.includes('verify'),'the build claim never gets a verify turn');
+  assert.equal(job.status,'posted',job.githubError||job.plan);
+  assert.equal(app.reviews.length,1);
+  const body=app.reviews[0].body;
+  // Posted as raw evidence (outcome "raw"): not the clean sentinel, not a CONVERGED total=0 marker.
+  assert.match(body,/ashlar-findings total=0 inline=0 body=1 raw=1 /);
+  assert.doesNotMatch(body,/Didn't find any major issues|ashlar-coverage cleared=/);
+  assert.match(body,/No complete review from local \(reply posted as evidence\)/);
+  assert.match(body,/Reviewed 1 of 2 files in feature turns; no defect was confirmed \(0 candidate\(s\) refuted, 1 build\/test claim\(s\) dropped\); not reviewed: b\.ts \(feature turn failed\)/);
+  assert.deepEqual([...job.incompleteProviders],['local']);
 });

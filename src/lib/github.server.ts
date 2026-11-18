@@ -607,7 +607,14 @@ export async function fetchPullSnapshot(
     ? vendoredPaths(allChanged, [await getFile(token, target.owner, target.repo, ".gitattributes", target.headSha).catch(() => null)])
     : [];
   const vendoredSet = new Set(vendored.map((v) => v.path));
-  const changedPaths = allChanged.filter((p) => !vendoredSet.has(p)).slice(0, MAX_FILES);
+  // MAX_FILES caps the changed paths. Files with a patch take the slots first (each group in the API's
+  // order): live, 55 binaries (no patch) listed ahead of the code filled every slot, so the review had
+  // no file to review. Binary, empty or too-large files come after them.
+  const withPatch = new Set(rows.filter((f) => f.filename && f.patch).map((f) => f.filename as string));
+  const kept = allChanged.filter((p) => !vendoredSet.has(p));
+  const ordered = [...kept.filter((p) => withPatch.has(p)), ...kept.filter((p) => !withPatch.has(p))];
+  // Paths past the cap are not in the snapshot: not changed paths, not fetched, not in the diff.
+  const changedPaths = ordered.slice(0, MAX_FILES);
   const policyPaths = policyPathsFor(changedPaths);
   const toFetch = [...new Set([...changedPaths, ...policyPaths])];
   const files: SnapshotFile[] = [];

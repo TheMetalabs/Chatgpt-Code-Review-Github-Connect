@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { TLSSocket } from 'node:tls';
 import { loadTs } from './load-source.mjs';
 import { buildChatParts } from '../../src/lib/chat-prompt.ts';
-import { gateLiveSubmission } from '../../src/lib/poster.ts';
+import { gateLiveSubmission, inChangedPaths } from '../../src/lib/poster.ts';
 import { DEFAULT_SETTINGS } from '../../src/lib/types.ts';
 
 // The real fetchPullSnapshot -> gh -> HTTPS decoder; only DNS and the network stream are fakes. The
@@ -28,10 +28,11 @@ const COMPARE = {
   ],
 };
 
-function fakeGithub(contents = CONTENTS, compare = COMPARE) {
+function fakeGithub(contents = CONTENTS, compare = COMPARE, pullFiles = null) {
   const paths = [];
   const reply = (path) => {
-    if (path.startsWith(`/repos/o/r/compare/${BASE}...${HEAD}`)) return [200, compare];
+    if (path.startsWith(`/repos/o/r/compare/${BASE}...${HEAD}`)) return compare ? [200, compare] : [404, { message: 'Not Found' }];
+    if (pullFiles && path.startsWith('/repos/o/r/pulls/7/files')) return [200, pullFiles];
     if (path === '/repos/o/r/pulls/7') return [200, { title: 't', body: 'PR body', head: { sha: HEAD, repo: { fork: false } }, base: { sha: BASE } }];
     const m = /^\/repos\/o\/r\/contents\/(.+)\?ref=([a-z0-9]+)$/.exec(path);
     const text = m && contents[m[2]]?.[decodeURIComponent(m[1])];
@@ -153,4 +154,65 @@ test('a linguist-vendored rule the PR removes from .gitattributes no longer leav
   const sample = await fakeGithub(contents, compare).api.fetchPullSnapshot('token', target, { skipVendored: true });
   assert.ok(sample.changedPaths.includes('lib/core.c'), 'the now-maintained file is reviewed');
   assert.equal(sample.vendoredPaths, undefined);
+});
+
+// Live: a 65-file PR whose first 55 compare rows were images (added/removed, no patch) and whose 10 code
+// files came after them. The 50-file cap kept only images, the local pipeline had 0 review targets and
+// failed every time. Files with a patch take the cap's slots first; a path past the cap is not in the snapshot.
+const pad = (n) => String(n).padStart(2, '0');
+const BINARIES = Array.from({ length: 55 }, (_, i) => ({ filename: `assets/img-${pad(i + 1)}.png`, status: i % 2 ? 'removed' : 'added', changes: 0 }));
+const PATCHED = Array.from({ length: 10 }, (_, i) => ({ filename: `src/app/feature-${pad(i + 1)}.ts`, status: 'modified', changes: 2, patch: `@@ -1 +1 @@\n-export const v${i + 1} = 0;\n+export const v${i + 1} = 1;` }));
+const CAP_CONTENTS = {
+  [BASE]: CONTENTS[BASE],
+  [HEAD]: Object.fromEntries(PATCHED.map((f, i) => [f.filename, `export const v${i + 1} = 1;\n`])),
+};
+
+function assertPatchedFirst(sample, paths) {
+  const changed = Array.from(sample.changedPaths);
+  assert.deepEqual(changed.slice(0, 10), PATCHED.map((f) => f.filename), 'every patched file is kept, in compare order, ahead of the binaries');
+  for (const f of PATCHED) {
+    assert.ok(sample.diff.includes(`--- ${f.filename}\n${f.patch}`), `${f.filename} patch is in the diff`);
+    assert.ok(sample.files.some((x) => x.path === f.filename), `${f.filename} content is fetched`);
+  }
+  // 10 patched + 40 binaries fill the 50 slots; the last 15 binaries are past the cap: neither changed
+  // paths nor fetched.
+  assert.equal(changed.length, 50, 'changedPaths is the capped set');
+  assert.deepEqual(changed.slice(10), BINARIES.slice(0, 40).map((f) => f.filename));
+  const overCap = BINARIES.slice(40).map((f) => f.filename);
+  for (const p of overCap) {
+    assert.ok(!changed.includes(p), `${p} is not a changed path`);
+    assert.ok(!paths.some((q) => q.startsWith(`/repos/o/r/contents/${p}?`)), `${p} is not fetched`);
+  }
+  assert.deepEqual(Array.from(sample.diffDroppedPaths), [], 'a cut binary has no patch to drop');
+}
+
+test('the file cap keeps files with a patch ahead of 55 patch-less binaries (compare)', async () => {
+  const { api, paths } = fakeGithub(CAP_CONTENTS, { files: [...BINARIES, ...PATCHED] });
+  assertPatchedFirst(await api.fetchPullSnapshot('token', target), paths);
+});
+
+test('the file cap keeps files with a patch first on the pulls/{pr}/files fallback too', async () => {
+  const { api, paths } = fakeGithub(CAP_CONTENTS, null, [...BINARIES, ...PATCHED]);
+  const sample = await api.fetchPullSnapshot('token', target);
+  assert.ok(paths.some((p) => p.startsWith('/repos/o/r/pulls/7/files')), 'the fallback was used');
+  assertPatchedFirst(sample, paths);
+});
+
+// A path past the cap must stay out of changedPaths: that list is the publish scope (poster
+// inChangedPaths), so listing an unseen file would let a finding on it post as an unanchored body finding.
+test('a file past the cap is not a changed path, so a finding on it is out of the publish scope', async () => {
+  const many = Array.from({ length: 52 }, (_, i) => ({ filename: `src/app/feature-${pad(i + 1)}.ts`, status: 'modified', patch: `@@ -1 +1 @@\n-a${i + 1}\n+b${i + 1}` }));
+  const { api, paths } = fakeGithub(CAP_CONTENTS, { files: [BINARIES[0], ...many] });
+  const sample = await api.fetchPullSnapshot('token', target);
+  const cut = ['src/app/feature-51.ts', 'src/app/feature-52.ts'];
+  assert.deepEqual(Array.from(sample.changedPaths), many.slice(0, 50).map((f) => f.filename), 'the 50 patched files take the cap; the binary and feature-51/52 are cut');
+  assert.deepEqual(Array.from(sample.diffDroppedPaths), [], 'diffDroppedPaths is only what the prompt budget dropped');
+  assert.equal(inChangedPaths(sample, 'src/app/feature-52.ts'), false, 'a finding on an over-cap file is out of the publish scope');
+  assert.equal(inChangedPaths(sample, 'src/app/feature-50.ts'), true);
+  for (const p of cut) {
+    assert.ok(!sample.changedPaths.includes(p), `${p} is not a changed path`);
+    assert.doesNotMatch(sample.diff, new RegExp(`^--- ${p.replace(/[.]/g, '\\.')}$`, 'm'), `${p} patch is not in the diff`);
+    assert.ok(!paths.some((q) => q.startsWith(`/repos/o/r/contents/${p}?`)), `${p} is not fetched`);
+  }
+  assert.match(sample.diff, /^--- src\/app\/feature-50\.ts$/m);
 });

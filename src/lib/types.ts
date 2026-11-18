@@ -36,9 +36,10 @@ export type LocalReviewMode = "single" | "multiturn" | "auto";
 
 export const LOCAL_REVIEW_MODES: LocalReviewMode[] = ["single", "multiturn", "auto"];
 
-/** Which local pipeline turns let a thinking model think (local-pipeline.server.ts). "on": every turn;
+/** Which local pipeline turns let a thinking model think (local-pipeline.server.ts). Every turn sends
+ * chat_template_kwargs {enable_thinking: true|false}, overriding the server's default. "on": every turn;
  * "focused": only the first attempt of a feature or verify turn (map, select and every retry send
- * chat_template_kwargs {enable_thinking:false}); "off": no turn. */
+ * enable_thinking:false); "off": no turn. */
 export type LocalPipelineThinking = "on" | "focused" | "off";
 
 export const LOCAL_PIPELINE_THINKING: LocalPipelineThinking[] = ["on", "focused", "off"];
@@ -374,8 +375,8 @@ export interface BotSettings {
   /** A candidate whose claimed failure is a build or test outcome ("compile error", "the test fails") is
    * dropped before verification: the authors' build and test gate already disproved it. Off: verified. */
   localPipelineDropBuildClaims: boolean;
-  /** Which pipeline turns may think (LocalPipelineThinking); the turns that may not send
-   * chat_template_kwargs {enable_thinking:false}. */
+  /** Which pipeline turns think (LocalPipelineThinking); every turn sends chat_template_kwargs
+   * {enable_thinking: true|false}. */
   localPipelineThinking: LocalPipelineThinking;
   /** Concurrent holders of the process-wide local-model lease (match the model server, e.g. oMLX concurrent=3). */
   localLeaseCapacity: number;

@@ -386,8 +386,10 @@ export function Settings() {
             ))}
           </select>
           <p className="mt-2 text-[12px] text-fg-subtle">
-            Map and select turns, and every retry, only summarise or reformat: focused sends them with thinking off
-            (chat_template_kwargs enable_thinking=false). Set on for a server that rejects that field.
+            Every turn sends chat_template_kwargs enable_thinking=true or false, so this overrides the server&apos;s own
+            default. Map and select turns, and every retry, only summarise or reformat: focused sends them with
+            thinking off. A server that rejects that field gets the turn again without it, and then follows its own
+            default for the rest of the run.
           </p>
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">

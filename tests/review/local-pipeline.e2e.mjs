@@ -64,11 +64,23 @@ test('large PR: the staged pipeline runs map → feature → verify and posts th
   const {app,stages}=await run(t,{localReviewMode:'multiturn'},{map:()=>map,review:()=>dirty,verify:()=>confirmed},{ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS:'50'});
   assert.deepEqual(stages,['map','review','verify']);
   assert.match(app.reviews[0].body,/ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 p2=0/);
-  // local_review.pipeline_thinking (default focused), on the wire: the map turn is sent with thinking off.
+  // local_review.pipeline_thinking (default focused), on the wire: every turn says whether it thinks, so the
+  // server's default never decides. The map turn is sent with thinking off, the first feature and verify
+  // attempts with it on.
   const wire=app.localRequests.map(r=>JSON.parse(r.raw??JSON.stringify(r)));
-  assert.deepEqual(wire.map(b=>b.chat_template_kwargs??null),[{enable_thinking:false},null,null]);
+  assert.deepEqual(wire.map(b=>b.chat_template_kwargs??null),[{enable_thinking:false},{enable_thinking:true},{enable_thinking:true}]);
   await eventually(()=>/Local pipeline: 1 feature group\(s\) × 1 lens\(es\), 1 candidate\(s\), 1 to verify, 1 confirmed, 0 refuted, 1 posted/.test(app.ops.at(-1)??''),'no pipeline summary in the ops comment');
 });
+
+for(const [mode,think] of [['on',true],['off',false]]){
+  test(`pipeline thinking ${mode}: every turn on the wire carries enable_thinking=${think}`,async t=>{
+    const map=JSON.stringify({files:[{file:'a.ts',summary:'changes the answer constant',guards:[],effects:[]}]});
+    const {app,stages}=await run(t,{localReviewMode:'multiturn',localPipelineThinking:mode},{map:()=>map,review:()=>dirty,verify:()=>confirmed},{ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS:'50'});
+    assert.deepEqual(stages,['map','review','verify']);
+    const wire=app.localRequests.map(r=>JSON.parse(r.raw??JSON.stringify(r)));
+    assert.deepEqual(wire.map(b=>b.chat_template_kwargs??null),[{enable_thinking:think},{enable_thinking:think},{enable_thinking:think}]);
+  });
+}
 
 test('pipeline off: the grouped tool loop of before (no map, no verify turn)',async t=>{
   const {stages}=await run(t,{localReviewMode:'multiturn',localReviewPipeline:false},{review:()=>dirty});

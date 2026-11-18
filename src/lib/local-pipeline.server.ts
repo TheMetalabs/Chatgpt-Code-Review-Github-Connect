@@ -681,12 +681,13 @@ export const VERIFY_RULES = [
   "4. Does a doc comment next to the code, MODULE_DOCS or the PR description state this behaviour as intended? Intended behaviour is not a defect.",
   "5. For an index, bound, count or arithmetic claim, work it through with concrete values from the code.",
   "6. Does the failure depend on something the cited code does not control — what a caller passes (a null, an empty value, two inputs together), what a client sends, how the database or a library behaves, or what a config or registry list holds? Then it is real only if the evidence shows a path that supplies it: a caller, a route or a config entry. If the callers shown never pass it, or the validation, schema, constraint or list shown rules it out, it is refuted. If no such path is shown, it is uncertain, never confirmed.",
+  "Angles: before the verdict, look at the cited code from three angles, one short line each in angles. failure: errors, early returns, retries, cancellation, ordering, concurrency, timing (a check made before a wait). data: empty, missing or null input, bounds, lengths, indexes, keys, encoding, line endings, units. contract: what the callers shown pass, what the callee shown does, sibling uses of the same code, what the test shown expects. Each line is \"if <trigger>, <wrong result>\" with the line that goes wrong, verbatim from CODE, or \"none\"; write none when the code that decides it is not shown. An angle line is a lead, not proof: quoting the line that would go wrong does not show the trigger can happen. Checks 1–6 apply to each angle's failure (rule 6: the caller, route or config that supplies the input must be shown). Confirm an angle's failure only as the confirmed verdict below requires; if it is not the reported one, same_reason is false and title, failure and fix describe it. Missing test coverage is never a failure. If no angle's failure passes those checks: refuted or uncertain; never invent a defect.",
   "Verdicts:",
   "- refuted: something shown prevents or explains the reported failure (one of the checks above) and you found no other input that makes this code go wrong, or it is only about documentation, naming, style, logging, i18n or test coverage. Put the code, diff line or doc text that shows this in blocking_code, copied verbatim from the evidence. A refutation without blocking_code is not accepted.",
   "- confirmed: you followed a concrete trigger through the code shown, step by step, from the changed code to a wrong result, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE. same_reason is true when that failure is the reported one; otherwise false, and title, failure and fix describe the defect you found.",
   "- uncertain: the deciding code is not shown, or you could not follow the scenario through the code. When in doubt, answer uncertain, never confirmed.",
   "Severity (confirmed only): P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
-  'Reply with ONLY this JSON, fields in this order: {"trace":"at most 3 short sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","blocking_code":"for refuted: only the deciding line(s) of the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: only the deciding failing line(s), verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: one sentence, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}. Stop after the JSON.',
+  'Reply with ONLY this JSON, fields in this order: {"trace":"at most 3 short sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","angles":[{"angle":"failure"|"data"|"contract","failure":"if <trigger>, <wrong result>; or none","quote":"the line that would go wrong, verbatim; or empty"}],"blocking_code":"for refuted: only the deciding line(s) of the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: only the deciding failing line(s), verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: one sentence, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}. Stop after the JSON.',
 ].join("\n");
 
 function gutter(path: string, lines: string[], from: number, to: number): string {
@@ -1211,8 +1212,32 @@ export function quoteInCode(quote: string, hay: string): boolean {
   });
 }
 
-/** A verdict. `sameReason` false: the verifier found a different defect at the place (its `title`, `failure`, `fix`). */
-type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity; sameReason?: boolean; title: string; failure: string; fix: string };
+/** One angle line of a verdict (VERIFY_RULES "Angles"): a failure the verifier suspects from that angle (a lead, not proof), or none. */
+type Angle = { angle: "failure" | "data" | "contract"; failure: string; quote: string };
+
+/** A verdict. `sameReason` false: the verifier found a different defect at the place (its `title`, `failure`, `fix`).
+ * `angles` are only counted (PipelineStats.angleFailures): the posted reason is the verdict's own. */
+type Verdict = { verdict: "confirmed" | "refuted" | "uncertain"; reason: string; quote: string; counter: string; severity?: Severity; sameReason?: boolean; title: string; failure: string; fix: string; angles: Angle[] };
+
+/** The verdict's angle lines, read tolerantly: anything but an array of objects with a known angle is
+ * left out, so a reply without angles, or with malformed ones, is still a verdict. */
+function acceptAngles(v: unknown): Angle[] {
+  if (!Array.isArray(v)) return [];
+  return v.slice(0, 6).flatMap((a): Angle[] => {
+    if (!a || typeof a !== "object") return [];
+    const o = a as Record<string, unknown>;
+    const angle = typeof o.angle === "string" ? /^\s*(failure|data|contract)/i.exec(o.angle)?.[1].toLowerCase() : undefined;
+    if (!angle) return [];
+    return [{ angle: angle as Angle["angle"], failure: typeof o.failure === "string" ? clip(o.failure, 300) : "", quote: typeof o.quote === "string" ? o.quote.slice(0, 500) : "" }];
+  });
+}
+
+/** An angle line that says "none", in any wording: "None: the guard at L12 covers it", "No issue",
+ * "not applicable", "없음". The word must end there ("Nonexistent key …" names a failure). */
+const ANGLE_NONE = /^\s*(?:none|nothing|no (?:issue|failure|problem|defect)s?|not applicable|n\/a|없음|해당\s*없음|문제\s*없음)(?![\p{L}\p{N}])/iu;
+
+/** An angle line that names a failure ("if <trigger>, <wrong result>", in any script), not "none" or bare punctuation. */
+const angleFails = (a: Angle) => /[\p{L}\p{N}]/u.test(a.failure) && !ANGLE_NONE.test(a.failure);
 
 function acceptVerdict(v: unknown): Verdict | null {
   const o = v as Record<string, unknown>;
@@ -1232,12 +1257,13 @@ function acceptVerdict(v: unknown): Verdict | null {
     title: clip(o.title, 160),
     failure: clip(o.failure, 600),
     fix: clip(o.fix, 400),
+    angles: acceptAngles(o.angles),
   };
 }
 
 /** The defect a confirming verifier found at the cited place when the reported reason was not it. */
 export type Reframe = { title: string; failure: string; rootCause: string; fix: string };
-export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string; reframe?: Reframe };
+export type VerifyResult = { cid: string; status: "confirmed" | "refuted" | "uncertain" | "unverified"; reason: string; severity: Severity; proof?: string; reframe?: Reframe; angleFailures?: number };
 
 /** Whether the candidate's OWN evidence quotes real code: the condition for posting an uncertain one. */
 function ownQuoteHolds(c: Candidate, sample: SamplePr, code: string): boolean {
@@ -1266,7 +1292,7 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     pack.perFile,
     `<<<CANDIDATE: REPORTED HYPOTHESIS (the place is usually right; the reason may be wrong; untrusted)>>>\n${candidate}\n<<<END>>>`,
     pack.specific,
-    "Check the code at the reported place against the evidence above and reply with the JSON object only (trace first, then blocking_code, verdict, proof_quote, same_reason, title, failure, fix, severity).",
+    "Check the code at the reported place against the evidence above and reply with the JSON object only (trace first, then angles, blocking_code, verdict, proof_quote, same_reason, title, failure, fix, severity).",
   ].filter(Boolean).join("\n\n");
   const messages: Msg[] = [{ role: "system", content: VERIFY_SYSTEM }, { role: "user", content: user }];
   // The cited file's head lines: a different reason's proof must be at the cited place (±REFRAME_PROOF_LINES).
@@ -1274,12 +1300,16 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
   const nearCited = (quote: string) => quoteInCode(quote, citedLines.slice(Math.max(0, c.line - 1 - REFRAME_PROOF_LINES), c.line + REFRAME_PROOF_LINES).join("\n"));
   let uncertain = "";
   const agreeing: Verdict[] = [];
+  // Angle lines that name a failure, over every vote: counted for the ops line, never posted.
+  let angleFailures = 0;
+  const done = (r: VerifyResult): VerifyResult => (angleFailures ? { ...r, angleFailures } : r);
   for (let i = 0; i < Math.max(1, votes); i += 1) {
     const { value } = await askJson(ctx, `verify[${c.cid}]#${i + 1}`, messages, i === 0 ? "strict" : "vote", acceptVerdict, true);
-    if (!value) return { cid: c.cid, status: "unverified", reason: "the verifier returned no verdict", severity: c.severity };
+    if (!value) return done({ cid: c.cid, status: "unverified", reason: "the verifier returned no verdict", severity: c.severity });
+    angleFailures += value.angles.filter(angleFails).length;
     if (value.verdict === "refuted") {
       // A refutation must point at what prevents the defect; one that cannot is no refutation.
-      if (quoteInCode(value.counter, pack.text)) return { cid: c.cid, status: "refuted", reason: value.reason, severity: c.severity };
+      if (quoteInCode(value.counter, pack.text)) return done({ cid: c.cid, status: "refuted", reason: value.reason, severity: c.severity });
       uncertain ||= `refuted without a counter-quote from the evidence (${value.reason})`;
       continue;
     }
@@ -1325,12 +1355,12 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
     // Not refuted and not proven: postable at P2 only when the candidate's own quote is real code and
     // Settings keep uncertain candidates (local_review.pipeline_keep_uncertain).
     const keep = ctx.settings.localPipelineKeepUncertain !== false && ownQuoteHolds(c, sample, pack.code);
-    return keep
+    return done(keep
       ? { cid: c.cid, status: "uncertain", reason: uncertain, severity: "P2" }
-      : { cid: c.cid, status: "refuted", reason: `uncertain and its own quote does not hold: ${uncertain}`, severity: c.severity };
+      : { cid: c.cid, status: "refuted", reason: `uncertain and its own quote does not hold: ${uncertain}`, severity: c.severity });
   }
   const reframe: Reframe | undefined = first.sameReason === false ? { title: first.title, failure: first.failure, rootCause: first.reason || first.failure, fix: first.fix } : undefined;
-  return { cid: c.cid, status: "confirmed", reason: first.reason, severity, proof: first.quote.trim(), ...(reframe ? { reframe } : {}) };
+  return done({ cid: c.cid, status: "confirmed", reason: first.reason, severity, proof: first.quote.trim(), ...(reframe ? { reframe } : {}) });
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1429,6 +1459,8 @@ export type PipelineStats = {
   buildClaims?: number;
   /** Confirmations whose verifier found a different reason at the cited place (VerifyResult.reframe). */
   reframed?: number;
+  /** Verifier angle lines (VERIFY_RULES "Angles") that named a failure rather than "none", over every vote. */
+  angleFailures?: number;
   confirmed: number; uncertain: number; refuted: number; unverified: number; overCap: number; posted: number; turns: number;
   stages?: Partial<Record<StageName, StageTotals>>;
 };
@@ -1453,7 +1485,7 @@ function stageBreakdown(stages: Partial<Record<StageName, StageTotals>>): string
 
 export function pipelineSummary(s: PipelineStats): string {
   const stages = s.stages ? stageBreakdown(s.stages) : "";
-  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.reframed ? ` (${s.reframed} reframed)` : ""}${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
+  return `Local pipeline: ${s.groups} feature group(s) × ${s.lenses} lens(es)${s.failedGroups ? ` (${failedNote(s)})` : ""}, ${s.candidates} candidate(s)${s.buildClaims ? `, ${s.buildClaims} build/test-outcome claim(s) dropped` : ""}, ${s.gated} to verify${s.softGated ? ` (${s.softGated} the gate would have dropped)` : ""}, ${s.confirmed} confirmed${s.reframed ? ` (${s.reframed} reframed)` : ""}${s.uncertain ? `, ${s.uncertain} uncertain` : ""}, ${s.refuted} refuted${s.unverified ? `, ${s.unverified} unverified` : ""}${s.overCap ? `, ${s.overCap} over the verify cap` : ""}${s.angleFailures ? `, ${s.angleFailures} angle line(s) with a failure` : ""}, ${s.posted} posted (${s.turns} turns${s.minutes !== undefined ? `, ${s.minutes} min` : ""})${stages ? ` · ${stages}` : ""}`;
 }
 
 /** The first-turn prompt budget in chars (what one candidate turn may carry) and the context cap. */
@@ -1559,6 +1591,7 @@ async function refuteAndSelect(
       r = { cid: c.cid, status: "unverified", reason: (e instanceof Error ? e.message : String(e)).slice(0, 160), severity: c.severity };
     }
     results.set(c.cid, r);
+    if (r.angleFailures) stats.angleFailures = (stats.angleFailures ?? 0) + r.angleFailures;
   }
   // Candidates past the verify cap were never judged: they stay candidates as reported (ranked last by
   // the selection), never silently dropped into a clean result.
@@ -1823,7 +1856,7 @@ export async function runLocalReviewPipeline(sample: SamplePr, settings: BotSett
   const ctx = makeCtx(settings, deps, t);
   const startedAt = Date.now();
   let lenses = lensesFor(settings.localPipelineLenses);
-  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, reframed: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
+  const stats: PipelineStats = { splitRetried: 0, unreviewedFiles: [], mapTurns: 0, groups: 0, lenses: lenses.length, failedGroups: 0, candidates: 0, gated: 0, softGated: 0, buildClaims: 0, reframed: 0, angleFailures: 0, confirmed: 0, uncertain: 0, refuted: 0, unverified: 0, overCap: 0, posted: 0, turns: 0 };
   const evidence: string[] = [];
   try {
     const budget = featureBudget(settings, t);

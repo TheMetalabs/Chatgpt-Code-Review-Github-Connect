@@ -348,6 +348,10 @@ export function Settings() {
               onChange={(e) => patch({ localPipelineLenses: fromForm(PIPELINE_LENSES_ATTRS.unit, e.target.valueAsNumber) })}
               className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
             />
+            <p className="mt-2 text-[12px] text-fg-subtle">
+              More lenses find more places, not better causes. 1 is recommended: the verifier checks every place from
+              three angles (failure path, data, contract).
+            </p>
           </Field>
         </div>
         <Field label="local_review.pipeline_keep_uncertain">
@@ -358,7 +362,7 @@ export function Settings() {
           />
           <p className="mt-2 text-[12px] text-fg-subtle">
             Candidate passes (lenses) look at failure paths, data invariants and contracts; every candidate is then
-            checked by its own verifier turn. A candidate the verifier neither proves nor refutes with a quote is posted
+            checked by its own verifier turn, which looks at the cited code from the same three angles. A candidate the verifier neither proves nor refutes with a quote is posted
             at P2 when this is on.
           </p>
         </Field>

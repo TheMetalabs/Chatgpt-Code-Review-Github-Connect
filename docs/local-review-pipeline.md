@@ -211,6 +211,19 @@ Why `focused` is the default:
 
 A server that rejects the unknown `chat_template_kwargs` field cannot use this setting: since every turn sends the field, `on` would fail there too. The pipeline handles such a server the way the JSON repair path does (its `includeNoThinking` retry): when a turn gets HTTP 400 or 422 whose body names `chat_template_kwargs` or `enable_thinking`, that turn is sent once more without the field, the run logs `pipeline <stage>: the server rejected chat_template_kwargs (…); retrying without it …`, and every later turn of that run is sent without it (logged `think=server`). Each turn then follows the server's own default, whatever `local_review.pipeline_thinking` says. A 400 that does not name either field (a prompt too long for the window, for example) is not retried this way. The next run tries the field again.
 
+## Verify from three angles (2026-11-18)
+
+On the Swift repository above, 4 of 11 posted findings had the right place and a wrong reason. The real defects were of different kinds: an index used without a length check (data), a timer that decides a skip (failure path), a +1 compensation that hides a second blank line (the contract with the test), and CRLF text not split (data). The verify turn could already reframe a finding, but it looked from one angle, usually the reporter's. The hunting lenses (`local_review.pipeline_lenses`) only add candidate turns: they find more places, never a better cause.
+
+- **One verify turn, three angles** (no extra turn). Before the verdict, `VERIFY_RULES` asks for one short line per angle, in a new `angles` field placed after `trace` and before `blocking_code` and `verdict`, so the model explores before it decides:
+  - **failure**: errors, early returns, retries, cancellation, ordering, concurrency, timing (a check made before a wait);
+  - **data**: empty, missing or null input, bounds, lengths, indexes, keys, encoding, line endings, units;
+  - **contract**: what the callers shown pass, what the callee shown does, sibling uses of the same code, what the test shown expects.
+
+  Each line is "if <trigger>, <wrong result>" with the line that goes wrong quoted from CODE, or "none" (also when the code that decides it is not shown). **An angle line is a lead, not proof**: quoting the line that would go wrong does not show the trigger can happen. Checks 1–6 apply to each angle's failure, rule 6 included: an empty, missing or odd input counts only when a caller, route or config shown supplies it. For example, "if items is empty, items[0] traps" with the quote `let first = items[0]` stays uncertain when no caller shown passes an empty array. An angle's failure is confirmed only as the confirmed verdict requires (a trigger followed through the code shown, with `proof_quote`). If it is not the reported one, `same_reason` is false and the verifier's title, failure and fix are posted (the reframe path above). **Missing test coverage is never a failure**: the contract angle reads what the test shown expects, not the test that should exist. If no angle's failure passes those checks, the verdict is refuted or uncertain, as before.
+- **Angles are never posted and never decide on their own.** `acceptVerdict` reads them tolerantly: a reply without `angles`, or with a string or malformed entries, is still a verdict. Only the chosen reason is posted, and a reframe still needs its `proof_quote` in CODE, within 30 lines of the cited line in the cited file, and not a build/test-outcome claim. Rule 6, the vote agreement, the fixed reframed test line and the Reported-as line are unchanged. The ops line counts the angle lines that named a failure (not "none" in any wording, such as "None: guarded at L12", "No issue", "not applicable" or "없음"; a failure line in any script counts), for example `… 2 confirmed (1 reframed), 1 refuted, 4 angle line(s) with a failure, 2 posted …`.
+- **`local_review.pipeline_lenses` = 1 is recommended** for cause quality: the angles now live in the verify turn, so extra hunting passes cost turns without improving the reason. The default is unchanged.
+
 ## Settings
 
 | Field | Default | Meaning |
@@ -218,7 +231,7 @@ A server that rejects the unknown `chat_template_kwargs` field cannot use this s
 | `local_review.pipeline` | on | Off restores the grouped tool loop. |
 | `local_review.pipeline_max_findings` | 5 | 1–8: the selection's cap. |
 | `local_review.pipeline_verify_votes` | 1 | 1–3: refute turns per candidate. All must confirm. |
-| `local_review.pipeline_lenses` | 3 | 1–3: candidate passes for a PR reviewed in one turn (1 = one combined pass). A PR split into features always gets one pass per feature. |
+| `local_review.pipeline_lenses` | 3 | 1–3: candidate passes for a PR reviewed in one turn (1 = one combined pass). A PR split into features always gets one pass per feature. 1 is recommended: more lenses find more places, not better causes, and the verify turn checks each place from three angles. |
 | `local_review.pipeline_keep_uncertain` | off | Post an undecided candidate at P2 when its own quote is real code. |
 | `local_review.pipeline_drop_build_claims` | on | Drop a candidate that claims a compile error or a failing test before it is verified (env `ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS`). |
 | `local_review.pipeline_thinking` | focused | `on`, `focused` or `off`: which turns think. Every turn sends `enable_thinking` explicitly, overriding the server's default. `focused` sends `true` only on the first attempt of a feature or verify turn; map, select and every retry are sent with `enable_thinking: false` (env `ASHLAR_LOCAL_PIPELINE_THINKING`). |

@@ -2,6 +2,7 @@
 // The model is a mock that answers by stage (its system message), so each test pins one decision.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   evidencePack,
   featureGroups,
@@ -685,7 +686,8 @@ test("verify prompt: the report is a hypothesis; the task is whether the code at
   assert.match(VERIFY_RULES, /find a concrete input or condition, from the code and evidence shown, under which it gives a wrong result, and quote the failing line\(s\)/);
   assert.match(VERIFY_RULES, /If no input from the code shown makes it go wrong, the verdict is refuted \(with blocking_code\) or uncertain: never invent a defect\./);
   assert.match(VERIFY_RULES, /they apply to the failure you find, not only to the reported one/, "rule 6 binds the verifier's own failure");
-  const order = ['"trace"', '"verdict"', '"proof_quote"', '"same_reason"', '"title"', '"failure"', '"fix"', '"severity"'].map((k) => VERIFY_RULES.indexOf(k));
+  // Each field after the one before it (the angle entries also carry a "failure" key, before "verdict").
+  const order = ['"trace"', '"verdict"', '"proof_quote"', '"same_reason"', '"title"', '"failure"', '"fix"', '"severity"'].reduce((at, k) => [...at, VERIFY_RULES.indexOf(k, (at.at(-1) ?? 0) + 1)], []);
   assert.ok(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), `fields in order: ${order}`);
   assert.match(VERIFY_RULES, /"title":"for confirmed: the defect as found, at most 12 words; else empty"/);
 });
@@ -2068,4 +2070,129 @@ test("build/test claims: a runtime type check or an unresolved schema reference 
   assert.equal(claim("x", "The schema's $ref is an unresolved reference, so the validator rejects every request"), false);
   assert.equal(claim("Unresolved reference: foo"), true);
   assert.equal(claim("this fails type checking"), true);
+});
+
+// Verify from three angles (docs/local-review-pipeline.md, 2026-11-18): one verify turn checks the cited
+// code from the failure, data and contract angles before its verdict; only the chosen reason is posted.
+/** A confirmation whose data angle proves a different failure than the reported one. */
+const angled = (o = {}) => reframe({
+  angles: [
+    { angle: "failure", failure: "none", quote: "" },
+    { angle: "data", failure: "If the body has no amount, charge receives undefined and pay returns undefined.", quote: "return charge(req.body.amount);" },
+    { angle: "contract", failure: "If a caller relies on the spec, CONTRACT-ANGLE-MARKER covers only amount 1.", quote: "test('charge', () => { expect(charge(1)).toBe(1); });" },
+  ],
+  title: "create() charges an undefined amount when the body has none",
+  failure: "If the body has no amount, charge receives undefined and pay returns undefined.",
+  fix: "Reject a body without a numeric amount before calling charge.",
+  ...o,
+});
+
+test("verify angles: the verify rules ask for the failure, data and contract angles, in an angles field before the verdict; the rules still come first", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const turn = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
+  assert.ok(turn.startsWith(VERIFY_RULES), "the fixed rules stay the shared prefix");
+  for (const rule of [
+    "Angles: before the verdict, look at the cited code from three angles, one short line each in angles.",
+    "failure: errors, early returns, retries, cancellation, ordering, concurrency, timing (a check made before a wait).",
+    "data: empty, missing or null input, bounds, lengths, indexes, keys, encoding, line endings, units.",
+    "contract: what the callers shown pass, what the callee shown does, sibling uses of the same code, what the test shown expects.",
+    'Each line is "if <trigger>, <wrong result>" with the line that goes wrong, verbatim from CODE, or "none"; write none when the code that decides it is not shown.',
+    "An angle line is a lead, not proof: quoting the line that would go wrong does not show the trigger can happen.",
+    "Checks 1–6 apply to each angle's failure (rule 6: the caller, route or config that supplies the input must be shown).",
+    "Confirm an angle's failure only as the confirmed verdict below requires; if it is not the reported one, same_reason is false and title, failure and fix describe it.",
+    "Missing test coverage is never a failure.",
+    "If no angle's failure passes those checks: refuted or uncertain; never invent a defect.",
+  ]) assert.ok(VERIFY_RULES.includes(rule), rule);
+  assert.ok(VERIFY_RULES.indexOf("Angles:") < VERIFY_RULES.indexOf("Verdicts:"), "the angles come before the verdicts");
+  const field = '"angles":[{"angle":"failure"|"data"|"contract","failure":"if <trigger>, <wrong result>; or none","quote":"the line that would go wrong, verbatim; or empty"}]';
+  assert.ok(VERIFY_RULES.includes(field), field);
+  const at = (k) => VERIFY_RULES.indexOf(k, VERIFY_RULES.indexOf("Reply with ONLY this JSON"));
+  assert.ok(at('"trace"') < at('"angles"') && at('"angles"') < at('"blocking_code"') && at('"blocking_code"') < at('"verdict"'), "trace, then angles, then blocking_code and verdict");
+  assert.match(turn, /\(trace first, then angles, blocking_code, verdict,/);
+});
+
+// PR #191 review (P1): "The verdict rests on the angle with proof" read as a shortcut to confirmed: an angle
+// line only quotes the line that would go wrong, so "if items is empty, items[0] traps" with the quote
+// `let first = items[0]` passed the quote check although no caller shown passes an empty array (rule 6:
+// uncertain). The angles are leads; checks 1-6 and rule 6 bind each angle's failure, and the contract
+// angle's "the test that should cover it" invited missing coverage as a defect.
+test("verify angles: an angle line is a lead, not proof; checks 1-6 (rule 6) bind each angle's failure; missing coverage is never a failure", () => {
+  const angles = VERIFY_RULES.split("\n").find((l) => l.startsWith("Angles:"));
+  assert.ok(angles, "the Angles rule is one line of VERIFY_RULES");
+  for (const phrase of ["a lead, not proof", "Checks 1–6 apply to each angle's failure", "rule 6: the caller, route or config that supplies the input must be shown", "Missing test coverage is never a failure", "what the callers shown pass, what the callee shown does", "what the test shown expects"]) {
+    assert.ok(angles.includes(phrase), phrase);
+  }
+  assert.ok(!VERIFY_RULES.includes("The verdict rests on the angle with proof"), "the old shortcut to confirmed is gone");
+  assert.ok(!VERIFY_RULES.includes("No angle with proof"), "no angle is said to carry proof");
+  assert.ok(!VERIFY_RULES.includes("the test that should cover it"), "the contract angle no longer asks for the test that should exist");
+  const lines = VERIFY_RULES.split("\n");
+  const at = lines.indexOf(angles);
+  assert.ok(lines[at - 1].startsWith("6. ") && lines[at + 1] === "Verdicts:", "the rule stays after check 6, before Verdicts");
+});
+
+test("verify angles: a data angle that proves a different failure posts that reason (reframe), not the reporter's test or the angle lines", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => angled() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const [row] = JSON.parse(out.raw).findings;
+  assert.equal(row.title, "create() charges an undefined amount when the body has none");
+  assert.equal(row.failure_scenario, "If the body has no amount, charge receives undefined and pay returns undefined.");
+  assert.equal(row.recommended_fix, "Reject a body without a numeric amount before calling charge.");
+  assert.equal(row.recommended_test, "Cover the failure described above.", "the reporter's test was for another reason");
+  assert.doesNotMatch(out.raw, /Reject -5\./);
+  assert.doesNotMatch(out.raw, /CONTRACT-ANGLE-MARKER/, "the per-angle lines are not posted");
+  assert.match(row.evidence, /\nReported as: create\(\) charges a negative amount$/);
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted, 2 angle line\(s\) with a failure, 1 posted/);
+});
+
+test("verify angles: a verdict without angles (the old shape) is still accepted and posted; no angle count", async () => {
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe() });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(JSON.parse(out.raw).findings[0].title, "create() passes a string amount through unconverted");
+  assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\), 0 refuted, 1 posted/);
+  assert.doesNotMatch(out.pipelineSummary, /angle/);
+});
+
+test("verify angles: malformed angles (a string, an object, wrong types, unknown angles) are ignored; the verdict stands", async () => {
+  for (const [angles, count] of [
+    ["data: if empty, crash", 0],
+    [{ angle: "data", failure: "if empty, crash", quote: "return charge(req.body.amount);" }, 0],
+    [42, 0],
+    [null, 0],
+    [["data", null, 7, [], { angle: 5, failure: "if x, y" }, { angle: "timing", failure: "if x, y" }, { angle: "data", failure: { x: 1 }, quote: ["q"] }, { angle: "contract", failure: "None.", quote: "" }], 0],
+    [[{ angle: "Data angle", failure: "If the body has no amount, charge gets undefined.", quote: 3 }, "junk"], 1],
+    // PR #191 review (P2): "none" with a reason, in any wording, names no failure; a failure in any script does.
+    ...["None: the guard at L12 covers it", "none (guarded by line 12)", "No issue", "None found.", "Nothing", "not applicable", "no failure", "None — guarded", "N/A", "-", "없음", "해당 없음"].map((failure) => [[{ angle: "data", failure, quote: "" }], 0]),
+    [[{ angle: "data", failure: "빈 배열이면 첫 원소 접근에서 크래시", quote: "return charge(req.body.amount);" }], 1],
+    [[{ angle: "data", failure: "if items is empty, items[0] traps", quote: "return charge(req.body.amount);" }], 1],
+    [[{ angle: "data", failure: "Nonexistent key: lookup returns undefined", quote: "" }], 1],
+  ]) {
+    const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ angles }) });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    const label = JSON.stringify(angles);
+    assert.equal(JSON.parse(out.raw).findings[0].title, "create() passes a string amount through unconverted", label);
+    assert.match(out.pipelineSummary, /1 confirmed \(1 reframed\)/, label);
+    if (count) assert.match(out.pipelineSummary, new RegExp(`, ${count} angle line\\(s\\) with a failure`), label);
+    else assert.doesNotMatch(out.pipelineSummary, /angle/, label);
+  }
+});
+
+test("verify angles: a confirmed reframe whose proof_quote is beyond 30 lines of the cited line stays uncertain, even with an angle quote at the place", async () => {
+  const pad = Array.from({ length: 40 }, (_, i) => `// note ${i}`).join("\n");
+  const files = { ...FILES, "src/orders/orders.controller.ts": `import { charge } from './orders.service';\nexport function create(req) {\n  return charge(req.body.amount);\n}\n${pad}\nexport function audit(entry) { return entry.amount; }\n` };
+  const far = "export function audit(entry) { return entry.amount; }";
+  const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => angled({ proof_quote: far }) });
+  await wholePr(async () => {
+    const out = await runLocalReviewPipeline(sample(files), { ...settings, localPipelineKeepUncertain: true }, { request: m.request });
+    assert.match(out.pipelineSummary, /0 confirmed, 1 uncertain, 0 refuted/);
+    const [row] = JSON.parse(out.raw).findings;
+    assert.equal(row.title, "create() charges a negative amount", "the uncertain finding keeps the reporter's text");
+    assert.equal(row.severity, "P2");
+  });
+});
+
+test("verify angles: the Settings help for local_review.pipeline_lenses recommends 1 (the angles live in the verify turn)", () => {
+  const src = readFileSync(new URL("../../src/routes/settings.tsx", import.meta.url), "utf8");
+  const field = src.slice(src.indexOf('<Field label="local_review.pipeline_lenses">'), src.indexOf("</Field>", src.indexOf('<Field label="local_review.pipeline_lenses">')));
+  assert.match(field.replace(/\s+/g, " "), /More lenses find more places, not better causes\. 1 is recommended: the verifier checks every place from three angles \(failure path, data, contract\)\./);
 });

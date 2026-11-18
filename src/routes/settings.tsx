@@ -6,6 +6,7 @@ import {
   DEFAULT_SETTINGS,
   FIX_AGENT_KNOBS,
   FIX_MODES,
+  LOCAL_PIPELINE_THINKING,
   PROVIDER_LABEL,
   SECRET_MASK,
   SECRET_MASK_PEM,
@@ -34,6 +35,7 @@ import type {
   FixDelivery,
   FixMode,
   GithubReady,
+  LocalPipelineThinking,
   ReviewProvider,
   Severity,
 } from "@/lib/types";
@@ -52,6 +54,12 @@ export const Route = createFileRoute("/settings")({ component: Settings });
 const GATE_MODE_LABEL: Record<GateMode, string> = {
   off: "off — post every finding on changed code (이전 동작)",
   rules: "rules — deterministic precision gate (기본)",
+};
+
+const PIPELINE_THINKING_LABEL: Record<LocalPipelineThinking, string> = {
+  on: "on — every turn thinks (before 2026-11-18)",
+  focused: "focused — only the first feature and verify attempts think (default)",
+  off: "off — no turn thinks",
 };
 
 /** The finding-precision fields the section edits (types.ts BotSettings, validated by settings-rules). */
@@ -154,6 +162,7 @@ export function Settings() {
     saved.localPipelineLenses,
     saved.localPipelineKeepUncertain,
     saved.localPipelineDropBuildClaims,
+    saved.localPipelineThinking,
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
@@ -362,6 +371,23 @@ export function Settings() {
           <p className="mt-2 text-[12px] text-fg-subtle">
             A candidate whose failure is a compile error, a type error or a failing test or assertion is noise when the
             authors run a build and test gate before review. Turn this off for a repository without one.
+          </p>
+        </Field>
+        <Field label="local_review.pipeline_thinking">
+          <select
+            value={draft.localPipelineThinking}
+            onChange={(e) => patch({ localPipelineThinking: e.target.value as LocalPipelineThinking })}
+            className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+          >
+            {LOCAL_PIPELINE_THINKING.map((k) => (
+              <option key={k} value={k}>
+                {PIPELINE_THINKING_LABEL[k]}
+              </option>
+            ))}
+          </select>
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Map and select turns, and every retry, only summarise or reformat: focused sends them with thinking off
+            (chat_template_kwargs enable_thinking=false). Set on for a server that rejects that field.
           </p>
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -626,6 +652,7 @@ review:
   local_pipeline_lenses: ${draft.localPipelineLenses}
   local_pipeline_keep_uncertain: ${draft.localPipelineKeepUncertain}
   local_pipeline_drop_build_claims: ${draft.localPipelineDropBuildClaims}
+  local_pipeline_thinking: ${draft.localPipelineThinking}
   chatgpt_reasoning: ${draft.chatgptReasoning}
   grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]

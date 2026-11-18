@@ -185,7 +185,29 @@ On a Swift repository a 15–23-turn run left some files unreviewed (their featu
 
 ### Checking turn sizes in the logs
 
-Each turn logs one line: `pipeline <stage>: finish=<reason> chars=<prompt chars> <wall>s [ttft=<s>] [prompt=<n>] [cached=<n>] [out=<n>] reply=<n>c [reasoning=<n>c]`, for example `pipeline general[App/Sync.swift]: finish=length chars=41230 312.4s ttft=40.1s prompt=11800 cached=6100 out=16384 reply=2210c reasoning=48120c`. `reply` is the length in characters of the reply's content, and `reasoning` is the length of the thinking text the server sent beside it (`reasoning_content`, which the stream aggregator collects, or `reasoning`). It is left out when the server sent none. `finish=length` means the turn hit the output cap (`local_review.max_tokens`), and its reply is retried once with a request to keep it short. A large `out` with a small `reply` and a large `reasoning` means the tokens went to thinking, not to the JSON.
+Each turn logs one line: `pipeline <stage>: finish=<reason> think=<on|off> chars=<prompt chars> <wall>s [ttft=<s>] [prompt=<n>] [cached=<n>] [out=<n>] reply=<n>c [reasoning=<n>c]`, for example `pipeline general[App/Sync.swift]: finish=length think=on chars=41230 312.4s ttft=40.1s prompt=11800 cached=6100 out=16384 reply=2210c reasoning=48120c`. `reply` is the length in characters of the reply's content, and `reasoning` is the length of the thinking text the server sent beside it (`reasoning_content`, which the stream aggregator collects, or `reasoning`). It is left out when the server sent none. `finish=length` means the turn hit the output cap (`local_review.max_tokens`), and its reply is retried once with a request to keep it short. A large `out` with a small `reply` and a large `reasoning` means the tokens went to thinking, not to the JSON. `think` says whether the turn was allowed to think (`local_review.pipeline_thinking`, below).
+
+## Thinking per stage (2026-11-18)
+
+The per-turn `reply=` / `reasoning=` fields showed that the local model (oMLX, a thinking model) thinks on every pipeline turn, and that the thinking is most of its output:
+
+- Map turns, which only summarise facts: reply 1.7–5.9K chars against reasoning 11.5–18.4K chars, about 4–5K completion tokens and 75–180 s per turn.
+- A feature turn: reply 1.7K chars against reasoning 22K chars (93% thinking).
+- Turns cut at the 16384-token output cap (`finish=length`) are thinking that never ends: 500–650 s each. 61% of the same-prompt retries after a cut were cut again.
+
+`local_review.pipeline_thinking` (env `ASHLAR_LOCAL_PIPELINE_THINKING`) decides which turns may think. A turn that may not is sent with `chat_template_kwargs: {enable_thinking: false}`, which the server honours (the JSON repair path already sends it, `local_repair_no_thinking`). Only the request body changes: the prompt, and so the cached prompt prefix, is the same.
+
+- `on`: every turn thinks (the behaviour before this change); no kwargs are sent.
+- `focused` (default): only the first attempt of a feature turn and of a verify turn thinks. Map turns (and their reformat retry), the select turn, and every retry (after a reply cut at the output cap, after a reply that was not JSON, after a review that showed no reviewed file) are sent with thinking off.
+- `off`: no pipeline turn thinks.
+
+Why `focused` is the default:
+
+- Map and select summarise and rank what is already in the prompt; they need no exploration, so their thinking is time on the shared model for nothing.
+- A retry after a cut-off that thinks again repeats the runaway (61% did); without thinking, the retry only re-emits a short JSON reply.
+- Feature and verify turns find and check defects, which is where thinking can help. They keep it until a replay comparison (`ASHLAR_LOCAL_PIPELINE_THINKING=off npm run replay:local …` against `focused`, below) shows `off` keeps precision and recall.
+
+A server that rejects the unknown `chat_template_kwargs` field needs `on`.
 
 ## Settings
 
@@ -197,6 +219,7 @@ Each turn logs one line: `pipeline <stage>: finish=<reason> chars=<prompt chars>
 | `local_review.pipeline_lenses` | 3 | 1–3: candidate passes for a PR reviewed in one turn (1 = one combined pass). A PR split into features always gets one pass per feature. |
 | `local_review.pipeline_keep_uncertain` | off | Post an undecided candidate at P2 when its own quote is real code. |
 | `local_review.pipeline_drop_build_claims` | on | Drop a candidate that claims a compile error or a failing test before it is verified (env `ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS`). |
+| `local_review.pipeline_thinking` | focused | `on`, `focused` or `off`: which turns may think. `focused` lets only the first attempt of a feature or verify turn think; map, select and every retry are sent with `enable_thinking: false` (env `ASHLAR_LOCAL_PIPELINE_THINKING`). |
 
 ## Measuring it with the real model
 

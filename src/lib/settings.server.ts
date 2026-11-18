@@ -7,6 +7,7 @@ import {
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
+  LOCAL_PIPELINE_THINKING,
   LOCAL_REVIEW_MODES,
   LOCAL_REVIEW_ROLES,
   fixKnob,
@@ -17,6 +18,7 @@ import {
   type FixAgentProvider,
   type FixDelivery,
   type FixMode,
+  type LocalPipelineThinking,
   type LocalReviewMode,
   type LocalReviewRole,
   type ReviewProvider,
@@ -112,6 +114,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (keepUncertain !== undefined) o.localPipelineKeepUncertain = keepUncertain;
   const dropBuildClaims = envFlag("ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS");
   if (dropBuildClaims !== undefined) o.localPipelineDropBuildClaims = dropBuildClaims;
+  const pipelineThinking = envStr("ASHLAR_LOCAL_PIPELINE_THINKING");
+  if (pipelineThinking) o.localPipelineThinking = pipelineThinking;
   const localLease = envNum("ASHLAR_LOCAL_LEASE_CAPACITY");
   if (localLease !== undefined) o.localLeaseCapacity = localLease;
   const order = envStr("ASHLAR_REVIEW_ORDER");
@@ -206,6 +210,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_PIPELINE_LENSES: String(s.localPipelineLenses),
     ASHLAR_LOCAL_PIPELINE_KEEP_UNCERTAIN: String(s.localPipelineKeepUncertain),
     ASHLAR_LOCAL_PIPELINE_DROP_BUILD_CLAIMS: String(s.localPipelineDropBuildClaims),
+    ASHLAR_LOCAL_PIPELINE_THINKING: s.localPipelineThinking,
     ASHLAR_LOCAL_LEASE_CAPACITY: String(s.localLeaseCapacity),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
@@ -319,6 +324,9 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localPipelineLenses: intField(p, "localPipelineLenses"),
     localPipelineKeepUncertain: bool(p.localPipelineKeepUncertain, DEFAULT_SETTINGS.localPipelineKeepUncertain),
     localPipelineDropBuildClaims: bool(p.localPipelineDropBuildClaims, DEFAULT_SETTINGS.localPipelineDropBuildClaims),
+    localPipelineThinking: LOCAL_PIPELINE_THINKING.includes(p.localPipelineThinking as LocalPipelineThinking)
+      ? (p.localPipelineThinking as LocalPipelineThinking)
+      : DEFAULT_SETTINGS.localPipelineThinking,
     localLeaseCapacity: intField(p, "localLeaseCapacity"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),

@@ -1394,7 +1394,7 @@ test("measurement: each turn's time and the server's usage (prompt, cached, out)
   assert.equal(out.ok, true, out.error);
   assert.equal(m.count.select, 1, "two P1 findings still get the select turn");
   assert.match(out.pipelineSummary, / posted \(6 turns, \d+ min\) · map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50 reply=\d+c$/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop think=on chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50 reply=\d+c$/.test(l)), logs.join("\n"));
   // harbor keeps only the first 300 chars of a log line, which cuts the breakdown off the summary: it is
   // also logged on a line of its own, every stage on it.
   assert.ok(logs.some((l) => /^pipeline stages: map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/.test(l)), logs.join("\n"));
@@ -1424,7 +1424,7 @@ test("measurement: a server that reports no usage (or no cached count) still get
   const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
   assert.equal(out.ok, true, out.error);
   assert.match(out.pipelineSummary, / posted \(4 turns, \d+ min\) · map 1t [\d.]+m · feature 2t [\d.]+m · verify 1t [\d.]+m$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s reply=\d+c$/.test(l)), "no token counts, and no first-token time without a streamed reply");
+  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop think=on chars=\d+ [\d.]+s reply=\d+c$/.test(l)), "no token counts, and no first-token time without a streamed reply");
   // The default mock reports prompt_tokens only: no cached share is claimed.
   const m = model(on);
   const withPrompt = await runLocalReviewPipeline(sample(), settings, { request: m.request });
@@ -1456,6 +1456,65 @@ test("turn diagnostics: the per-turn log line carries the reply's length and, wh
   const verifyLine = plainLogs.find((l) => /^pipeline verify\[c1\]#1: /.test(l));
   assert.match(verifyLine, new RegExp(` reply=${confirm().length}c$`));
   assert.ok(plainLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => /reply=\d+c$/.test(l) && !/reasoning=/.test(l)));
+});
+
+// local_review.pipeline_thinking: a turn that may not think carries chat_template_kwargs {enable_thinking:false};
+// one that may carries no such field. The fixture cuts the first orders feature reply and the first mailer
+// verify reply at the output cap, and answers the first map turn with prose, so every kind of retry runs.
+const NO_THINKING = { enable_thinking: false };
+function thinkingRun() {
+  const mail = F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
+  const review = reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] });
+  return model({
+    map: (body, n) => (n === 1 ? "The files add order charging." : mapReply(body)),
+    review: (body) => (groupOf(body).includes("src/orders/orders.controller.ts") && body.messages.length === 2 ? msg('{"findings": [', "length") : review(body)),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? (body.messages.length === 2 ? msg('{"trace": "', "length") : confirm("return queue.push(to);")) : confirm()),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c2" }] }),
+  });
+}
+/** Each request as stage, first attempt or retry, and whether it carried the no-thinking kwargs. */
+const thinkingTurns = (m) => m.bodies.map((b) => ({ stage: stageOf(b), retry: b.messages.length > 2, kwargs: b.chat_template_kwargs }));
+
+test("pipeline thinking (default focused): map, select and every retry send enable_thinking=false; a first feature or verify attempt thinks", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineThinking, "focused");
+  const m = thinkingRun();
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  const turns = thinkingTurns(m);
+  const pick = (stage, retry) => turns.filter((t) => t.stage === stage && t.retry === retry);
+  // Every kind of turn ran: map and its reformat retry, a feature cut retry, a verify cut retry, the select turn.
+  for (const [stage, retry] of [["map", false], ["map", true], ["review", false], ["review", true], ["verify", false], ["verify", true], ["select", false]]) {
+    assert.ok(pick(stage, retry).length > 0, `${stage}${retry ? " retry" : ""} ran`);
+  }
+  for (const t of [...pick("map", false), ...pick("map", true), ...pick("select", false)]) assert.deepEqual(t.kwargs, NO_THINKING, `${t.stage} does not think`);
+  for (const t of [...pick("review", false), ...pick("verify", false)]) assert.equal(t.kwargs, undefined, `a first ${t.stage} attempt thinks`);
+  for (const t of [...pick("review", true), ...pick("verify", true)]) assert.deepEqual(t.kwargs, NO_THINKING, `a ${t.stage} retry after a cut-off does not think`);
+  // The per-turn log line says which.
+  assert.ok(logs.some((l) => /^pipeline map: finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline general\[src\/orders\/orders\.controller\.ts \+2\]: finish=length think=on chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline general\[src\/orders\/orders\.controller\.ts \+2\] retry \(cut_off\): finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1 \(retry\): finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline select: finish=stop think=off chars=/.test(l)), logs.join("\n"));
+});
+
+test("pipeline thinking: on sends no thinking kwargs on any turn; off sends enable_thinking=false on every turn", async () => {
+  const on = thinkingRun();
+  const onLogs = [];
+  const a = await runLocalReviewPipeline(sample(), { ...settings, localPipelineThinking: "on" }, { request: on.request, log: (l) => onLogs.push(l) });
+  assert.equal(a.ok, true, a.error);
+  assert.ok(on.bodies.length >= 9, "every kind of turn ran");
+  assert.ok(on.bodies.every((b) => !("chat_template_kwargs" in b)), "on: no request carries the field");
+  assert.ok(onLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => / think=on /.test(l)), onLogs.join("\n"));
+  const off = thinkingRun();
+  const offLogs = [];
+  const b = await runLocalReviewPipeline(sample(), { ...settings, localPipelineThinking: "off" }, { request: off.request, log: (l) => offLogs.push(l) });
+  assert.equal(b.ok, true, b.error);
+  assert.equal(off.bodies.length, on.bodies.length);
+  assert.ok(off.bodies.every((x) => JSON.stringify(x.chat_template_kwargs) === JSON.stringify(NO_THINKING)), "off: every request carries enable_thinking=false");
+  assert.ok(offLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => / think=off /.test(l)), offLogs.join("\n"));
+  // The prompt is the same whatever the setting: only the request body's kwargs differ.
+  assert.deepEqual(off.bodies.map((x) => x.messages), on.bodies.map((x) => x.messages));
 });
 
 test("select: two P2 findings in different files of different feature groups still get the select turn (feature groups do not prove two findings unrelated)", async () => {

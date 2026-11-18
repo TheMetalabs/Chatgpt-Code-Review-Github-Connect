@@ -186,6 +186,26 @@ describe("sanitizeBotSettings", () => {
     }
   });
 
+  it("defaults localPipelineThinking to focused, keeps a saved mode, rejects an unknown one, and round-trips ASHLAR_LOCAL_PIPELINE_THINKING", () => {
+    assert.equal(DEFAULT_SETTINGS.localPipelineThinking, "focused");
+    assert.equal(sanitizeBotSettings({}).localPipelineThinking, "focused");
+    assert.equal(sanitizeBotSettings({ localPipelineThinking: "off" }).localPipelineThinking, "off");
+    assert.equal(sanitizeBotSettings({ localPipelineThinking: "on" }).localPipelineThinking, "on");
+    assert.equal(sanitizeBotSettings({ localPipelineThinking: "none" }).localPipelineThinking, "focused");
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, localPipelineThinking: "none" }) ?? "", /local_review\.pipeline_thinking must be one of: on, focused, off$/);
+    assert.equal(botSettingsToEnv(sanitizeBotSettings({ localPipelineThinking: "off" })).ASHLAR_LOCAL_PIPELINE_THINKING, "off");
+    assert.equal(botSettingsToEnv(DEFAULT_SETTINGS).ASHLAR_LOCAL_PIPELINE_THINKING, "focused");
+    const prev = process.env.ASHLAR_LOCAL_PIPELINE_THINKING;
+    try {
+      process.env.ASHLAR_LOCAL_PIPELINE_THINKING = "on";
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localPipelineThinking, "on");
+      process.env.ASHLAR_LOCAL_PIPELINE_THINKING = "sometimes";
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localPipelineThinking, "focused");
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_LOCAL_PIPELINE_THINKING; else process.env.ASHLAR_LOCAL_PIPELINE_THINKING = prev;
+    }
+  });
+
   it("finding precision: defaults on, normalizes stored values, validates saves strictly, and the saved value beats the env seed", () => {
     const d = sanitizeBotSettings({});
     assert.deepEqual(

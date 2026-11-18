@@ -117,6 +117,7 @@ const TOP_LEVEL = {
   localPipelineLenses: {bad: [0, 4, '2', null], good: 1},
   localPipelineKeepUncertain: {bad: ['true', 1, null], good: false},
   localPipelineDropBuildClaims: {bad: ['false', 0, null], good: false},
+  localPipelineThinking: {bad: ['none', 'Off', '', false, 0, null], good: 'off'},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {
@@ -338,4 +339,13 @@ test('local_review.pipeline_drop_build_claims: the Settings screen store sends O
   assert.equal(state.settings.localPipelineDropBuildClaims, true, 'default on');
   await state.setSettings({localPipelineDropBuildClaims: false});
   assert.equal(request.localPipelineDropBuildClaims, false);
+});
+
+test('local_review.pipeline_thinking: the Settings screen store sends the chosen mode (default focused)', async () => {
+  let state, request;
+  const create = () => factory => { const set = patch => { state = {...state, ...(typeof patch === 'function' ? patch(state) : patch)}; }; state = factory(set, () => state); return state; };
+  loadTs('src/lib/store.ts', {...types, create, fetch: async (_path, init) => { request = JSON.parse(init.body); return {ok: true}; }});
+  assert.equal(state.settings.localPipelineThinking, 'focused', 'default focused');
+  await state.setSettings({localPipelineThinking: 'on'});
+  assert.equal(request.localPipelineThinking, 'on');
 });

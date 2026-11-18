@@ -29,6 +29,7 @@ import {
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
+  LOCAL_PIPELINE_THINKING,
   LOCAL_REVIEW_MODES,
   LOCAL_REVIEW_ROLES,
   fixKnob,
@@ -389,6 +390,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   localPipelineLenses: int("localPipelineLenses"),
   localPipelineKeepUncertain: bool("local_review.pipeline_keep_uncertain"),
   localPipelineDropBuildClaims: bool("local_review.pipeline_drop_build_claims"),
+  localPipelineThinking: oneOf("local_review.pipeline_thinking", LOCAL_PIPELINE_THINKING),
   localLeaseCapacity: int("localLeaseCapacity"),
   reviewOrder: (v) =>
     Array.isArray(v) && v.length === DEFAULT_REVIEW_ORDER.length && DEFAULT_REVIEW_ORDER.every((p) => v.includes(p))

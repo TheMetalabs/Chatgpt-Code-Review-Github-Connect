@@ -22,7 +22,7 @@ import { buildChatParts, buildPolicyAttachment, LOCAL_CHARS_PER_TOKEN, parseChat
 import { changedExportedSymbols } from "./context-slice.ts";
 import { extractChatJsonParts, lastJsonObjectRange } from "./extract-chat-json.ts";
 import { importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
-import { requestLocalJson, type LocalRequestActivity } from "./local-chat-request.server.ts";
+import { LocalChatHttpError, requestLocalJson, type LocalRequestActivity } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
 import {
@@ -86,6 +86,9 @@ type Ctx = {
   turns: number;
   /** Per-stage totals of every turn (time and the server's token counts), for the ops line. */
   stages: Partial<Record<StageName, StageTotals>>;
+  /** The server rejected chat_template_kwargs once this run: the rest of the run sends no thinking
+   * control (each turn then follows the server's default). */
+  noThinkingControl: boolean;
 };
 
 export type StageName = "map" | "feature" | "verify" | "select";
@@ -135,8 +138,24 @@ function sampling(settings: BotSettings, mode: Sampling): Record<string, number>
 
 const chars = (messages: Msg[]) => messages.reduce((n, m) => n + m.content.length, 0);
 
-/** One request. Throws on transport errors and on cancellation (the caller decides what that means). */
-async function ask(ctx: Ctx, stage: string, messages: Msg[], mode: Sampling): Promise<{ content: string; finish?: string; toolCalls: number }> {
+/** Whether a turn thinks (local_review.pipeline_thinking). `deep`: the first attempt of a feature or
+ * verify turn, the only turns "focused" (the default) lets think. Map and select only summarise and rank,
+ * and a retry after a cut-off or a reply that was not JSON would repeat the runaway thinking. Every turn
+ * sends the answer explicitly (ask), so the setting holds whatever the server's own default is. */
+function pipelineThinks(settings: BotSettings, deep: boolean): boolean {
+  const mode = settings.localPipelineThinking;
+  return mode === "on" ? true : mode === "off" ? false : deep;
+}
+
+/** A 400/422 whose body names the thinking kwargs: a server that does not accept chat_template_kwargs. */
+const rejectsThinkingControl = (e: unknown) =>
+  e instanceof LocalChatHttpError && (e.status === 400 || e.status === 422) && /chat_template_kwargs|enable_thinking/i.test(e.message);
+
+/** One request. Throws on transport errors and on cancellation (the caller decides what that means).
+ * Sends chat_template_kwargs {enable_thinking: think} on every turn, so the server's default never decides;
+ * the prompt is the same either way. A server that rejects the field gets the turn once more without it,
+ * and the rest of the run sends none (ctx.noThinkingControl). */
+async function ask(ctx: Ctx, stage: string, messages: Msg[], mode: Sampling, think: boolean): Promise<{ content: string; finish?: string; toolCalls: number }> {
   const { deps, settings } = ctx;
   if (deps.checkpoint) await deps.checkpoint();
   if (deps.signal?.aborted) throw deps.signal.reason ?? new Error("local review cancelled at a turn boundary");
@@ -153,12 +172,23 @@ async function ask(ctx: Ctx, stage: string, messages: Msg[], mode: Sampling): Pr
     if (a.kind === "output") { outputs += 1; firstAt ||= a.at; }
   };
   let res: { choices?: { finish_reason?: string; message?: { content?: string; reasoning_content?: unknown; reasoning?: unknown; tool_calls?: unknown[] } }[]; usage?: unknown };
-  try {
-    res = (await ctx.request(ctx.baseUrl, ctx.apiKey, "chat/completions", {
+  const send = async () =>
+    (await ctx.request(ctx.baseUrl, ctx.apiKey, "chat/completions", {
       model: settings.localLlmModel.trim(),
       messages,
       ...sampling(settings, mode),
+      ...(ctx.noThinkingControl ? {} : { chat_template_kwargs: { enable_thinking: think } }),
     }, deps.signal, { onActivity })) as typeof res;
+  try {
+    try {
+      res = await send();
+    } catch (e) {
+      if (ctx.noThinkingControl || !rejectsThinkingControl(e)) throw e;
+      ctx.noThinkingControl = true;
+      sentAt = 0; firstAt = 0; outputs = 0;
+      deps.log?.(`pipeline ${stage}: the server rejected chat_template_kwargs (${(e as Error).message}); retrying without it, and this run sends no thinking control (local_review.pipeline_thinking has no effect)`);
+      res = await send();
+    }
   } catch (e) {
     noteTurn(ctx, stage, Date.now() - start, undefined);
     throw e;
@@ -175,25 +205,27 @@ async function ask(ctx: Ctx, stage: string, messages: Msg[], mode: Sampling): Pr
   // (`reasoning_content`, which the stream aggregator collects; `reasoning` on some buffered servers).
   const thought = [choice?.message?.reasoning_content, choice?.message?.reasoning].find((r): r is string => typeof r === "string" && r.length > 0);
   const sizes = [`reply=${(choice?.message?.content ?? "").length}c`, thought ? `reasoning=${thought.length}c` : ""];
-  deps.log?.(`pipeline ${stage}: finish=${choice?.finish_reason} chars=${chars(messages)} ${[...timing, ...tokens, ...sizes].filter(Boolean).join(" ")}`);
+  deps.log?.(`pipeline ${stage}: finish=${choice?.finish_reason} think=${ctx.noThinkingControl ? "server" : think ? "on" : "off"} chars=${chars(messages)} ${[...timing, ...tokens, ...sizes].filter(Boolean).join(" ")}`);
   return { content: choice?.message?.content ?? "", finish: choice?.finish_reason, toolCalls: Array.isArray(calls) ? calls.length : 0 };
 }
 
 /** A JSON object reply (any shape `accept` takes), with one reformat retry. `replies` are the completed
- * replies that were not usable (kept as evidence where the stage produces findings). */
+ * replies that were not usable (kept as evidence where the stage produces findings). `deep`: the first
+ * attempt may think under "focused" (pipelineThinks); the retry never does unless thinking is "on". */
 async function askJson<T>(
   ctx: Ctx,
   stage: string,
   messages: Msg[],
   mode: Sampling,
   accept: (value: unknown) => T | null,
+  deep = false,
 ): Promise<{ value: T | null; replies: string[] }> {
   const replies: string[] = [];
   const parse = (text: string): T | null => {
     const span = lastJsonObjectRange(text, (v) => accept(v) !== null, true);
     return span ? accept(JSON.parse(span.json)) : null;
   };
-  const first = await ask(ctx, stage, messages, mode);
+  const first = await ask(ctx, stage, messages, mode, pipelineThinks(ctx.settings, deep));
   const cut = first.finish === "length";
   if (first.finish === "content_filter") return { value: null, replies };
   const v1 = cut || first.toolCalls ? null : parse(first.content);
@@ -208,7 +240,7 @@ async function askJson<T>(
       ? "Your last reply was cut off at the output limit. Reply again with ONLY the JSON object, kept short. No prose, no markdown fences."
       : "Your last reply was not the requested JSON object. Reply again with ONLY that JSON object. No prose, no markdown fences.",
   });
-  const second = await ask(ctx, `${stage} (retry)`, retry, "strict");
+  const second = await ask(ctx, `${stage} (retry)`, retry, "strict", pipelineThinks(ctx.settings, false));
   if (second.finish === "length" || second.finish === "content_filter" || second.toolCalls) return { value: null, replies };
   const v2 = parse(second.content);
   if (v2 === null && second.content.trim()) replies.push(second.content.trim());
@@ -598,7 +630,7 @@ async function reviewFeature(
   ];
   const label = `${lens}[${files[0]}${files.length > 1 ? ` +${files.length - 1}` : ""}]`;
   const replies: string[] = [];
-  const first = await ask(ctx, label, messages, "explore");
+  const first = await ask(ctx, label, messages, "explore", pipelineThinks(settings, true));
   const cut = first.finish === "length";
   if (first.finish === "content_filter") return { files, raw: null, replies };
   const parts = !cut && !first.toolCalls ? extractChatJsonParts(first.content) : null;
@@ -616,7 +648,7 @@ async function reviewFeature(
   const retry: Msg[] = [...messages];
   if (!cut && Math.ceil((chars(messages) + first.content.length) / LOCAL_CHARS_PER_TOKEN) <= ctx.capTokens) retry.push({ role: "assistant", content: first.content });
   retry.push({ role: "user", content: GROUP_RETRY_MSG[kind] });
-  const second = await ask(ctx, `${label} retry (${kind})`, retry, "strict");
+  const second = await ask(ctx, `${label} retry (${kind})`, retry, "strict", pipelineThinks(settings, false));
   const ok2 = second.finish !== "length" && second.finish !== "content_filter" && !second.toolCalls;
   const parts2 = ok2 ? extractChatJsonParts(second.content) : null;
   if (parts2 && groupReviewValid(parts2.json, files, sample, settings)) {
@@ -1243,7 +1275,7 @@ async function verifyCandidate(ctx: Ctx, sample: SamplePr, c: Candidate, map: Ma
   let uncertain = "";
   const agreeing: Verdict[] = [];
   for (let i = 0; i < Math.max(1, votes); i += 1) {
-    const { value } = await askJson(ctx, `verify[${c.cid}]#${i + 1}`, messages, i === 0 ? "strict" : "vote", acceptVerdict);
+    const { value } = await askJson(ctx, `verify[${c.cid}]#${i + 1}`, messages, i === 0 ? "strict" : "vote", acceptVerdict, true);
     if (!value) return { cid: c.cid, status: "unverified", reason: "the verifier returned no verdict", severity: c.severity };
     if (value.verdict === "refuted") {
       // A refutation must point at what prevents the defect; one that cannot is no refutation.
@@ -1471,6 +1503,7 @@ function makeCtx(settings: BotSettings, deps: LocalReviewDeps, t: LoopTuning): C
     promptChars,
     turns: 0,
     stages: {},
+    noThinkingControl: false,
   };
 }
 

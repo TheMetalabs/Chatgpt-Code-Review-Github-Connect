@@ -31,6 +31,20 @@ test('Settings UI: repair defaults ON, saved OFF survives reload and does not ch
  assert.equal(submitted.localJsonRepairEnabled,false);assert.equal(submitted.reviewChatgpt,true);assert.equal(submitted.reviewLocal,false);
  await page.reload();assert.equal(await toggle.getAttribute('aria-pressed'),'false');
 });
+test('Settings UI: local_review.pipeline_thinking is a select that defaults to focused and saves the chosen mode',async t=>{
+ const context=await browser.newContext();t.after(()=>context.close());let submitted;
+ await context.route('https://repair.fixture/**',async route=>{
+  const url=new URL(route.request().url());
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/api/harbor')submitted=route.request().postDataJSON();
+  return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
+ });
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Repair UI fixture page error:',error.message));await page.goto('https://repair.fixture/?settings');
+ const select=page.locator('label',{hasText:'local_review.pipeline_thinking'}).locator('select');
+ assert.equal(await select.inputValue(),'focused');assert.deepEqual(await select.locator('option').evaluateAll(o=>o.map(x=>x.value)),['on','focused','off']);
+ await select.selectOption('off');await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('Saved',{exact:true}).waitFor();
+ assert.equal(submitted.localPipelineThinking,'off');
+});
 test('History UI: repair status visible, originals and candidates only after protected load and remain inert',async t=>{
  const context=await browser.newContext();t.after(()=>context.close());const metadata={id:'repair-A',jobId:'A',provider:'chatgpt',runId:'run-A',responseId:'response-A',sourceHash:'a'.repeat(64),schemaVersion:'review-format-1',schema:'review',headSha:'abc',model:'formatter',status:'needs_attention',attempts:1,createdAt:1,updatedAt:2,errors:['original_content_not_preserved']};
  const job={id:'A',owner:'fixture',repo:'repo',pr:1,status:'awaiting_chat'};

@@ -34,6 +34,7 @@ import { collectPriorFindings, isPriorDuplicate } from "../../src/lib/prior-find
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
 import { verifiedKey } from "../../src/lib/finding-gate.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
+import { LocalChatHttpError } from "../../src/lib/local-chat-request.server.ts";
 import { asFinding, gateLiveSubmission } from "../../src/lib/poster.ts";
 import { inlineFindingComment } from "../../src/lib/review-format.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
@@ -1394,7 +1395,7 @@ test("measurement: each turn's time and the server's usage (prompt, cached, out)
   assert.equal(out.ok, true, out.error);
   assert.equal(m.count.select, 1, "two P1 findings still get the select turn");
   assert.match(out.pipelineSummary, / posted \(6 turns, \d+ min\) · map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50 reply=\d+c$/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop think=on chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50 reply=\d+c$/.test(l)), logs.join("\n"));
   // harbor keeps only the first 300 chars of a log line, which cuts the breakdown off the summary: it is
   // also logged on a line of its own, every stage on it.
   assert.ok(logs.some((l) => /^pipeline stages: map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/.test(l)), logs.join("\n"));
@@ -1424,7 +1425,7 @@ test("measurement: a server that reports no usage (or no cached count) still get
   const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
   assert.equal(out.ok, true, out.error);
   assert.match(out.pipelineSummary, / posted \(4 turns, \d+ min\) · map 1t [\d.]+m · feature 2t [\d.]+m · verify 1t [\d.]+m$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s reply=\d+c$/.test(l)), "no token counts, and no first-token time without a streamed reply");
+  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop think=on chars=\d+ [\d.]+s reply=\d+c$/.test(l)), "no token counts, and no first-token time without a streamed reply");
   // The default mock reports prompt_tokens only: no cached share is claimed.
   const m = model(on);
   const withPrompt = await runLocalReviewPipeline(sample(), settings, { request: m.request });
@@ -1456,6 +1457,109 @@ test("turn diagnostics: the per-turn log line carries the reply's length and, wh
   const verifyLine = plainLogs.find((l) => /^pipeline verify\[c1\]#1: /.test(l));
   assert.match(verifyLine, new RegExp(` reply=${confirm().length}c$`));
   assert.ok(plainLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => /reply=\d+c$/.test(l) && !/reasoning=/.test(l)));
+});
+
+// local_review.pipeline_thinking: every turn carries chat_template_kwargs {enable_thinking: true|false}, so the
+// setting holds whatever the server's own default is (a turn that sent nothing would inherit it). The fixture cuts the first orders feature reply and the first mailer
+// verify reply at the output cap, and answers the first map turn with prose, so every kind of retry runs.
+const NO_THINKING = { enable_thinking: false };
+const THINKING = { enable_thinking: true };
+function thinkingRun() {
+  const mail = F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" });
+  const review = reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [mail] });
+  return model({
+    map: (body, n) => (n === 1 ? "The files add order charging." : mapReply(body)),
+    review: (body) => (groupOf(body).includes("src/orders/orders.controller.ts") && body.messages.length === 2 ? msg('{"findings": [', "length") : review(body)),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? (body.messages.length === 2 ? msg('{"trace": "', "length") : confirm("return queue.push(to);")) : confirm()),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c2" }] }),
+  });
+}
+/** Each request as stage, first attempt or retry, and the thinking kwargs it carried. */
+const thinkingTurns = (m) => m.bodies.map((b) => ({ stage: stageOf(b), retry: b.messages.length > 2, kwargs: b.chat_template_kwargs }));
+
+test("pipeline thinking (default focused): map, select and every retry send enable_thinking=false; a first feature or verify attempt sends enable_thinking=true", async () => {
+  assert.equal(DEFAULT_SETTINGS.localPipelineThinking, "focused");
+  const m = thinkingRun();
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  const turns = thinkingTurns(m);
+  const pick = (stage, retry) => turns.filter((t) => t.stage === stage && t.retry === retry);
+  // Every kind of turn ran: map and its reformat retry, a feature cut retry, a verify cut retry, the select turn.
+  for (const [stage, retry] of [["map", false], ["map", true], ["review", false], ["review", true], ["verify", false], ["verify", true], ["select", false]]) {
+    assert.ok(pick(stage, retry).length > 0, `${stage}${retry ? " retry" : ""} ran`);
+  }
+  for (const t of [...pick("map", false), ...pick("map", true), ...pick("select", false)]) assert.deepEqual(t.kwargs, NO_THINKING, `${t.stage} does not think`);
+  for (const t of [...pick("review", false), ...pick("verify", false)]) assert.deepEqual(t.kwargs, THINKING, `a first ${t.stage} attempt asks for thinking explicitly`);
+  assert.ok(m.bodies.every((b) => "chat_template_kwargs" in b), "no turn is left to the server's default");
+  for (const t of [...pick("review", true), ...pick("verify", true)]) assert.deepEqual(t.kwargs, NO_THINKING, `a ${t.stage} retry after a cut-off does not think`);
+  // The per-turn log line says which.
+  assert.ok(logs.some((l) => /^pipeline map: finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline general\[src\/orders\/orders\.controller\.ts \+2\]: finish=length think=on chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline general\[src\/orders\/orders\.controller\.ts \+2\] retry \(cut_off\): finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1 \(retry\): finish=stop think=off chars=/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline select: finish=stop think=off chars=/.test(l)), logs.join("\n"));
+});
+
+test("pipeline thinking: on sends enable_thinking=true on every turn; off sends enable_thinking=false on every turn", async () => {
+  const on = thinkingRun();
+  const onLogs = [];
+  const a = await runLocalReviewPipeline(sample(), { ...settings, localPipelineThinking: "on" }, { request: on.request, log: (l) => onLogs.push(l) });
+  assert.equal(a.ok, true, a.error);
+  assert.ok(on.bodies.length >= 9, "every kind of turn ran");
+  assert.ok(on.bodies.every((b) => JSON.stringify(b.chat_template_kwargs) === JSON.stringify(THINKING)), "on: every request carries enable_thinking=true");
+  assert.ok(onLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => / think=on /.test(l)), onLogs.join("\n"));
+  const off = thinkingRun();
+  const offLogs = [];
+  const b = await runLocalReviewPipeline(sample(), { ...settings, localPipelineThinking: "off" }, { request: off.request, log: (l) => offLogs.push(l) });
+  assert.equal(b.ok, true, b.error);
+  assert.equal(off.bodies.length, on.bodies.length);
+  assert.ok(off.bodies.every((x) => JSON.stringify(x.chat_template_kwargs) === JSON.stringify(NO_THINKING)), "off: every request carries enable_thinking=false");
+  assert.ok(offLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => / think=off /.test(l)), offLogs.join("\n"));
+  // The prompt is the same whatever the setting: only the request body's kwargs differ.
+  assert.deepEqual(off.bodies.map((x) => x.messages), on.bodies.map((x) => x.messages));
+});
+
+test("pipeline thinking: a server that rejects chat_template_kwargs (400 naming it) gets that turn once more without it, and no later turn sends it", async () => {
+  const m = thinkingRun();
+  const sent = [];
+  let rejections = 0;
+  const request = async (b, k, path, body, ...rest) => {
+    if (path === "chat/completions") sent.push(body);
+    if (path === "chat/completions" && "chat_template_kwargs" in body) {
+      rejections += 1;
+      throw new LocalChatHttpError(400, '{"error":"Unrecognized request argument supplied: chat_template_kwargs"}');
+    }
+    return m.request(b, k, path, body, ...rest);
+  };
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(rejections, 1, "rejected once, then remembered for the rest of the run");
+  assert.ok("chat_template_kwargs" in sent[0]);
+  assert.ok(sent.slice(1).every((b) => !("chat_template_kwargs" in b)), "the retry and every later turn send no kwargs");
+  assert.deepEqual(sent[1].messages, sent[0].messages, "the retry is the same turn");
+  assert.ok(m.bodies.length >= 9, "the whole run went on");
+  assert.equal(logs.filter((l) => /the server rejected chat_template_kwargs \(local LLM HTTP 400: .*chat_template_kwargs.*\); retrying without it/.test(l)).length, 1, logs.join("\n"));
+  assert.ok(logs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => / think=server /.test(l)), logs.join("\n"));
+});
+
+test("pipeline thinking: a 400 that does not name the thinking kwargs is not retried without them", async () => {
+  const sent = [];
+  const request = async (_b, _k, path, body) => {
+    if (path === "models") return { data: [] };
+    sent.push(body);
+    throw new LocalChatHttpError(400, "prompt is too long for the context window");
+  };
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
+  assert.ok(sent.length >= 1);
+  assert.ok(sent.every((b) => "chat_template_kwargs" in b), "every request still carried the kwargs");
+  assert.ok(!logs.some((l) => /rejected chat_template_kwargs/.test(l)), logs.join("\n"));
+  assert.equal(out.ok, false, "every turn failed");
+  // One request per turn: no turn was sent twice (a rejection retry would repeat the same messages).
+  const keys = sent.map((b) => JSON.stringify(b.messages));
+  assert.equal(new Set(keys).size, keys.length, "no turn was retried without the kwargs");
 });
 
 test("select: two P2 findings in different files of different feature groups still get the select turn (feature groups do not prove two findings unrelated)", async () => {

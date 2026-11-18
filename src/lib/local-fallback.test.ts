@@ -196,6 +196,44 @@ describe("verify-clean local role", () => {
     );
   });
 
+  it("a partial or cut-off local result with no finding does not keep chat waived, even with a 'Reviewed N of M' investigated_safe line", () => {
+    const at = { localFallbackAt: 1, assumptions: [] as string[] };
+    // The shape the local pipeline emits for a partial review (no finding, part of the change unreviewed).
+    const partial = {
+      provider: "local" as const,
+      raw: JSON.stringify({
+        merge_recommendation: "COMMENT",
+        highest_risk: "",
+        investigated_safe: [
+          "Reviewed 3 of 4 files in feature turns; no defect was confirmed (1 candidate(s) refuted, 0 build/test claim(s) dropped); not reviewed: src/b.ts (feature turn failed)",
+          "src/a.ts: checked",
+        ],
+        assumptions: [],
+        findings: [],
+        coverage: [{ file: "src/a.ts", status: "cleared", reason: "reviewed in a feature turn" }, { file: "src/b.ts", status: "not_cleared", reason: "feature review failed" }],
+        unreviewed_paths: ["src/b.ts"],
+      }),
+    };
+    assert.equal(usableLocalFallbackLeg(partial), false, "partial local result is not a usable verdict");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [partial] }), false, "partial local result: chat is awaited again");
+    // Blank unreviewed_paths entries are not unreviewed paths.
+    const blankUnreviewed = { provider: "local" as const, raw: JSON.stringify({ findings: [], investigated_safe: ["src/a.ts: checked"], unreviewed_paths: ["", "  "] }) };
+    assert.equal(usableLocalFallbackLeg(blankUnreviewed), true, "blank unreviewed_paths entries do not make it partial");
+    // A complete clean result keeps chat waived.
+    const complete = { provider: "local" as const, raw: JSON.stringify({ merge_recommendation: "COMMENT", findings: [], investigated_safe: ["src/a.ts: checked", "src/b.ts: checked"], coverage: [] }) };
+    assert.equal(usableLocalFallbackLeg(complete), true, "complete clean result is usable");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [complete] }), true, "complete clean result keeps chat waived");
+    // A reply cut off before it finished is never a complete clean verdict.
+    const truncated = { provider: "local" as const, raw: JSON.stringify({ findings: [], investigated_safe: ["src/a.ts: checked"], truncated: true }) };
+    assert.equal(usableLocalFallbackLeg(truncated), false, "truncated result is not usable");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [truncated] }), false, "truncated result: chat is awaited again");
+    // In verify-clean with chatgpt + local, the chat provider is racing again after a partial fallback.
+    const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "local"] as ReviewProvider[], localReleased: true };
+    assert.deepEqual(racingProviders({ ...fallback, localFallback: fallbackWaivesChat({ ...at, storedLegs: [partial] }) }), ["chatgpt", "local"]);
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat({ ...at, storedLegs: [partial] }) }), payloads: ["local"], assumptions: [], localInFlight: false }), true, "partial local: waits on chat");
+    assert.deepEqual(racingProviders({ ...fallback, localFallback: fallbackWaivesChat({ ...at, storedLegs: [complete] }) }), ["local"], "complete local: chat stays waived");
+  });
+
   it("pins the held-local release prompt so a later chatPrompt mutation cannot retarget local", () => {
     const before = { chatPrompt: "VERIFY-PROMPT-AT-RELEASE", chatPromptByProvider: { chatgpt: "VERIFY-PROMPT-AT-RELEASE" } };
     const pinned = releaseLocalPrompt(before);

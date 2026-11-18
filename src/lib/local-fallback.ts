@@ -92,6 +92,14 @@ export function usableLocalFallbackLeg(
     // is not a review (a bare {} / non-review object must not keep chat waived).
     const findings = Array.isArray(o.findings) ? o.findings : [];
     if (findings.length === 0) {
+      // A partial run (some changed paths unreviewed) or a reply cut off before it finished is not a
+      // complete clean verdict, even when investigated_safe carries a "Reviewed N of M files" line:
+      // mirrors incompleteVerdict, so an incomplete local result awaits chat again.
+      if (o.truncated === true) return false;
+      const unreviewed = Array.isArray(o.unreviewed_paths)
+        ? (o.unreviewed_paths as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean)
+        : [];
+      if (unreviewed.length) return false;
       const safe = Array.isArray(o.investigated_safe)
         ? (o.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
         : [];

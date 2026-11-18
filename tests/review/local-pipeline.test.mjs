@@ -27,6 +27,8 @@ import {
   SMALL_REVIEW_MAX_FILES,
   isBuildOutcomeClaim,
   callQualifiers,
+  partialReviewLine,
+  PARTIAL_REVIEW_LINE_MAX_CHARS,
 } from "../../src/lib/local-pipeline.server.ts";
 import { collectPriorFindings, isPriorDuplicate } from "../../src/lib/prior-findings.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
@@ -35,6 +37,7 @@ import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
 import { asFinding, gateLiveSubmission } from "../../src/lib/poster.ts";
 import { inlineFindingComment } from "../../src/lib/review-format.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
+import { incompleteVerdict, usableLocalFallbackLeg } from "../../src/lib/local-fallback.ts";
 
 // One lens pass per feature unless a test is about lenses (it sets localPipelineLenses itself).
 const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k", findingGate: "rules", localPipelineLenses: 1 };
@@ -532,8 +535,12 @@ test("codex #181: a whole-PR reply that marks a file unreviewed keeps it unrevie
     const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
     const json = JSON.parse(out.raw);
     assert.deepEqual(json.unreviewed_paths, ["src/orders/orders.service.ts"]);
-    assert.deepEqual(json.investigated_safe, [], "a partial review with no finding claims nothing clean");
+    // A partial review says so (never an empty reply the gate rejects), and is never a complete verdict.
+    assert.match(json.investigated_safe[0], /^Reviewed 3 of 4 files in feature turns; no defect was confirmed .*; not reviewed: src\/orders\/orders\.service\.ts \(the reviewer reported it unreviewed\)$/);
     assert.ok(json.coverage.some((c) => c.file === "src/orders/orders.service.ts" && c.status === "not_cleared"));
+    const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings);
+    assert.ok(gate.ok);
+    assert.match(incompleteVerdict(gate, out), /1 changed path\(s\) were not reviewed/);
   });
 });
 
@@ -691,7 +698,35 @@ test("no consequences from memory: the hunt and verify rules allow only what the
   assert.match(feature, rule);
   assert.ok(feature.includes('Write failure_scenario as "if <trigger>, <wrong result>".'));
   assert.match(verify, rule);
-  assert.ok(VERIFY_RULES.includes('"failure":"for confirmed: 1-2 sentences, if <trigger>, <wrong result>; else empty"'));
+  assert.ok(VERIFY_RULES.includes('"failure":"for confirmed: one sentence, if <trigger>, <wrong result>; else empty"'));
+});
+
+test("short replies: the feature, verify, map and select prompts each carry output-length rules; the verify rules still come first", async () => {
+  const m = model({
+    map: mapReply,
+    review: reviewFor({ "src/orders/orders.controller.ts": [F()], "src/mail/mailer.ts": [F({ file: "src/mail/mailer.ts", line: 2, title: "sendMail pushes to an undefined queue", evidence: "src/mail/mailer.ts:2 `return queue.push(to);`" })] }),
+    verify: (body) => (candidateFile(body) === "src/mail/mailer.ts" ? confirm("return queue.push(to);") : confirm()),
+    select: () => JSON.stringify({ selected: [{ id: "c1" }, { id: "c2" }] }),
+  });
+  await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  const user = (stage) => m.bodies.find((b) => stageOf(b) === stage).messages[1].content;
+  // Feature turns: short text fields, evidence only the needed line(s), one investigated_safe line per file, stop after the JSON.
+  const feature = user("review");
+  assert.ok(feature.includes("evidence quotes only the line(s) of the cause and of where it fails (path:line `code`), never whole blocks."));
+  assert.ok(feature.includes("Keep the reply short: every text field is one or two short sentences, and investigated_safe is one short line per file. Stop after the JSON object."));
+  assert.ok(feature.includes("Output exactly ONE JSON object: no prose, heading or second draft before or after it."), "the no-prose rule is kept");
+  // Verify turns: trace at most 3 short sentences, title at most 12 words, failure and fix one sentence, quotes only the deciding line(s).
+  const verify = user("verify");
+  assert.ok(verify.startsWith(VERIFY_RULES), "the fixed rules stay the shared prefix");
+  for (const rule of ['"trace":"at most 3 short sentences:', '"blocking_code":"for refuted: only the deciding line(s)', '"proof_quote":"for confirmed: only the deciding failing line(s)', '"title":"for confirmed: the defect as found, at most 12 words', '"failure":"for confirmed: one sentence,', '"fix":"for confirmed: one sentence;', "Stop after the JSON."]) assert.ok(verify.includes(rule), rule);
+  // Map turns: one-sentence summary, short-phrase guards and effects.
+  const map = user("map");
+  for (const rule of ['"summary":"one sentence"', '"guards":["a short phrase:', '"effects":["a short phrase:', "each a short phrase. Stop after the JSON."]) assert.ok(map.includes(rule), rule);
+  // Select turn: no reasons.
+  assert.ok(user("select").includes("No reasons or other text: stop after the JSON."));
+  // Every precision rule is still there.
+  for (const rule of ["Not findings (omit them)", "Intended behaviour the PR description or module docs", 'Write failure_scenario as "if <trigger>, <wrong result>".']) assert.ok(HUNT_INSTRUCTIONS.includes(rule), rule);
+  assert.ok(HUNT_INSTRUCTIONS.length < REVIEW_INSTRUCTIONS.length, "the hunt rules still fit where the chat rules were");
 });
 
 test("language notes: a Swift feature turn gets the Character, CRLF, waitForExistence and try? notes; a TypeScript-only one does not", async () => {
@@ -914,6 +949,108 @@ test("failed feature turn: files still failing alone are unreviewed and named in
   assert.deepEqual([...review.unreviewed_paths].sort(), [...ORDERS].sort());
   assert.match(out.pipelineSummary, /\(1 failed, 3 file\(s\) retried alone, unreviewed: orders\.(controller|service)\.ts, /);
   assert.ok(review.coverage.filter((c) => c.reason === "feature review failed").length === 3);
+});
+
+// ── A partial review with no finding (2026-11-18): one feature's turns failed and every candidate was
+// dropped or refuted. It was sent with investigated_safe: [], which the poster rejects as an Instant-tier
+// skip, so the whole run was thrown away and the head re-requested ──
+
+const BUILD_CLAIM = F({ title: "create() does not compile", failure_scenario: "The build fails with a compile error at create().", root_cause: "charge expects a number." });
+/** The mailer feature's turns fail (cut off at the output cap, also on retry: no completed reply to keep);
+ * the orders feature reports `orders`. */
+const mailerFails = (orders) => (body) => (groupOf(body).includes("src/mail/mailer.ts") ? msg('{"findings": [', "length") : reviewFor({ "src/orders/orders.controller.ts": orders })(body));
+/** What harbor's gateLeg decides from: the poster's gate, then whether it is a complete verdict. */
+function legDecision(out) {
+  const gate = gateLiveSubmission(parseChatSubmission(out.raw), sample(), settings);
+  return { gate, incomplete: gate.ok ? incompleteVerdict(gate, out) : gate.reason };
+}
+
+test("partial review: a failed feature and only a build/test claim (dropped) is a review that names the unreviewed file", async () => {
+  const m = model({ map: mapReply, review: mailerFails([BUILD_CLAIM]), verify: () => assert.fail("a build claim never gets a verify turn") });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.unparsedText, undefined, "the cut-off turns left no reply as evidence");
+  const review = JSON.parse(out.raw);
+  assert.deepEqual(review.findings, []);
+  assert.deepEqual(review.unreviewed_paths, ["src/mail/mailer.ts"]);
+  assert.equal(review.investigated_safe[0], "Reviewed 3 of 4 files in feature turns; no defect was confirmed (0 candidate(s) refuted, 1 build/test claim(s) dropped); not reviewed: src/mail/mailer.ts (feature turn failed)");
+  // The feature turn's own investigated_safe entries are kept after it.
+  assert.ok(review.investigated_safe.includes("src/orders/orders.controller.ts: checked"));
+  assert.deepEqual(review.coverage.filter((c) => c.status === "not_cleared"), [{ file: "src/mail/mailer.ts", status: "not_cleared", reason: "feature review failed" }]);
+  const { gate, incomplete } = legDecision(out);
+  assert.ok(gate.ok, gate.reason);
+  assert.deepEqual(gate.unreviewed, ["src/mail/mailer.ts"]);
+  // Never a complete (clean) verdict: harbor gates it as evidence and it posts as a raw review.
+  assert.match(incomplete, /^1 changed path\(s\) were not reviewed \(src\/mail\/mailer\.ts\) and no finding is left to post$/);
+});
+
+test("partial review: a failed feature and every candidate refuted is a review that names the unreviewed file", async () => {
+  const m = model({ map: mapReply, review: mailerFails([F()]), verify: refute });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  const review = JSON.parse(out.raw);
+  assert.deepEqual(review.findings, []);
+  assert.deepEqual(review.unreviewed_paths, ["src/mail/mailer.ts"]);
+  assert.equal(review.investigated_safe[0], "Reviewed 3 of 4 files in feature turns; no defect was confirmed (1 candidate(s) refuted, 0 build/test claim(s) dropped); not reviewed: src/mail/mailer.ts (feature turn failed)");
+  assert.ok(!review.investigated_safe.some((s) => /refuted all/.test(s)), "no 'all refuted' line for a partial review");
+  const { gate, incomplete } = legDecision(out);
+  assert.ok(gate.ok, gate.reason);
+  assert.match(incomplete, /were not reviewed \(src\/mail\/mailer\.ts\)/);
+});
+
+test("partial review: the pipeline's partial result never keeps chat waived as a chat-down fallback; a complete one does", async () => {
+  const partial = await runLocalReviewPipeline(sample(), settings, { request: model({ map: mapReply, review: mailerFails([F()]), verify: refute }).request });
+  assert.equal(partial.ok, true, partial.error);
+  assert.match(JSON.parse(partial.raw).investigated_safe[0], /^Reviewed 3 of 4 files/);
+  assert.equal(usableLocalFallbackLeg({ provider: "local", raw: partial.raw }), false, "partial: chat is awaited again");
+  const complete = await runLocalReviewPipeline(sample(), settings, { request: model({ map: mapReply, review: reviewFor({}), verify: () => assert.fail("no candidate to verify") }).request });
+  assert.equal(complete.ok, true, complete.error);
+  assert.equal(usableLocalFallbackLeg({ provider: "local", raw: complete.raw }), true, "complete: chat stays waived");
+});
+
+test("partial review line: long unreviewed paths fit the poster's 400-char slice and end with the +K more count", () => {
+  const dir = "src/modules/fixture-area/deeply/nested/subsystem/component/implementation";
+  const failed = Array.from({ length: 9 }, (_, i) => `${dir}/handler-number-${i}.service.ts`);
+  const reported = Array.from({ length: 7 }, (_, i) => `${dir}/reported-file-${i}.controller.ts`);
+  const noDiff = Array.from({ length: 4 }, (_, i) => `${dir}/asset-${i}.bin`);
+  const stats = { refuted: 2, buildClaims: 1, uncertain: 3 };
+  const line = partialReviewLine(5, [...failed, ...reported, ...noDiff], failed, reported, stats);
+  assert.equal(PARTIAL_REVIEW_LINE_MAX_CHARS, 400);
+  assert.ok(line.length <= 400, `line is ${line.length} chars`);
+  assert.match(line, /^Reviewed 5 of 25 files in feature turns; no defect was confirmed \(2 candidate\(s\) refuted, 1 build\/test claim\(s\) dropped, 3 uncertain not posted\); not reviewed: /);
+  const more = line.match(/\+(\d+) more$/);
+  assert.ok(more, `ends with +K more: ${line}`);
+  const shown = (line.match(/handler-number-\d+|reported-file-\d+|asset-\d+/g) ?? []).length;
+  assert.equal(Number(more[1]), 20 - shown, "+K counts exactly the paths left out");
+  assert.ok(shown >= 1, "at least one path is still named");
+  // The poster keeps the whole line.
+  assert.equal(line.slice(0, 400), line);
+  // A short list is unchanged: every path, no count.
+  assert.equal(partialReviewLine(3, ["src/b.ts"], ["src/b.ts"], [], { refuted: 0, buildClaims: 0 }), "Reviewed 3 of 4 files in feature turns; no defect was confirmed (0 candidate(s) refuted, 0 build/test claim(s) dropped); not reviewed: src/b.ts (feature turn failed)");
+});
+
+test("partial review: a run with no unreviewed file and no candidate is unchanged (the feature turns' own lines, a complete verdict)", async () => {
+  const m = model({ map: mapReply, review: reviewFor({}), verify: () => assert.fail("no candidate to verify") });
+  const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+  assert.equal(out.ok, true, out.error);
+  const review = JSON.parse(out.raw);
+  assert.equal(review.unreviewed_paths, undefined);
+  assert.deepEqual([...review.investigated_safe].sort(), Object.keys(FILES).map((f) => `${f}: checked`).sort());
+  assert.ok(!review.investigated_safe.some((s) => /^Reviewed \d+ of/.test(s)));
+  const { gate, incomplete } = legDecision(out);
+  assert.ok(gate.ok, gate.reason);
+  assert.equal(incomplete, undefined, "a full review with no finding stays a complete verdict");
+});
+
+test("partial review: when no file was reviewed (every reviewed reply marked its files unreviewed) the result stays empty", async () => {
+  await wholePr(async () => {
+    const all = Object.keys(FILES);
+    const m = model({ review: () => JSON.stringify({ merge_recommendation: "COMMENT", investigated_safe: ["looked"], findings: [], unreviewed_paths: all }) });
+    const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });
+    const review = JSON.parse(out.raw);
+    assert.deepEqual(review.investigated_safe, []);
+    assert.deepEqual([...review.unreviewed_paths].sort(), [...all].sort());
+  });
 });
 
 // ── Precision on aicc-center and WalkieBoard (2026-11-09: 17 posted findings after #183, none valid; 8 of 10
@@ -1257,7 +1394,7 @@ test("measurement: each turn's time and the server's usage (prompt, cached, out)
   assert.equal(out.ok, true, out.error);
   assert.equal(m.count.select, 1, "two P1 findings still get the select turn");
   assert.match(out.pipelineSummary, / posted \(6 turns, \d+ min\) · map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50$/.test(l)), logs.join("\n"));
+  assert.ok(logs.some((l) => /^pipeline verify\[c\d+\]#1: finish=stop chars=\d+ [\d.]+s ttft=2\.5s prompt=3000 cached=2400 out=50 reply=\d+c$/.test(l)), logs.join("\n"));
   // harbor keeps only the first 300 chars of a log line, which cuts the breakdown off the summary: it is
   // also logged on a line of its own, every stage on it.
   assert.ok(logs.some((l) => /^pipeline stages: map 1t [\d.]+m in 1K cached 0% out 100 · feature 2t [\d.]+m in 4K cached 50% out 600 · verify 2t [\d.]+m in 6K cached 80% out 100 · select 1t [\d.]+m in 500 cached 0% out 20$/.test(l)), logs.join("\n"));
@@ -1287,11 +1424,38 @@ test("measurement: a server that reports no usage (or no cached count) still get
   const out = await runLocalReviewPipeline(sample(), settings, { request, log: (l) => logs.push(l) });
   assert.equal(out.ok, true, out.error);
   assert.match(out.pipelineSummary, / posted \(4 turns, \d+ min\) · map 1t [\d.]+m · feature 2t [\d.]+m · verify 1t [\d.]+m$/);
-  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s$/.test(l)), "no token counts, and no first-token time without a streamed reply");
+  assert.ok(logs.some((l) => /^pipeline verify\[c1\]#1: finish=stop chars=\d+ [\d.]+s reply=\d+c$/.test(l)), "no token counts, and no first-token time without a streamed reply");
   // The default mock reports prompt_tokens only: no cached share is claimed.
   const m = model(on);
   const withPrompt = await runLocalReviewPipeline(sample(), settings, { request: m.request });
   assert.match(withPrompt.pipelineSummary, /· verify 1t [\d.]+m in 100$/);
+});
+
+test("turn diagnostics: the per-turn log line carries the reply's length and, when the server sent it, the reasoning's", async () => {
+  const on = { map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => confirm() };
+  // A server that sends its thinking beside the reply (reasoning_content, as the stream aggregator collects it).
+  const thinking = model(on);
+  const replies = [];
+  const withReasoning = async (...args) => {
+    const res = await thinking.request(...args);
+    if (args[2] === "models") return res;
+    const message = res.choices[0].message;
+    replies.push(message.content.length);
+    return { ...res, choices: [{ ...res.choices[0], message: { ...message, reasoning_content: "r".repeat(1234) } }] };
+  };
+  const logs = [];
+  const out = await runLocalReviewPipeline(sample(), settings, { request: withReasoning, log: (l) => logs.push(l) });
+  assert.equal(out.ok, true, out.error);
+  const turns = logs.filter((l) => /^pipeline .+?: finish=/.test(l));
+  assert.equal(turns.length, replies.length, "one line per turn");
+  turns.forEach((l, i) => assert.match(l, new RegExp(` reply=${replies[i]}c reasoning=1234c$`), l));
+  // A server that sends no reasoning: the reply's length only, no reasoning field.
+  const plain = model(on);
+  const plainLogs = [];
+  await runLocalReviewPipeline(sample(), settings, { request: plain.request, log: (l) => plainLogs.push(l) });
+  const verifyLine = plainLogs.find((l) => /^pipeline verify\[c1\]#1: /.test(l));
+  assert.match(verifyLine, new RegExp(` reply=${confirm().length}c$`));
+  assert.ok(plainLogs.filter((l) => /^pipeline .+?: finish=/.test(l)).every((l) => /reply=\d+c$/.test(l) && !/reasoning=/.test(l)));
 });
 
 test("select: two P2 findings in different files of different feature groups still get the select turn (feature groups do not prove two findings unrelated)", async () => {

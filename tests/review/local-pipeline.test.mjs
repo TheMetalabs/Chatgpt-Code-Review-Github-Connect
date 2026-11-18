@@ -2093,20 +2093,42 @@ test("verify angles: the verify rules ask for the failure, data and contract ang
   const turn = m.bodies.find((b) => stageOf(b) === "verify").messages[1].content;
   assert.ok(turn.startsWith(VERIFY_RULES), "the fixed rules stay the shared prefix");
   for (const rule of [
-    "Angles: before the verdict, check the cited code from three angles, one short line each in angles.",
+    "Angles: before the verdict, look at the cited code from three angles, one short line each in angles.",
     "failure: errors, early returns, retries, cancellation, ordering, concurrency, timing (a check made before a wait).",
     "data: empty, missing or null input, bounds, lengths, indexes, keys, encoding, line endings, units.",
-    "contract: what callers pass, what the callee does, sibling uses of the same code, the test that should cover it.",
-    'Each line is "if <trigger>, <wrong result>" with the deciding line verbatim from CODE, or "none".',
-    "The verdict rests on the angle with proof: if its failure is not the reported one, same_reason is false and title, failure and fix describe it.",
-    "No angle with proof: refuted or uncertain; never invent a defect.",
+    "contract: what the callers shown pass, what the callee shown does, sibling uses of the same code, what the test shown expects.",
+    'Each line is "if <trigger>, <wrong result>" with the line that goes wrong, verbatim from CODE, or "none"; write none when the code that decides it is not shown.',
+    "An angle line is a lead, not proof: quoting the line that would go wrong does not show the trigger can happen.",
+    "Checks 1–6 apply to each angle's failure (rule 6: the caller, route or config that supplies the input must be shown).",
+    "Confirm an angle's failure only as the confirmed verdict below requires; if it is not the reported one, same_reason is false and title, failure and fix describe it.",
+    "Missing test coverage is never a failure.",
+    "If no angle's failure passes those checks: refuted or uncertain; never invent a defect.",
   ]) assert.ok(VERIFY_RULES.includes(rule), rule);
   assert.ok(VERIFY_RULES.indexOf("Angles:") < VERIFY_RULES.indexOf("Verdicts:"), "the angles come before the verdicts");
-  const field = '"angles":[{"angle":"failure"|"data"|"contract","failure":"if <trigger>, <wrong result>; or none","quote":"the deciding line, verbatim; or empty"}]';
+  const field = '"angles":[{"angle":"failure"|"data"|"contract","failure":"if <trigger>, <wrong result>; or none","quote":"the line that would go wrong, verbatim; or empty"}]';
   assert.ok(VERIFY_RULES.includes(field), field);
   const at = (k) => VERIFY_RULES.indexOf(k, VERIFY_RULES.indexOf("Reply with ONLY this JSON"));
   assert.ok(at('"trace"') < at('"angles"') && at('"angles"') < at('"blocking_code"') && at('"blocking_code"') < at('"verdict"'), "trace, then angles, then blocking_code and verdict");
   assert.match(turn, /\(trace first, then angles, blocking_code, verdict,/);
+});
+
+// PR #191 review (P1): "The verdict rests on the angle with proof" read as a shortcut to confirmed: an angle
+// line only quotes the line that would go wrong, so "if items is empty, items[0] traps" with the quote
+// `let first = items[0]` passed the quote check although no caller shown passes an empty array (rule 6:
+// uncertain). The angles are leads; checks 1-6 and rule 6 bind each angle's failure, and the contract
+// angle's "the test that should cover it" invited missing coverage as a defect.
+test("verify angles: an angle line is a lead, not proof; checks 1-6 (rule 6) bind each angle's failure; missing coverage is never a failure", () => {
+  const angles = VERIFY_RULES.split("\n").find((l) => l.startsWith("Angles:"));
+  assert.ok(angles, "the Angles rule is one line of VERIFY_RULES");
+  for (const phrase of ["a lead, not proof", "Checks 1–6 apply to each angle's failure", "rule 6: the caller, route or config that supplies the input must be shown", "Missing test coverage is never a failure", "what the callers shown pass, what the callee shown does", "what the test shown expects"]) {
+    assert.ok(angles.includes(phrase), phrase);
+  }
+  assert.ok(!VERIFY_RULES.includes("The verdict rests on the angle with proof"), "the old shortcut to confirmed is gone");
+  assert.ok(!VERIFY_RULES.includes("No angle with proof"), "no angle is said to carry proof");
+  assert.ok(!VERIFY_RULES.includes("the test that should cover it"), "the contract angle no longer asks for the test that should exist");
+  const lines = VERIFY_RULES.split("\n");
+  const at = lines.indexOf(angles);
+  assert.ok(lines[at - 1].startsWith("6. ") && lines[at + 1] === "Verdicts:", "the rule stays after check 6, before Verdicts");
 });
 
 test("verify angles: a data angle that proves a different failure posts that reason (reframe), not the reporter's test or the angle lines", async () => {
@@ -2139,6 +2161,11 @@ test("verify angles: malformed angles (a string, an object, wrong types, unknown
     [null, 0],
     [["data", null, 7, [], { angle: 5, failure: "if x, y" }, { angle: "timing", failure: "if x, y" }, { angle: "data", failure: { x: 1 }, quote: ["q"] }, { angle: "contract", failure: "None.", quote: "" }], 0],
     [[{ angle: "Data angle", failure: "If the body has no amount, charge gets undefined.", quote: 3 }, "junk"], 1],
+    // PR #191 review (P2): "none" with a reason, in any wording, names no failure; a failure in any script does.
+    ...["None: the guard at L12 covers it", "none (guarded by line 12)", "No issue", "None found.", "Nothing", "not applicable", "no failure", "None — guarded", "N/A", "-", "없음", "해당 없음"].map((failure) => [[{ angle: "data", failure, quote: "" }], 0]),
+    [[{ angle: "data", failure: "빈 배열이면 첫 원소 접근에서 크래시", quote: "return charge(req.body.amount);" }], 1],
+    [[{ angle: "data", failure: "if items is empty, items[0] traps", quote: "return charge(req.body.amount);" }], 1],
+    [[{ angle: "data", failure: "Nonexistent key: lookup returns undefined", quote: "" }], 1],
   ]) {
     const m = model({ map: mapReply, review: reviewFor({ "src/orders/orders.controller.ts": [F()] }), verify: () => reframe({ angles }) });
     const out = await runLocalReviewPipeline(sample(), settings, { request: m.request });

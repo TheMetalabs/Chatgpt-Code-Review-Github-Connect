@@ -654,7 +654,7 @@ export const VERIFY_RULES = [
   "- confirmed: you followed a concrete trigger through the code shown, step by step, from the changed code to a wrong result, and none of the checks above stops it. Put the failing line(s) in proof_quote, copied verbatim from CODE. same_reason is true when that failure is the reported one; otherwise false, and title, failure and fix describe the defect you found.",
   "- uncertain: the deciding code is not shown, or you could not follow the scenario through the code. When in doubt, answer uncertain, never confirmed.",
   "Severity (confirmed only): P0/P1 only for wrong or lost data, a crash or a security hole the code proves end to end; otherwise P2.",
-  'Reply with ONLY this JSON, fields in this order: {"trace":"at most 2 sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","blocking_code":"for refuted: only the deciding line(s) of the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: only the deciding failing line(s), verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: one sentence, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}. Stop after the JSON.',
+  'Reply with ONLY this JSON, fields in this order: {"trace":"at most 3 short sentences: what the cited code does, step by step, and the input that makes it go wrong, if any","blocking_code":"for refuted: only the deciding line(s) of the preventing code or text, verbatim; else empty","verdict":"refuted"|"uncertain"|"confirmed","proof_quote":"for confirmed: only the deciding failing line(s), verbatim; else empty","same_reason":true|false,"title":"for confirmed: the defect as found, at most 12 words; else empty","failure":"for confirmed: one sentence, if <trigger>, <wrong result>; else empty","fix":"for confirmed: one sentence; else empty","severity":"P0"|"P1"|"P2"}. Stop after the JSON.',
 ].join("\n");
 
 function gutter(path: string, lines: string[], from: number, to: number): string {
@@ -1744,15 +1744,37 @@ function finalJson(opts: { findings: Finding[]; safe: string[]; assumptions: str
   });
 }
 
+/** The poster keeps the first 400 chars of each investigated_safe entry (poster.gateLiveSubmission). */
+export const PARTIAL_REVIEW_LINE_MAX_CHARS = 400;
+
 /** The investigated_safe line of a partial review with no finding: what was reviewed, what the candidates
- * came to, and which files were not reviewed and why. */
-function partialReviewLine(reviewed: number, unreviewed: string[], failed: string[], reported: string[], stats: PipelineStats): string {
+ * came to, and which files were not reviewed and why. It fits PARTIAL_REVIEW_LINE_MAX_CHARS so the
+ * poster's slice never cuts a reason group silently: paths are dropped (up to 6 per reason group, fewer
+ * while it does not fit), then shown as basenames, and whatever is left out is counted in a closing
+ * "+K more". The full list stays in unreviewed_paths. */
+export function partialReviewLine(reviewed: number, unreviewed: string[], failed: string[], reported: string[], stats: Pick<PipelineStats, "refuted" | "buildClaims" | "uncertain">): string {
   const why = (p: string) => (failed.includes(p) ? "feature turn failed" : reported.includes(p) ? "the reviewer reported it unreviewed" : "no usable diff");
   const groups = new Map<string, string[]>();
   for (const p of unreviewed) groups.set(why(p), [...(groups.get(why(p)) ?? []), p]);
-  const notReviewed = [...groups].map(([reason, paths]) => `${paths.slice(0, 6).join(", ")}${paths.length > 6 ? ` +${paths.length - 6} more` : ""} (${reason})`).join("; ");
   const counts = [`${stats.refuted} candidate(s) refuted`, `${stats.buildClaims ?? 0} build/test claim(s) dropped`, ...(stats.uncertain ? [`${stats.uncertain} uncertain not posted`] : [])].join(", ");
-  return `Reviewed ${reviewed} of ${reviewed + unreviewed.length} files in feature turns; no defect was confirmed (${counts}); not reviewed: ${notReviewed}`;
+  const prefix = `Reviewed ${reviewed} of ${reviewed + unreviewed.length} files in feature turns; no defect was confirmed (${counts}); not reviewed: `;
+  const render = (perGroup: number, basename: boolean) => {
+    let omitted = 0;
+    const parts: string[] = [];
+    for (const [reason, paths] of groups) {
+      const shown = paths.slice(0, perGroup).map((p) => (basename ? p.split("/").pop() || p : p));
+      omitted += paths.length - shown.length;
+      if (shown.length) parts.push(`${shown.join(", ")} (${reason})`);
+    }
+    return `${prefix}${parts.join("; ")}${omitted ? `${parts.length ? "; " : ""}+${omitted} more` : ""}`;
+  };
+  for (const basename of [false, true]) {
+    for (let perGroup = 6; perGroup >= 1; perGroup--) {
+      const line = render(perGroup, basename);
+      if (line.length <= PARTIAL_REVIEW_LINE_MAX_CHARS) return line;
+    }
+  }
+  return render(0, true);
 }
 
 export type PipelineLegResult = LocalLegResult & { pipelineSummary?: string; verifiedKeys?: string[] };

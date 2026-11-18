@@ -55,3 +55,22 @@ test("fallback waiver still recovers a bound chat run without attemptedProviders
   assert.equal(recovered.provider, "chatgpt");
   assert.equal(recovered.resumeProviders.join(","), "chatgpt");
 });
+
+test("a partial local fallback result (no finding, some paths unreviewed) re-offers a fresh chat start", () => {
+  const partialRaw = JSON.stringify({
+    merge_recommendation: "COMMENT",
+    findings: [],
+    investigated_safe: ["Reviewed 1 of 2 files in feature turns; no defect was confirmed (0 candidate(s) refuted, 0 build/test claim(s) dropped); not reviewed: src/b.ts (feature turn failed)"],
+    unreviewed_paths: ["src/b.ts"],
+  });
+  const { bridge } = bridgeHarness([job({ id: "job1", ...FALLBACK, storedLegs: [{ provider: "local", raw: partialRaw }] })]);
+  const next = bridge.nextBridgeJob("chrome1");
+  assert.ok(next, "an incomplete local result must not keep chat waived");
+  assert.deepEqual(next.providers, ["chatgpt"]);
+});
+
+test("a complete clean local fallback result keeps a fresh chat start waived", () => {
+  const cleanRaw = JSON.stringify({ merge_recommendation: "COMMENT", findings: [], investigated_safe: ["src/a.ts: checked", "src/b.ts: checked"] });
+  const { bridge } = bridgeHarness([job({ id: "job1", ...FALLBACK, storedLegs: [{ provider: "local", raw: cleanRaw }] })]);
+  assert.equal(bridge.nextBridgeJob("chrome1"), null);
+});

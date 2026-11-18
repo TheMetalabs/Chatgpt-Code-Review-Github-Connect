@@ -27,6 +27,8 @@ import {
   SMALL_REVIEW_MAX_FILES,
   isBuildOutcomeClaim,
   callQualifiers,
+  partialReviewLine,
+  PARTIAL_REVIEW_LINE_MAX_CHARS,
 } from "../../src/lib/local-pipeline.server.ts";
 import { collectPriorFindings, isPriorDuplicate } from "../../src/lib/prior-findings.ts";
 import { REVIEW_INSTRUCTIONS } from "../../src/lib/chat-prompt.ts";
@@ -35,7 +37,7 @@ import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
 import { asFinding, gateLiveSubmission } from "../../src/lib/poster.ts";
 import { inlineFindingComment } from "../../src/lib/review-format.ts";
 import { parseChatSubmission } from "../../src/lib/chat-prompt.ts";
-import { incompleteVerdict } from "../../src/lib/local-fallback.ts";
+import { incompleteVerdict, usableLocalFallbackLeg } from "../../src/lib/local-fallback.ts";
 
 // One lens pass per feature unless a test is about lenses (it sets localPipelineLenses itself).
 const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k", findingGate: "rules", localPipelineLenses: 1 };
@@ -713,10 +715,10 @@ test("short replies: the feature, verify, map and select prompts each carry outp
   assert.ok(feature.includes("evidence quotes only the line(s) of the cause and of where it fails (path:line `code`), never whole blocks."));
   assert.ok(feature.includes("Keep the reply short: every text field is one or two short sentences, and investigated_safe is one short line per file. Stop after the JSON object."));
   assert.ok(feature.includes("Output exactly ONE JSON object: no prose, heading or second draft before or after it."), "the no-prose rule is kept");
-  // Verify turns: trace at most 2 sentences, title at most 12 words, failure and fix one sentence, quotes only the deciding line(s).
+  // Verify turns: trace at most 3 short sentences, title at most 12 words, failure and fix one sentence, quotes only the deciding line(s).
   const verify = user("verify");
   assert.ok(verify.startsWith(VERIFY_RULES), "the fixed rules stay the shared prefix");
-  for (const rule of ['"trace":"at most 2 sentences:', '"blocking_code":"for refuted: only the deciding line(s)', '"proof_quote":"for confirmed: only the deciding failing line(s)', '"title":"for confirmed: the defect as found, at most 12 words', '"failure":"for confirmed: one sentence,', '"fix":"for confirmed: one sentence;', "Stop after the JSON."]) assert.ok(verify.includes(rule), rule);
+  for (const rule of ['"trace":"at most 3 short sentences:', '"blocking_code":"for refuted: only the deciding line(s)', '"proof_quote":"for confirmed: only the deciding failing line(s)', '"title":"for confirmed: the defect as found, at most 12 words', '"failure":"for confirmed: one sentence,', '"fix":"for confirmed: one sentence;', "Stop after the JSON."]) assert.ok(verify.includes(rule), rule);
   // Map turns: one-sentence summary, short-phrase guards and effects.
   const map = user("map");
   for (const rule of ['"summary":"one sentence"', '"guards":["a short phrase:', '"effects":["a short phrase:', "each a short phrase. Stop after the JSON."]) assert.ok(map.includes(rule), rule);
@@ -994,6 +996,37 @@ test("partial review: a failed feature and every candidate refuted is a review t
   const { gate, incomplete } = legDecision(out);
   assert.ok(gate.ok, gate.reason);
   assert.match(incomplete, /were not reviewed \(src\/mail\/mailer\.ts\)/);
+});
+
+test("partial review: the pipeline's partial result never keeps chat waived as a chat-down fallback; a complete one does", async () => {
+  const partial = await runLocalReviewPipeline(sample(), settings, { request: model({ map: mapReply, review: mailerFails([F()]), verify: refute }).request });
+  assert.equal(partial.ok, true, partial.error);
+  assert.match(JSON.parse(partial.raw).investigated_safe[0], /^Reviewed 3 of 4 files/);
+  assert.equal(usableLocalFallbackLeg({ provider: "local", raw: partial.raw }), false, "partial: chat is awaited again");
+  const complete = await runLocalReviewPipeline(sample(), settings, { request: model({ map: mapReply, review: reviewFor({}), verify: () => assert.fail("no candidate to verify") }).request });
+  assert.equal(complete.ok, true, complete.error);
+  assert.equal(usableLocalFallbackLeg({ provider: "local", raw: complete.raw }), true, "complete: chat stays waived");
+});
+
+test("partial review line: long unreviewed paths fit the poster's 400-char slice and end with the +K more count", () => {
+  const dir = "src/modules/fixture-area/deeply/nested/subsystem/component/implementation";
+  const failed = Array.from({ length: 9 }, (_, i) => `${dir}/handler-number-${i}.service.ts`);
+  const reported = Array.from({ length: 7 }, (_, i) => `${dir}/reported-file-${i}.controller.ts`);
+  const noDiff = Array.from({ length: 4 }, (_, i) => `${dir}/asset-${i}.bin`);
+  const stats = { refuted: 2, buildClaims: 1, uncertain: 3 };
+  const line = partialReviewLine(5, [...failed, ...reported, ...noDiff], failed, reported, stats);
+  assert.equal(PARTIAL_REVIEW_LINE_MAX_CHARS, 400);
+  assert.ok(line.length <= 400, `line is ${line.length} chars`);
+  assert.match(line, /^Reviewed 5 of 25 files in feature turns; no defect was confirmed \(2 candidate\(s\) refuted, 1 build\/test claim\(s\) dropped, 3 uncertain not posted\); not reviewed: /);
+  const more = line.match(/\+(\d+) more$/);
+  assert.ok(more, `ends with +K more: ${line}`);
+  const shown = (line.match(/handler-number-\d+|reported-file-\d+|asset-\d+/g) ?? []).length;
+  assert.equal(Number(more[1]), 20 - shown, "+K counts exactly the paths left out");
+  assert.ok(shown >= 1, "at least one path is still named");
+  // The poster keeps the whole line.
+  assert.equal(line.slice(0, 400), line);
+  // A short list is unchanged: every path, no count.
+  assert.equal(partialReviewLine(3, ["src/b.ts"], ["src/b.ts"], [], { refuted: 0, buildClaims: 0 }), "Reviewed 3 of 4 files in feature turns; no defect was confirmed (0 candidate(s) refuted, 0 build/test claim(s) dropped); not reviewed: src/b.ts (feature turn failed)");
 });
 
 test("partial review: a run with no unreviewed file and no candidate is unchanged (the feature turns' own lines, a complete verdict)", async () => {

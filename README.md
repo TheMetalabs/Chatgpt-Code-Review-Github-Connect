@@ -136,6 +136,18 @@ Ashlar → Settings → **GitHub App** → **Save GitHub credentials**
 
 리뷰어 토글·로컬 LLM URL/모델/키는 **Save settings** 후 이 머신 gitignore `.env` (`ASHLAR_REVIEW_LOCAL`, `ASHLAR_LOCAL_LLM_*`)와 `.data/ashlar-settings.json`에 남습니다. Chrome 브릿지 토큰은 첫 기동 때 `.env`의 `ASHLAR_BRIDGE_TOKEN`에 저장되고 PM2 재시작 후에도 같습니다. **Rotate token** 만 새로 만듭니다. 이전에 쓰이던 `.data/ashlar-bot-settings.json`도 읽습니다. PM2 재시작은 `.env`를 다시 읽습니다. **Reset demo tape** 는 Inbox 잡만 지웁니다. `.env`는 커밋하지 마세요.
 
+#### `.env` 저장과 dev 서버 재시작
+
+Settings 저장(리뷰어·로컬 LLM, GitHub 시크릿, 브릿지 토큰 Rotate)은 `.env`를 다시 쓰지만 **dev 서버(`npm run dev` / PM2)를 재시작하지 않습니다.** 저장한 값은 그 자리에서 `process.env`와 실행 중 상태(`state.settings`, 로컬 모델 lease 용량 등)에 바로 반영되고, 메모리에 있는 리뷰 큐와 돌던 잡도 그대로 남습니다. (예전에는 Vite가 `.env` 변경을 보고 `[vite] .env changed, restarting server...`로 서버를 다시 띄워 큐가 통째로 지워졌습니다. 지금은 `scripts/env-watch-plugin.mjs`가 envDir의 `.env`, `.env.local`, `.env.<mode>`, `.env.<mode>.local`을 Vite 감시에서 뺍니다. 소스 파일 HMR·리로드, `vite.config.ts` 변경 시 재시작은 그대로입니다.)
+
+그 대신 아래 값은 **프로세스 시작 때 한 번만** 읽힙니다. `.env`를 손으로 고친 뒤에는 `pm2 restart <앱이름>`(또는 `npm run dev` 재시작)이 필요합니다.
+
+| 값 | 어디서 읽나 |
+| --- | --- |
+| `ASHLAR_PUBLIC_HOST`, `ASHLAR_ALLOWED_HOSTS` | `vite.config.ts`의 `loadEnv` → Vite `server.allowedHosts` (터널 Host 헤더 허용). Settings 화면의 Webhook URL 힌트는 `process.env`라 별개 |
+| `VITE_*` (`VITE_AUTH_ENABLED`, `VITE_STUN_URLS`) | Vite 클라이언트 env(`import.meta.env`, `/__app-env`). `.grok/app-env.json`은 `scripts/with-app-env.mjs`가 기동 때만 합칩니다 |
+| Settings 밖에서 손으로 `.env`에 넣거나 고친 그 밖의 키 | 서버는 기동 때 `loadDotenvFile`로 `.env`를 한 번 읽고, 이미 있는 키는 덮지 않습니다 (예전 Vite 재시작도 이미 설정된 키는 다시 읽지 않았음) |
+
 터널 호스트와 자격은 **`.env`에만** 둡니다. `.env`는 gitignore입니다. `.env.example`을 복사하세요.
 
 ```bash

@@ -10,6 +10,8 @@ import { nitro } from "nitro/vite";
 import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
 // @ts-expect-error JS plugin alongside the TS vite config
 import { appEnvPlugin } from "./scripts/app-env-plugin.mjs";
+// @ts-expect-error JS plugin alongside the TS vite config
+import { envWatchIgnorePlugin } from "./scripts/env-watch-plugin.mjs";
 import { isMigrationFile } from "./scripts/migration-plan.mjs";
 import { parseHostList } from "./src/lib/ashlar-env";
 
@@ -156,7 +158,9 @@ export default defineConfig(({ command, isPreview, mode }) => {
     host: "0.0.0.0",
     port: 8080,
     strictPort: true,
-    // Tunnel Host header comes from ASHLAR_PUBLIC_HOST / ASHLAR_ALLOWED_HOSTS in .env
+    // Tunnel Host header comes from ASHLAR_PUBLIC_HOST / ASHLAR_ALLOWED_HOSTS in .env.
+    // Read once at startup: .env edits do not restart Vite (envWatchIgnorePlugin),
+    // so a change here needs a process restart (pm2 restart).
     allowedHosts: tunnelHosts.length ? tunnelHosts : true,
   },
   preview: {
@@ -166,6 +170,9 @@ export default defineConfig(({ command, isPreview, mode }) => {
   },
   resolve: { tsconfigPaths: true },
   plugins: [
+    // Settings saves write .env at runtime and apply in-process; a Vite restart
+    // on that write would wipe the in-memory review queue. See the plugin.
+    envWatchIgnorePlugin(),
     pgliteBootstrapPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),

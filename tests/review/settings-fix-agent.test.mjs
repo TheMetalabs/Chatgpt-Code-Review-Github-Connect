@@ -228,6 +228,11 @@ const STORED = [
   {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, localLeaseCapacity: 99, contextPadLines: 1e300, promptDiffMaxChars: -1},
   {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', localReviewRole: 'turbo', publishMinSeverity: 'P7'},
   {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
+  // Codex on with a diff budget its prompt cannot hold: load raises the Codex prompt budget, or turns Codex off.
+  {reviewCodex: true, promptDiffMaxChars: 500_000},
+  {reviewCodex: true, codexPromptMaxChars: 400_000},
+  {reviewCodex: true, promptDiffMaxChars: 900_000},
+  {reviewCodex: true, reviewChatgpt: false, reviewGrok: false, reviewLocal: false, promptDiffMaxChars: 900_000},
   'not an object', null, [],
 ];
 
@@ -246,6 +251,30 @@ test('what load yields (disk or env seed), a save accepts: an unrelated save suc
   for (const stored of STORED.slice(0, 4)) assert.equal(harness(stored).state.settings.fixAgent.enabled, false, JSON.stringify(stored));
   assert.equal(harness(STORED[3]).state.settings.fixAgent.provider, 'grok', 'a legacy grok fix provider stays visible (OFF)');
   assert.equal(harness(STORED[4]).state.settings.fixAgent.enabled, true, 'a runnable stored switch stays ON');
+});
+
+test('env seed: Codex on with a diff budget its prompt cannot hold loads save-valid (budget raised, else Codex off)', async (t) => {
+  const {overlayEnv, sanitizeBotSettings} = await import('../../src/lib/settings.server.ts');
+  const rules = await import('../../src/lib/settings-rules.ts');
+  const keys = ['ASHLAR_REVIEW_CODEX', 'ASHLAR_PROMPT_DIFF_MAX_CHARS', 'ASHLAR_CODEX_PROMPT_MAX_CHARS'];
+  const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  t.after(() => { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  const warn = console.warn; const warnings = []; console.warn = (...a) => warnings.push(a.join(' '));
+  t.after(() => { console.warn = warn; });
+  const seed = (env) => { for (const k of keys) delete process.env[k]; Object.assign(process.env, env); return sanitizeBotSettings(overlayEnv({})); };
+  let s = seed({ASHLAR_REVIEW_CODEX: 'true', ASHLAR_PROMPT_DIFF_MAX_CHARS: '500000'});
+  assert.equal(rules.settingsProblem({...s, username: 'x'}), null);
+  assert.equal(s.reviewCodex, true);
+  assert.equal(s.codexPromptMaxChars, 650_000, 'raised to diff + 150000');
+  s = seed({ASHLAR_REVIEW_CODEX: 'true', ASHLAR_CODEX_PROMPT_MAX_CHARS: '400000'});
+  assert.equal(rules.settingsProblem(s), null);
+  assert.equal(s.codexPromptMaxChars, 450_000);
+  s = seed({ASHLAR_REVIEW_CODEX: 'true', ASHLAR_PROMPT_DIFF_MAX_CHARS: '900000'});
+  assert.equal(rules.settingsProblem(s), null);
+  assert.equal(s.reviewCodex, false, 'no Codex budget can hold it: Codex off');
+  assert.equal(warnings.length, 3, warnings.join('\n'));
+  assert.match(warnings[0], /raised to 650000/);
+  assert.match(warnings[2], /review_codex turned off/);
 });
 
 test('grok is refused as a fix provider by the Settings API (400, nothing saved); grok reviews are unaffected', async () => {

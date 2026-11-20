@@ -162,11 +162,23 @@ function finiteNumber(v: unknown): number | undefined {
   return typeof n === "number" && Number.isFinite(n) ? n : undefined;
 }
 
+/** A reset time is never sooner than this after now ... */
+const MIN_RESET_MS = 60_000;
+/** ... nor later than this: a garbled or hostile value must not park Codex for months. */
+const MAX_RESET_MS = 7 * 24 * 60 * 60_000;
+
+/** An epoch value as ms: above ~1e11 it already is ms (1e11 s is year 5138). */
+function epochMs(v: number): number {
+  return v > 1e11 ? v : v * 1000;
+}
+
 /** A usage-limit failure's reset time (epoch ms), or undefined when `failure` is not one. A usage limit
  * is HTTP 429, or an error whose type is usage_limit_reached / usage_not_included / rate_limit_exceeded
  * (in a non-2xx body, a 200 JSON body or a stream error chunk, where the proxy forwards it). The reset
- * time is, in order: `resets_at` (epoch seconds), `resets_in_seconds`, the Retry-After header, the
- * x-codex-primary-reset-after-seconds / x-codex-primary-reset-at headers, else now + cooldownMinutes. */
+ * time comes from the first source present, in order: `resets_at` (epoch s or ms), `resets_in_seconds`,
+ * the Retry-After header, the x-codex-primary-reset-after-seconds / x-codex-primary-reset-at headers.
+ * It is clamped to [now + 1 min, now + 7 days]; none, a past one or a non-finite one is
+ * now + cooldownMinutes. */
 export function codexQuotaResetAt(
   failure: unknown,
   now: number,
@@ -192,20 +204,41 @@ export function codexQuotaResetAt(
   const error = objectOf(parsed?.error) ?? parsed;
   const type = String(error?.type ?? error?.code ?? "");
   if (status !== 429 && !QUOTA_TYPES.test(type)) return undefined;
-  const pick = (key: string) => finiteNumber(error?.[key]) ?? finiteNumber(parsed?.[key]);
-  const resetsAt = pick("resets_at");
-  if (resetsAt !== undefined && resetsAt > 0) return resetsAt * 1000;
-  const resetsIn = pick("resets_in_seconds");
-  if (resetsIn !== undefined && resetsIn >= 0) return now + resetsIn * 1000;
-  if (retryAfterMs !== undefined) return now + retryAfterMs;
-  const after = finiteNumber(headers["x-codex-primary-reset-after-seconds"]);
-  if (after !== undefined && after >= 0) return now + after * 1000;
-  const atRaw = headers["x-codex-primary-reset-at"];
-  const atSeconds = finiteNumber(atRaw);
-  if (atSeconds !== undefined && atSeconds > 0) return atSeconds * 1000;
-  const atDate = atRaw ? Date.parse(atRaw) : NaN;
-  if (Number.isFinite(atDate)) return atDate;
-  return now + Math.max(1, cooldownMinutes) * 60_000;
+  // A present but unreadable value (a string that is no number) still counts as present: NaN.
+  const raw = (key: string) => error?.[key] ?? parsed?.[key];
+  const num = (v: unknown) =>
+    finiteNumber(v) ?? (v === undefined || v === null || v === "" ? undefined : NaN);
+  const atHeader = headers["x-codex-primary-reset-at"];
+  const atHeaderNum = finiteNumber(atHeader);
+  const candidates: (() => number | undefined)[] = [
+    () => {
+      const v = num(raw("resets_at"));
+      return v === undefined ? undefined : epochMs(v);
+    },
+    () => {
+      const v = num(raw("resets_in_seconds"));
+      return v === undefined ? undefined : now + v * 1000;
+    },
+    () => (retryAfterMs === undefined ? undefined : now + retryAfterMs),
+    () => {
+      const v = num(headers["x-codex-primary-reset-after-seconds"]);
+      return v === undefined ? undefined : now + v * 1000;
+    },
+    () =>
+      atHeader === undefined
+        ? undefined
+        : atHeaderNum !== undefined
+          ? epochMs(atHeaderNum)
+          : Date.parse(atHeader),
+  ];
+  let at: number | undefined;
+  for (const candidate of candidates) {
+    at = candidate();
+    if (at !== undefined) break;
+  }
+  const fallback = now + Math.max(1, cooldownMinutes) * 60_000;
+  if (at === undefined || !Number.isFinite(at) || at <= now) return fallback;
+  return Math.min(now + MAX_RESET_MS, Math.max(now + MIN_RESET_MS, at));
 }
 
 /** A 400/422 whose body names the structured-output field: a proxy that does not accept response_format. */
@@ -224,7 +257,7 @@ function failureText(
   timeoutMinutes: number,
 ): string {
   if (why === "timeout") return `no reply within ${timeoutMinutes} min (codexTimeoutMinutes)`;
-  if (why === "silent") return `the Codex proxy sent nothing for ${CODEX_LIVENESS_MS / 60_000} min`;
+  if (why === "silent") return "the Codex proxy sent nothing for the liveness window";
   if (e instanceof LocalChatHttpError) return `HTTP ${e.status} from the Codex proxy`;
   if (e instanceof CodexBodyError || e instanceof LocalChatStreamError)
     return "the Codex proxy returned an error instead of a reply";
@@ -252,6 +285,9 @@ export type CodexRunOptions = {
   onStage?: (stage: CodexStage) => void;
   log?: (line: string) => void;
   now?: () => number;
+  /** Test seams: the hard ceiling (default codexTimeoutMinutes) and the silence window (CODEX_LIVENESS_MS). */
+  timeoutMs?: number;
+  livenessMs?: number;
 };
 
 /** A leading reasoning summary some proxies put in the content (`<think>…</think>`, ChatMock's
@@ -284,23 +320,32 @@ export async function runCodexReview(
   } catch {
     return { ok: false, error: "cancelled" };
   }
+  // A usage limit that started while this review waited for the slot: nothing is sent.
+  if (codexCoolingDown(now())) {
+    release();
+    const until = codexCooldownUntil();
+    return { ok: false, error: codexQuotaNote(until), quotaResetAt: until };
+  }
   const inner = new AbortController();
   let why: "timeout" | "silent" | undefined;
   const onAbort = () => inner.abort(opts.signal?.reason);
   if (opts.signal?.aborted) onAbort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   const timeoutMinutes = Math.max(1, Number(settings.codexTimeoutMinutes) || 20);
-  const hard = setTimeout(() => {
-    why ??= "timeout";
-    inner.abort(new Error("codex timeout"));
-  }, timeoutMinutes * 60_000);
+  const hard = setTimeout(
+    () => {
+      why ??= "timeout";
+      inner.abort(new Error("codex timeout"));
+    },
+    opts.timeoutMs ?? timeoutMinutes * 60_000,
+  );
   let silence: ReturnType<typeof setTimeout> | undefined;
   const armSilence = () => {
     if (silence) clearTimeout(silence);
     silence = setTimeout(() => {
       why ??= "silent";
       inner.abort(new Error("codex silent"));
-    }, CODEX_LIVENESS_MS);
+    }, opts.livenessMs ?? CODEX_LIVENESS_MS);
   };
   let stage: CodexStage = "codex_queued";
   const onActivity = (a: LocalRequestActivity) => {
@@ -324,6 +369,8 @@ export async function runCodexReview(
         stream: true,
         bypassSlotLock: true,
         onActivity,
+        // Any bytes (SSE comment heartbeats included) prove the proxy is alive.
+        onBytes: armSilence,
       },
     );
   try {
@@ -373,8 +420,15 @@ export async function runCodexReview(
     const resetAt = why
       ? undefined
       : codexQuotaResetAt(e, now(), Number(settings.codexQuotaCooldownMinutes) || 60);
-    if (resetAt !== undefined)
-      return { ok: false, error: codexQuotaNote(resetAt), quotaResetAt: resetAt };
+    if (resetAt !== undefined) {
+      // Recorded before the slot is released (finally), so a review queued behind this one sees it.
+      noteCodexCooldown(resetAt);
+      return {
+        ok: false,
+        error: codexQuotaNote(codexCooldownUntil()),
+        quotaResetAt: codexCooldownUntil(),
+      };
+    }
     const error = opts.signal?.aborted ? "cancelled" : failureText(e, why, timeoutMinutes);
     // The backend's own words go to the process log only.
     log(

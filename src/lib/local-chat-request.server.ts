@@ -99,6 +99,9 @@ export type LocalRequestOptions = {
   /** Never take the ASHLAR_LOCAL_SLOT_LOCK slot: a request to another server than the local model
    * (the Codex proxy) must not queue behind, or block, the local model's slot. */
   bypassSlotLock?: boolean;
+  /** Called on every chunk of response bytes, whatever it holds (an SSE comment heartbeat included,
+   * which onActivity never reports): a caller's own silence watchdog. */
+  onBytes?: () => void;
 };
 
 /** The env-configured streaming default (on unless ASHLAR_LOCAL_LLM_STREAM="false"). Exported so the
@@ -360,6 +363,7 @@ function dispatchLocalJson(
         activity(assembler.apply(chunk));
       };
       res.on("data", (chunk: Buffer) => {
+        opts?.onBytes?.();
         bytes += chunk.length;
         // Bound memory, never queue/generation duration; don't store partial reviews.
         if (bytes > MAX_RESPONSE_BYTES) { res.destroy(new Error("local LLM response too large")); return; }

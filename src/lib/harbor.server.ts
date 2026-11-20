@@ -210,7 +210,40 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
     cancelLocalJsonRepairs("disabled");
   }
   applyLocalModelLeaseCapacity(saved.localLeaseCapacity);
+  // Codex turned off: its queued or running legs on live jobs end (jobs pin their providers, so the
+  // switch alone would never reach them).
+  if (providersFromSettings(previousSettings).includes("codex") && !providersFromSettings(saved).includes("codex")) endDisabledCodexLegs();
   return state.settings;
+}
+
+/** A Codex reviewer turned off in Settings, as endDisabledChatLegs does for chat: each live job's
+ * unfinished Codex leg is aborted and Codex leaves its pinned reviewers, so the others' verdict stands
+ * (a clean one stays clean). A job with no other reviewer ends its Codex leg as cancelled, so the job
+ * is a failed attempt, never a clean review. A leg that already returned stays and merges. */
+function endDisabledCodexLegs() {
+  for (const job of [...state.jobs]) {
+    if (job.status !== "awaiting_chat" || !(job.reviewProviders ?? []).includes("codex")) continue;
+    if ((job.storedLegs ?? []).some((l) => l.provider === "codex" && l.raw.trim())) continue;
+    const now = Date.now();
+    transitionJob(job.id, (j) => {
+      if (j.status !== "awaiting_chat") return j;
+      const others = (j.reviewProviders ?? []).filter((p) => p !== "codex");
+      if (others.length) return { ...j, reviewProviders: others, generating: { ...j.generating, codex: false }, updatedAt: now };
+      const message = "codex was turned off in settings";
+      return { ...j, generating: { ...j.generating, codex: false },
+        providerErrors: { ...j.providerErrors, codex: { code: "cancelled", message } },
+        assumptions: [...(j.assumptions ?? []), `Skipped codex (${message})`].slice(0, 12), updatedAt: now };
+    });
+    codexControllers.get(job.id)?.abort();
+    codexPrompts.delete(job.id);
+  }
+}
+
+/** The job's only pinned reviewer was Codex and it ended without running (usage limit, or turned off). */
+function codexOnlyEnded(job: Job): boolean {
+  const providers = job.reviewProviders ?? [];
+  const code = job.providerErrors?.codex?.code;
+  return providers.length > 0 && providers.every((p) => p === "codex") && (code === "quota" || code === "cancelled");
 }
 
 export function resetHarbor() {
@@ -718,13 +751,25 @@ async function watchReviewersLoop(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
+    // The fallback is decided on chat alone: a non-chat racer still running (Codex) must not hold back
+    // the local fallback once every chat reviewer is down.
+    const chatRacing = stillRacing({
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: fallbackWaivesChat(job) }).filter(isChatProvider),
+      payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
+      assumptions: job.assumptions,
+      localInFlight: localInFlight.has(jobId),
+      generating: job.generating,
+      providerErrors: job.providerErrors,
+      claimed,
+      connected: bridge.connected,
+    });
     if (
       job.status === "awaiting_chat" &&
       releaseLocalAsFallback({
         role,
         providers: job.reviewProviders ?? [],
         localReleased,
-        chatRacing: racing,
+        chatRacing,
         usableChat: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()),
         chatStalled: stalled,
       })
@@ -741,14 +786,17 @@ async function watchReviewersLoop(jobId: string, token: string) {
         // Report the real per-reviewer reason (usage limit / connection / genuinely empty) rather
         // than a blanket "finished without JSON" that hid infra causes like a quota block.
         const skip = emptyReviewSkip(buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) }));
+        // Codex alone ended before it ran: a failed attempt, as when it is skipped for its cooldown.
+        const failedAttempt = codexOnlyEnded(job);
         transitionJob(jobId, (j) => ({
           ...j,
           status: "skipped",
           skipReason: skip.skipReason,
           plan: "No reviewer JSON to schema-merge.",
+          ...(failedAttempt ? { noReviewAttempt: true } : {}),
           updatedAt: Date.now(),
         }));
-        void upsertOpsComment(token, jobId, "skipped", job.codexNote ? [job.codexNote, ...skip.ops] : skip.ops);
+        void upsertOpsComment(token, jobId, failedAttempt ? "failed" : "skipped", job.codexNote ? [job.codexNote, ...skip.ops] : skip.ops);
       }
     }
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
@@ -1041,7 +1089,7 @@ function endCodexForQuota(jobId: string, resetAt: number) {
   const note = codexQuotaNote(resetAt);
   const now = Date.now();
   transitionJob(jobId, (j) => {
-    if (j.status !== "awaiting_chat") return j;
+    if (j.status !== "awaiting_chat" || !(j.reviewProviders ?? []).includes("codex") || j.providerErrors?.codex) return j;
     const others = (j.reviewProviders ?? []).filter((p) => p !== "codex");
     const progress = { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "quota" as const, observedAt: now, receivedAt: now } };
     if (others.length) {
@@ -1082,6 +1130,8 @@ async function attachCodexLeg(jobId: string, prompt: string, signal: AbortSignal
     });
     transitionJob(jobId, (j) => {
       if (j.status !== "awaiting_chat") return j;
+      // Codex was turned off while this ran (endDisabledCodexLegs already settled the job).
+      if (!(j.reviewProviders ?? []).includes("codex") || j.providerErrors?.codex) return { ...j, generating: { ...j.generating, codex: false } };
       if (result.ok) return collect(j, result.raw, result.originalText, { unparsedText: result.unparsedText, residualReplies: result.residualReplies });
       // A completed reply that is not review JSON (or was cut off) is evidence: posted verbatim, never clean.
       const salvage = failedLocalSalvage(result);
@@ -1778,7 +1828,10 @@ export async function submitHarborChat(
   ) as Partial<Record<ReviewProvider, RawCause>>;
   const auxiliaryFailures = Object.keys(auxiliaryProviderFailures).length ? auxiliaryProviderFailures : undefined;
 
-  if (!canonicalGates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
+  // The verify-clean fallback is decided on chat output only: a Codex gate beside no usable chat gate
+  // still releases local as the fallback (its leg stays stored and merges with local's).
+  const usableChatGate = [...canonicalByProvider.keys()].some(isChatProvider);
+  if (!usableChatGate && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
     if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
     if (auxiliaryFailures) {

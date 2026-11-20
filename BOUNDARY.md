@@ -17,6 +17,15 @@ changed file is outside the allowlist below.
 > Prompt *semantics*, submission, settlement, and schema-merge are unchanged — only what context
 > is gathered/attached. The full `npm test` suite is the behavioral net for the frozen path.
 
+> **Scope extension — Codex reviewer (`codex`).** A new non-chat reviewer leg
+> (`codex-reviewer.server.ts`) sends the job's review prompt to a local OpenAI-compatible proxy over
+> the shared local transport, outside the local-model lease and slot lock, and races as one more
+> non-canonical, blocking leg. Merge and posting semantics are unchanged: the shared files only add
+> `codex` to provider lists, labels and notes (`poster.ts` `disputedFromUnique`, `review-format.ts`
+> `SummaryJob` / `reviewSummaryBody` / `reviewersLine`, `ops-comment.ts` `buildOpsComment`, scoped by
+> declaration; `jobs.$id.tsx` provider record) and a fixed usage-limit note. The bridge and the
+> extension never see the provider (`isChatProvider` is unchanged).
+
 ## Why
 
 The local leg runs through the OpenAI-compatible SDK/HTTP transport, so it can do a

@@ -301,11 +301,15 @@ test("usage limit: HTTP 429 with resets_at / resets_in_seconds / Retry-After / x
   };
   assert.equal(
     codexQuotaResetAt(
-      err({ error: { ...limit.error, resets_at: 1_800_000_000, resets_in_seconds: 5 } }, {}, 1000),
+      err(
+        { error: { ...limit.error, resets_at: now / 1000 + 7200, resets_in_seconds: 5 } },
+        {},
+        1000,
+      ),
       now,
       60,
     ),
-    1_800_000_000_000,
+    now + 7_200_000,
     "resets_at wins",
   );
   assert.equal(
@@ -314,7 +318,7 @@ test("usage limit: HTTP 429 with resets_at / resets_in_seconds / Retry-After / x
   );
   assert.equal(
     codexQuotaResetAt(
-      err(limit, { "retry-after": "120", "x-codex-primary-reset-after-seconds": "30" }, 120_000),
+      err(limit, { "retry-after": "120", "x-codex-primary-reset-after-seconds": "300" }, 120_000),
       now,
       60,
     ),
@@ -322,12 +326,16 @@ test("usage limit: HTTP 429 with resets_at / resets_in_seconds / Retry-After / x
     "Retry-After before the x-codex headers",
   );
   assert.equal(
-    codexQuotaResetAt(err(limit, { "x-codex-primary-reset-after-seconds": "30" }), now, 60),
-    now + 30_000,
+    codexQuotaResetAt(err(limit, { "x-codex-primary-reset-after-seconds": "300" }), now, 60),
+    now + 300_000,
   );
   assert.equal(
-    codexQuotaResetAt(err(limit, { "x-codex-primary-reset-at": "1800000300" }), now, 60),
-    1_800_000_300_000,
+    codexQuotaResetAt(
+      err(limit, { "x-codex-primary-reset-at": String(now / 1000 + 3600) }),
+      now,
+      60,
+    ),
+    now + 3_600_000,
   );
   assert.equal(
     codexQuotaResetAt(err("Too Many Requests"), now, 45),
@@ -346,12 +354,12 @@ test("usage limit: HTTP 429 with resets_at / resets_in_seconds / Retry-After / x
   assert.equal(
     codexQuotaResetAt(
       new LocalChatStreamError(
-        JSON.stringify({ error: { type: "rate_limit_exceeded", resets_in_seconds: 10 } }),
+        JSON.stringify({ error: { type: "rate_limit_exceeded", resets_in_seconds: 600 } }),
       ),
       now,
       60,
     ),
-    now + 10_000,
+    now + 600_000,
   );
   assert.equal(
     codexQuotaResetAt(new LocalChatHttpError(500, '{"error":{"type":"server_error"}}'), now, 60),
@@ -392,6 +400,7 @@ test("a 429 from the proxy is a usage-limit result with its reset time and fixed
   assert.equal(out.ok, false);
   assert.equal(out.quotaResetAt, now + 3_600_000);
   assert.equal(out.error, "Codex skipped (usage limit, resets at 10:00 UTC)");
+  resetCodexStateForTest(); // the first limit's cooldown would stop the second request before it is sent
   const streamed = await runCodexReview("x", settings(p.base), { now: () => now });
   assert.equal(streamed.quotaResetAt, now + 60_000);
 });
@@ -457,4 +466,144 @@ test("the Codex prompt is the chat prompt fitted to codexPromptMaxChars (code co
     /<<<ATTACH:ashlar-diff\.patch>>>/,
     "attachments inline, as an API model reads them",
   );
+});
+
+test("a usage limit stops the reviews already queued for the Codex slot: only one request is sent", async (t) => {
+  resetCodexStateForTest();
+  const p = await proxy(t, ({ res }) => {
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "usage_limit_reached", resets_in_seconds: 1800 } }));
+  });
+  const now = Date.now();
+  const first = runCodexReview("a", settings(p.base), { now: () => now });
+  const second = runCodexReview("b", settings(p.base), { now: () => now });
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.quotaResetAt, now + 1_800_000);
+  assert.equal(b.ok, false);
+  assert.equal(b.quotaResetAt, now + 1_800_000, "the queued review returns the usage limit");
+  assert.match(b.error, /^Codex skipped \(usage limit, resets at \d\d:\d\d UTC\)$/);
+  assert.equal(p.requests.length, 1, "the queued review sent nothing");
+  resetCodexStateForTest();
+});
+
+test("usage-limit reset times are clamped: ms epochs, past, unreadable and huge values", () => {
+  const now = Date.UTC(2026, 10, 20, 12, 0, 0);
+  const limit = (fields, headers = {}, retry) =>
+    new LocalChatHttpError(
+      429,
+      JSON.stringify({ error: { type: "usage_limit_reached", ...fields } }),
+      retry,
+      headers,
+    );
+  const week = 7 * 24 * 60 * 60_000;
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_at: now + 3_600_000 }), now, 60),
+    now + 3_600_000,
+    "an epoch in ms is read as ms",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({}, { "x-codex-primary-reset-at": String(now + 7_200_000) }), now, 60),
+    now + 7_200_000,
+    "an ms epoch header too",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_at: now / 1000 - 600 }), now, 45),
+    now + 45 * 60_000,
+    "a past reset: the cooldown setting",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_in_seconds: -30 }), now, 45),
+    now + 45 * 60_000,
+    "a negative relative reset: the cooldown setting",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_at: "soon" }), now, 45),
+    now + 45 * 60_000,
+    "unreadable (NaN): the cooldown setting",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_in_seconds: 1e12 }), now, 60),
+    now + week,
+    "a huge relative reset: at most a week",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_at: now / 1000 + 365 * 86_400 }), now, 60),
+    now + week,
+    "a far epoch: at most a week",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({}, { "x-codex-primary-reset-after-seconds": "1e15" }), now, 60),
+    now + week,
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({}, {}, 5_000_000_000), now, 60),
+    now + week,
+    "Retry-After too",
+  );
+  assert.equal(
+    codexQuotaResetAt(limit({ resets_in_seconds: 5 }), now, 60),
+    now + 60_000,
+    "never sooner than a minute",
+  );
+});
+
+/** Fails fast instead of waiting out a production-length timer. */
+const within = (promise, ms) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`no result within ${ms} ms`)), ms),
+    ),
+  ]);
+
+/** A proxy that answers headers and then only SSE comment heartbeats, every `every` ms, until `stop()`. */
+function heartbeats(res, every) {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  const timer = setInterval(() => res.write(": ping\n\n"), every);
+  return () => clearInterval(timer);
+}
+
+test("SSE comment heartbeats keep a slow reply alive past the silence window", async (t) => {
+  resetCodexStateForTest();
+  const p = await proxy(t, ({ res }) => {
+    const stop = heartbeats(res, 40);
+    setTimeout(() => {
+      stop();
+      res.end(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: review }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      );
+    }, 600);
+  });
+  const out = await within(runCodexReview("x", settings(p.base), { livenessMs: 200 }), 3000);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.raw, review);
+});
+
+test("a truly silent stream is aborted after the silence window", async (t) => {
+  resetCodexStateForTest();
+  const p = await proxy(t, ({ res }) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+  });
+  const started = Date.now();
+  const out = await within(runCodexReview("x", settings(p.base), { livenessMs: 200 }), 3000);
+  assert.equal(out.ok, false);
+  assert.equal(out.error, "the Codex proxy sent nothing for the liveness window");
+  assert.ok(Date.now() - started < 3000);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(p.requests[0].req.destroyed || p.requests[0].res.destroyed, "the request was aborted");
+});
+
+test("the hard timeout ends a request that keeps heartbeating but never answers", async (t) => {
+  resetCodexStateForTest();
+  const stops = [];
+  const p = await proxy(t, ({ res }) => {
+    stops.push(heartbeats(res, 30));
+  });
+  t.after(() => stops.forEach((stop) => stop()));
+  const out = await within(
+    runCodexReview("x", settings(p.base), { livenessMs: 10_000, timeoutMs: 300 }),
+    3000,
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.error, "no reply within 20 min (codexTimeoutMinutes)");
 });

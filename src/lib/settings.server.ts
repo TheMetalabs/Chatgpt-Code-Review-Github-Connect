@@ -26,7 +26,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
-import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
+import { CODEX_DIFF_HEADROOM, SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 import { normalizeGateMode } from "./finding-gate.ts";
 
@@ -389,8 +389,25 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     codexTimeoutMinutes: intField(p, "codexTimeoutMinutes"),
     codexQuotaCooldownMinutes: intField(p, "codexQuotaCooldownMinutes"),
   };
+  fitCodexPromptBudget(next);
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;
+}
+
+/** Load normalizes INTO the save domain (settings-rules codexDiffBudgetProblem): with Codex on, a diff
+ * budget the Codex prompt budget cannot hold (an env seed such as ASHLAR_PROMPT_DIFF_MAX_CHARS=500000)
+ * raises the Codex prompt budget to diff + headroom when its domain allows, else turns Codex off. A
+ * save is validated before it gets here, so this only ever changes a stored or env-seeded document. */
+function fitCodexPromptBudget(next: BotSettings): void {
+  if (!next.reviewCodex || next.promptDiffMaxChars <= next.codexPromptMaxChars - CODEX_DIFF_HEADROOM) return;
+  const needed = next.promptDiffMaxChars + CODEX_DIFF_HEADROOM;
+  if (needed <= SETTINGS_INT_FIELDS.codexPromptMaxChars.max) {
+    console.warn(`[settings] codex.prompt_max_chars ${next.codexPromptMaxChars} cannot hold prompt.diff_max_chars ${next.promptDiffMaxChars} + ${CODEX_DIFF_HEADROOM}; raised to ${needed}`);
+    next.codexPromptMaxChars = needed;
+    return;
+  }
+  console.warn(`[settings] prompt.diff_max_chars ${next.promptDiffMaxChars} leaves no room in the Codex prompt (max ${SETTINGS_INT_FIELDS.codexPromptMaxChars.max}); review_codex turned off`);
+  next.reviewCodex = false;
 }
 
 function settingsPath() {

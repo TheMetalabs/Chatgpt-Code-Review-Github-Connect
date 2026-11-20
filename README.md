@@ -189,13 +189,14 @@ cloudflared tunnel --url http://127.0.0.1:8080
 
 ## 2. 리뷰어 토글
 
-Settings에서 최대 3개를 켭니다. 하나만 끌 수는 없습니다.
+Settings에서 최대 4개를 켭니다. 하나만 끌 수는 없습니다.
 
 | 토글 | 어떻게 도는지 |
 | --- | --- |
 | `review_chatgpt` | Chrome이 `chatgpt.com` 임시 채팅에 프롬프트만 넣고 Send |
 | `review_grok` | Chrome이 `grok.com` 새 채팅에 넣고 Send |
 | `review_local` | 켜면 ChatGPT/Grok과 **같이 경주**. ping 실패면 즉시 스킵 |
+| `review_codex` | 이 머신의 로컬 프록시(ChatMock)로 ChatGPT 계정의 Codex 모델에 한 번 요청. 기본 꺼짐. [아래](#codex-chatgpt-계정) 참고 |
 
 ChatGPT / Grok / Local은 Settings에서 켠 것만 병렬로 돕니다. 표현이 달라도 LLM으로 합치지 않습니다. 각 리뷰어 JSON을 **스키마로 합쳐** 인라인 코멘트를 답니다. 아직 답을 쓰는 리뷰어만 기다리고, 벽시계 타임아웃으로 자르지 않습니다.
 
@@ -310,6 +311,52 @@ CLIProxyAPI 자체의 내부 재시도보다 이 우선순위를 먼저 적용�
 `ASHLAR_LOCAL_REVIEW_MODE=single`.
 
 **향후 개선**: `file_read` 툴의 교차 파일 head 읽기는 별도 후속 작업입니다(github.server.ts 경계 결정 필요). 현재는 스냅샷 파일만 읽습니다.
+
+### Codex (ChatGPT 계정)
+
+`review_codex`를 켜면 ChatGPT 모델(기본 `gpt-6-luna`)이 리뷰어로 하나 더 경주합니다. API 키가 아니라 **이 머신의
+ChatGPT 계정 Codex 로그인**을 감싼 로컬 OpenAI 호환 프록시를 거칩니다. 권장은 ChatMock(`http://127.0.0.1:8000/v1`),
+CLIProxyAPI(`http://127.0.0.1:8317/v1`)도 됩니다. Ashlar는 `{base}/chat/completions`에 스트리밍 요청을 **리뷰당 한 번**
+보내고, Chrome 브릿지·로컬 모델 lease·`ASHLAR_LOCAL_SLOT_LOCK`과는 무관합니다. Codex 요청은 프로세스 전체에서 한 번에
+하나만 나가고 나머지는 줄을 섭니다.
+
+ChatMock 준비 (ChatMock README 기준):
+
+1. ChatMock을 설치하고 **ChatMock 자체 로그인**을 합니다: `chatmock login` (브라우저로 ChatGPT 계정 로그인)
+2. `127.0.0.1`에만 바인딩해서 띄웁니다: `chatmock serve` (기본 `127.0.0.1:8000`). 외부 인터페이스에 열지 마세요
+3. 계정은 **하나만** 씁니다. CLIProxyAPI의 여러 계정 풀링(라운드로빈)으로 쿼타를 늘리지 마세요
+4. Settings → Codex에서 `review_codex`를 켜고 `codex.base_url`/`codex.model`을 확인합니다. `codex.api_key`는 프록시 자체
+   접근 키이고 ChatMock이면 비워 둡니다
+
+**비공개 코드를 리뷰하기 전에** 그 ChatGPT 계정에서 Settings → Data controls의 **Improve the model for everyone**과
+Codex의 학습 허용 토글을 끄세요. 리뷰 프롬프트에는 diff와 스냅샷 코드가 그대로 들어갑니다.
+
+프롬프트는 ChatGPT 브라우저 레그와 같은 리뷰 프롬프트를 `codex.prompt_max_chars`(기본 600000자)에 맞춘 것입니다(첨부는
+본문에 인라인). 코드 컨텍스트는 줄여도 **diff는 줄이지 않으므로**, Codex를 켜면 `prompt.diff_max_chars`가
+`codex.prompt_max_chars − 150000` 이하여야 저장됩니다. 지적은 최대 8개, `response_format` json_schema로 요청하고
+프록시가 400/422로 거절하면 그 프로세스에서는 빼고 한 번만 다시 보냅니다. temperature·top_p·max_tokens 같은 샘플링
+필드는 보내지 않습니다. 응답이 리뷰 JSON이 아니거나 잘리면 교정 요청 없이 원문을 증거로 올리고 clean으로 치지 않습니다.
+프록시가 reasoning 요약을 맨 앞 `<think>…</think>`로 보내면 떼어 내고 읽습니다.
+
+무료 플랜에도 사용량 한도가 있어 429가 납니다. 429(또는 프록시가 넘겨준 `usage_limit_reached` /
+`usage_not_included` / `rate_limit_exceeded`)를 받으면 리셋 시각(`resets_at`, `resets_in_seconds`, `Retry-After`,
+`x-codex-primary-reset-*`, 없으면 `codex.quota_cooldown_minutes`)까지 **새 잡에 Codex를 붙이지 않고** ops 코멘트에
+`Codex skipped (usage limit, resets at HH:MM UTC)`를 남깁니다. 잡 도중에 한도에 걸리면 Codex만 빠지고, 나머지 리뷰어가
+clean이면 그대로 clean으로 게시됩니다. Codex만 켜 둔 잡은 리뷰 없이 실패한 시도로 끝납니다. 쿨다운은 Settings의 Codex
+칸에 읽기 전용으로 보입니다.
+
+| 설정 / env | 기본 | 뜻 |
+| --- | --- | --- |
+| `reviewCodex` / `ASHLAR_REVIEW_CODEX` | false | Codex 리뷰어 켜기 |
+| `codexBaseUrl` / `ASHLAR_CODEX_BASE_URL` | `http://127.0.0.1:8000/v1` | 로컬 프록시 주소 |
+| `codexApiKey` / `ASHLAR_CODEX_API_KEY` | 빈 값 | 프록시 접근 키(시크릿, 화면에서 마스크). 비우면 더미 bearer |
+| `codexModel` / `ASHLAR_CODEX_MODEL` | `gpt-6-luna` | 모델 |
+| `codexReasoningEffort` / `ASHLAR_CODEX_REASONING_EFFORT` | `medium` | `low` / `medium` / `high` |
+| `codexStructuredOutput` / `ASHLAR_CODEX_STRUCTURED_OUTPUT` | true | `response_format` json_schema 전송 |
+| `codexPromptMaxChars` / `ASHLAR_CODEX_PROMPT_MAX_CHARS` | 600000 | 프롬프트 상한(자). 컨텍스트는 약 272K 토큰 |
+| `codexMaxOutputTokens` / `ASHLAR_CODEX_MAX_OUTPUT_TOKENS` | 0 | `max_completion_tokens`. 0이면 안 보냄 |
+| `codexTimeoutMinutes` / `ASHLAR_CODEX_TIMEOUT_MINUTES` | 20 | 요청 하나의 하드 상한(분). 스트림이 5분 동안 무신호여도 중단 |
+| `codexQuotaCooldownMinutes` / `ASHLAR_CODEX_QUOTA_COOLDOWN_MINUTES` | 60 | 리셋 시각이 없는 한도 응답 뒤 쉬는 시간(분) |
 
 ---
 

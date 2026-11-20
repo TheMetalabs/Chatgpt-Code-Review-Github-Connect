@@ -624,7 +624,7 @@ describe("codex reviewer settings", () => {
   it("defaults off, with ChatMock's address, gpt-6-luna, medium effort, structured output and the documented budgets", () => {
     const s = sanitizeBotSettings({});
     assert.equal(s.reviewCodex, false);
-    assert.equal(s.codexBaseUrl, "http://127.0.0.1:8000/v1");
+    assert.equal(s.codexBaseUrl, "http://127.0.0.1:18431/v1");
     assert.equal(s.codexApiKey, "");
     assert.equal(s.codexModel, "gpt-6-luna");
     assert.equal(s.codexReasoningEffort, "medium");
@@ -668,7 +668,7 @@ describe("codex reviewer settings", () => {
     assert.equal(bad.codexPromptMaxChars, 200_000, "clamped into its domain");
     assert.equal(bad.codexTimeoutMinutes, 240);
     assert.equal(bad.codexStructuredOutput, true);
-    assert.equal(bad.codexBaseUrl, "http://127.0.0.1:8000/v1");
+    assert.equal(bad.codexBaseUrl, "http://127.0.0.1:18431/v1");
   });
 
   it("env seeds every codex field before the first save; a saved review_codex wins", () => {

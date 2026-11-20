@@ -1,6 +1,6 @@
 /**
  * The Codex reviewer leg: a ChatGPT model reached through a LOCAL OpenAI-compatible proxy that wraps a
- * ChatGPT account's Codex login (ChatMock at http://127.0.0.1:8000/v1 is the recommended one;
+ * ChatGPT account's Codex login (ChatMock at http://127.0.0.1:18431/v1 is the recommended one;
  * CLIProxyAPI works too). One streamed `chat/completions` request per review, over the shared local
  * transport, but:
  *

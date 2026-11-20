@@ -419,7 +419,7 @@ export interface BotSettings {
   skipVendoredPaths: boolean;
   /** The Codex reviewer (codex-reviewer.server.ts): a ChatGPT model through a local proxy (ChatMock). */
   reviewCodex: boolean;
-  /** OpenAI-compatible base URL of the local proxy, e.g. ChatMock http://127.0.0.1:8000/v1. */
+  /** OpenAI-compatible base URL of the local proxy, e.g. ChatMock http://127.0.0.1:18431/v1. */
   codexBaseUrl: string;
   /** The proxy's own access key (may be empty: a dummy bearer is sent). */
   codexApiKey: string;
@@ -610,7 +610,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   postLatestHeadOnly: true,
   skipVendoredPaths: true,
   reviewCodex: false,
-  codexBaseUrl: "http://127.0.0.1:8000/v1",
+  codexBaseUrl: "http://127.0.0.1:18431/v1",
   codexApiKey: "",
   codexModel: "gpt-6-luna",
   codexReasoningEffort: "medium",

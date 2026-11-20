@@ -315,7 +315,7 @@ CLIProxyAPI 자체의 내부 재시도보다 이 우선순위를 먼저 적용�
 ### Codex (ChatGPT 계정)
 
 `review_codex`를 켜면 ChatGPT 모델(기본 `gpt-6-luna`)이 리뷰어로 하나 더 경주합니다. API 키가 아니라 **이 머신의
-ChatGPT 계정 Codex 로그인**을 감싼 로컬 OpenAI 호환 프록시를 거칩니다. 권장은 ChatMock(`http://127.0.0.1:8000/v1`),
+ChatGPT 계정 Codex 로그인**을 감싼 로컬 OpenAI 호환 프록시를 거칩니다. 권장은 ChatMock(`http://127.0.0.1:18431/v1`),
 CLIProxyAPI(`http://127.0.0.1:8317/v1`)도 됩니다. Ashlar는 `{base}/chat/completions`에 스트리밍 요청을 **리뷰당 한 번**
 보내고, Chrome 브릿지·로컬 모델 lease·`ASHLAR_LOCAL_SLOT_LOCK`과는 무관합니다. Codex 요청은 프로세스 전체에서 한 번에
 하나만 나가고 나머지는 줄을 섭니다.
@@ -323,7 +323,9 @@ CLIProxyAPI(`http://127.0.0.1:8317/v1`)도 됩니다. Ashlar는 `{base}/chat/com
 ChatMock 준비 (ChatMock README 기준):
 
 1. ChatMock을 설치하고 **ChatMock 자체 로그인**을 합니다: `chatmock login` (브라우저로 ChatGPT 계정 로그인)
-2. `127.0.0.1`에만 바인딩해서 띄웁니다: `chatmock serve` (기본 `127.0.0.1:8000`). 외부 인터페이스에 열지 마세요
+2. `127.0.0.1`에만 바인딩하고, 다른 개발 서버와 겹치지 않게 Ashlar 기본 포트로 띄웁니다:
+   `chatmock serve --host 127.0.0.1 --port 18431`. ChatMock 자체 기본은 `8000`이라 그대로 띄우면
+   `codex.base_url`을 `http://127.0.0.1:8000/v1`로 바꿔야 합니다. 외부 인터페이스에 열지 마세요
 3. 계정은 **하나만** 씁니다. CLIProxyAPI의 여러 계정 풀링(라운드로빈)으로 쿼타를 늘리지 마세요
 4. Settings → Codex에서 `review_codex`를 켜고 `codex.base_url`/`codex.model`을 확인합니다. `codex.api_key`는 프록시 자체
    접근 키이고 ChatMock이면 비워 둡니다
@@ -348,7 +350,7 @@ clean이면 그대로 clean으로 게시됩니다. Codex만 켜 둔 잡은 리�
 | 설정 / env | 기본 | 뜻 |
 | --- | --- | --- |
 | `reviewCodex` / `ASHLAR_REVIEW_CODEX` | false | Codex 리뷰어 켜기 |
-| `codexBaseUrl` / `ASHLAR_CODEX_BASE_URL` | `http://127.0.0.1:8000/v1` | 로컬 프록시 주소 |
+| `codexBaseUrl` / `ASHLAR_CODEX_BASE_URL` | `http://127.0.0.1:18431/v1` | 로컬 프록시 주소 |
 | `codexApiKey` / `ASHLAR_CODEX_API_KEY` | 빈 값 | 프록시 접근 키(시크릿, 화면에서 마스크). 비우면 더미 bearer |
 | `codexModel` / `ASHLAR_CODEX_MODEL` | `gpt-6-luna` | 모델 |
 | `codexReasoningEffort` / `ASHLAR_CODEX_REASONING_EFFORT` | `medium` | `low` / `medium` / `high` |

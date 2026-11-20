@@ -1109,7 +1109,7 @@ function CodexSection({
           <input
             value={value.codexBaseUrl}
             onChange={(e) => onChange({ codexBaseUrl: e.target.value })}
-            placeholder="http://127.0.0.1:8000/v1"
+            placeholder="http://127.0.0.1:18431/v1"
             className="h-11 w-full rounded-md border border-line bg-bg px-3 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
           />
         </Field>

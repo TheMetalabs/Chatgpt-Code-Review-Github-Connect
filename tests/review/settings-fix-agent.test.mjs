@@ -118,6 +118,16 @@ const TOP_LEVEL = {
   localPipelineKeepUncertain: {bad: ['true', 1, null], good: false},
   localPipelineDropBuildClaims: {bad: ['false', 0, null], good: false},
   localPipelineThinking: {bad: ['none', 'Off', '', false, 0, null], good: 'off'},
+  reviewCodex: {bad: ['true', 1, null], good: true},
+  codexBaseUrl: {bad: [42, null, {}], good: 'http://127.0.0.1:8317/v1'},
+  codexApiKey: {bad: [42, null, {}], good: 'proxy-key'},
+  codexModel: {bad: [42, null, []], good: 'gpt-6-luna'},
+  codexReasoningEffort: {bad: ['max', 'Medium', '', 1, null], good: 'high'},
+  codexStructuredOutput: {bad: ['false', 0, null], good: false},
+  codexPromptMaxChars: {bad: ['600000', null, 199_999, 1_000_001, 1.5], good: 500_000},
+  codexMaxOutputTokens: {bad: ['0', null, -1, 1.5], good: 32_000},
+  codexTimeoutMinutes: {bad: ['20', null, 0, 241, 2.5], good: 30},
+  codexQuotaCooldownMinutes: {bad: ['60', null, 0, 10_081], good: 90},
 };
 
 test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {

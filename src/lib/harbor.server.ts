@@ -25,6 +25,7 @@ import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode, type LocalReviewDeps } from "./local-review-loop.server";
 import { isSmallReview, runLocalReviewPipeline } from "./local-pipeline.server";
+import { buildCodexPrompt, codexCooldownUntil, codexCoolingDown, codexQuotaNote, noteCodexCooldown, runCodexReview, type CodexStage } from "./codex-reviewer.server";
 import { stripLoopDirectives } from "./review-loop";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, smallReviewsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
@@ -108,6 +109,12 @@ const localQueueSince = new Map<string, number>();
 // the local model's budget (chat-prompt.ts LocalBudget). `shrinkContext` also cuts the code context
 // (a forced single-turn); without it an oversized prompt still routes auto mode to the grouped loop.
 const localSinglePrompts = new Map<string, { chatPrompt: string; build: (budgetTokens: number, shrinkContext: boolean) => string }>();
+// The Codex leg (codex-reviewer.server.ts): one request per job, never under the local lease. The
+// prompt (the chat prompt fitted to codexPromptMaxChars) is built at snapshot and kept only until the
+// leg starts; the controller aborts the request on cancel / supersede / removal (releaseJob).
+const codexInFlight = new Set<string>();
+const codexControllers = new Map<string, AbortController>();
+const codexPrompts = new Map<string, string>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -287,11 +294,16 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
     localSamples.delete(job.id);
     localSinglePrompts.delete(job.id);
   }
+  if (edge === "removed" || !codexInFlight.has(job.id)) codexPrompts.delete(job.id);
   // No merge follows a terminal edge: an in-flight leg's later reads are not kept either.
   localHeadReads.delete(job.id);
   localVerifiedKeys.delete(job.id);
   localQueueSince.delete(job.id);
   if (!stop) return;
+  // A cancelled / superseded / removed job stops its Codex request too (it may still wait for the
+  // one-at-a-time Codex slot: the abort takes it out of that queue).
+  codexControllers.get(job.id)?.abort();
+  codexPrompts.delete(job.id);
   localControllers.get(job.id)?.abort();
   // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
   // the next queued review starts without waiting for the aborted request to unwind.
@@ -315,7 +327,8 @@ export function hasLocalLegState(jobId: string): boolean {
 
 /** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
 export function orphanedLocalState(): string[] {
-  const ids = new Set([...localSamples.keys(), ...localSinglePrompts.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
+  const ids = new Set([...localSamples.keys(), ...localSinglePrompts.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching,
+    ...codexInFlight, ...codexControllers.keys(), ...codexPrompts.keys()]);
   return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
 }
 
@@ -388,6 +401,9 @@ export function publicSettings(s: BotSettings) {
     localLlmApiKey: "",
     localLlmApiKeySet: Boolean(s.localLlmApiKey),
     webhookSecretSet: Boolean(s.webhookSecret),
+    codexApiKey: "",
+    codexApiKeySet: Boolean(s.codexApiKey),
+    codexCooldownUntil: codexCooldownUntil(),
   };
 }
 
@@ -732,7 +748,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
           plan: "No reviewer JSON to schema-merge.",
           updatedAt: Date.now(),
         }));
-        void upsertOpsComment(token, jobId, "skipped", skip.ops);
+        void upsertOpsComment(token, jobId, "skipped", job.codexNote ? [job.codexNote, ...skip.ops] : skip.ops);
       }
     }
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
@@ -753,6 +769,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
       if (note) notes.push(note);
     }
     if (job.localVerifyStartedAt) notes.push("Chat review found nothing; the local LLM is verifying before the review posts.");
+    if (job.codexNote) notes.push(job.codexNote);
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
     const phase: OpsPhase = racing ? (chat.length && !bridge.connected && !claimed ? "blocked" : "running") : "running";
@@ -880,7 +897,19 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
 
-  const providers = providersFromSettings(state.settings);
+  let providers = providersFromSettings(state.settings);
+  // Codex is cooling down after a usage limit: not pinned for this job (no request is spent), and the
+  // job says so with fixed text. Codex alone: a failed attempt, never a clean review.
+  let codexNote: string | undefined;
+  if (providers.includes("codex") && codexCoolingDown(Date.now())) {
+    providers = providers.filter((p) => p !== "codex");
+    codexNote = codexQuotaNote(codexCooldownUntil());
+    if (!providers.length) {
+      transitionJob(jobId, (j) => ({ ...j, status: "skipped", skipReason: codexNote, codexNote, noReviewAttempt: true, updatedAt: Date.now() }));
+      await upsertOpsComment(token, jobId, "failed", [codexNote]);
+      return;
+    }
+  }
   if (!providers.length) {
     transitionJob(jobId, (j) => ({
       ...j,
@@ -925,6 +954,8 @@ async function playGithub(jobId: string, untrustedBody: string) {
     status: "awaiting_chat",
     plan: verifier
       ? `Snapshot loaded. ${chatProviders.join(" + ")} review first; local verifies a clean result.`
+      : providers.includes("codex")
+      ? `Snapshot loaded. ${providers.join(" + ")} race in parallel. Schema-merge when each finishes.`
       : providers.includes("local")
       ? `Snapshot loaded. ${[...chatProviders, "local"].join(" + ")} race in parallel. Schema-merge when each finishes.`
       : chatProviders.length > 1
@@ -941,6 +972,8 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localVerified: undefined,
     skippedProviders: undefined,
     incompleteProviders: undefined,
+    codexNote,
+    quotaEndedLegs: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -963,6 +996,110 @@ async function playGithub(jobId: string, untrustedBody: string) {
     });
     // verify-clean: no local generation now; submitHarborChat starts it only after a clean chat result.
     if (!verifier) void kickLocalRace(jobId, prompt);
+  }
+  if (providers.includes("codex")) {
+    // The chat prompt fitted to the Codex budget (the diff is never shrunk: settings-rules keeps the
+    // diff budget below it). Started here only: no watcher restart ever sends a second Codex request.
+    codexPrompts.set(jobId, buildCodexPrompt(promptOpts, state.settings.codexPromptMaxChars));
+    kickCodexLeg(jobId);
+  }
+}
+
+/** Start the job's one Codex request (playGithub only). */
+function kickCodexLeg(jobId: string) {
+  if (codexInFlight.has(jobId)) return;
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat" || !(job.reviewProviders ?? []).includes("codex")) return;
+  if ((job.storedLegs ?? []).some((l) => l.provider === "codex" && l.raw.trim())) return;
+  if (skippedProvider(job.assumptions, "codex") || job.providerErrors?.codex) return;
+  const prompt = codexPrompts.get(jobId);
+  codexPrompts.delete(jobId);
+  if (!prompt?.trim()) return;
+  codexInFlight.add(jobId);
+  const controller = new AbortController();
+  codexControllers.set(jobId, controller);
+  const now = Date.now();
+  transitionJob(jobId, (j) => ({ ...j, generating: { ...j.generating, codex: true },
+    providerProgress: { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "codex_queued", observedAt: now, receivedAt: now } }, updatedAt: now }));
+  try { reviewHistory().recordServerStep(jobId, "codex.requested"); } catch { /* visible history health */ }
+  void attachCodexLeg(jobId, prompt, controller.signal);
+}
+
+function noteCodexStage(jobId: string, stage: CodexStage) {
+  const now = Date.now();
+  transitionJob(jobId, (j) => j.status !== "awaiting_chat" ? j : ({
+    ...j,
+    providerProgress: { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage, observedAt: now, receivedAt: now } },
+  }));
+}
+
+/** Codex hit its usage limit before it produced a reply. With another pinned reviewer left, Codex
+ * leaves the pinned list (as endDisabledChatLegs does for a reviewer turned off), so the others' clean
+ * verdict still publishes clean; the job records it (quotaEndedLegs) and says so with fixed text.
+ * Codex alone: it ends as a skipped reviewer, so the job is a failed attempt, never a clean review. */
+function endCodexForQuota(jobId: string, resetAt: number) {
+  const note = codexQuotaNote(resetAt);
+  const now = Date.now();
+  transitionJob(jobId, (j) => {
+    if (j.status !== "awaiting_chat") return j;
+    const others = (j.reviewProviders ?? []).filter((p) => p !== "codex");
+    const progress = { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "quota" as const, observedAt: now, receivedAt: now } };
+    if (others.length) {
+      return { ...j, reviewProviders: others, generating: { ...j.generating, codex: false }, providerProgress: progress,
+        quotaEndedLegs: [...new Set([...(j.quotaEndedLegs ?? []), "codex" as const])], codexNote: note, updatedAt: now };
+    }
+    return { ...j, generating: { ...j.generating, codex: false }, providerProgress: progress,
+      providerErrors: { ...j.providerErrors, codex: { code: "quota", message: note } },
+      assumptions: [...(j.assumptions ?? []), `Skipped codex (${note})`].slice(0, 12), codexNote: note, updatedAt: now };
+  });
+}
+
+/** Run the job's Codex request, store its leg (or its failure) and submit like the local leg. */
+async function attachCodexLeg(jobId: string, prompt: string, signal: AbortSignal) {
+  try {
+    const result = await runCodexReview(prompt, state.settings, {
+      signal,
+      onStage: (stage) => noteCodexStage(jobId, stage),
+      log: (line) => console.info(`[codex] ${jobId} ${line}`),
+    });
+    if (!result.ok && "quotaResetAt" in result) {
+      noteCodexCooldown(result.quotaResetAt);
+      try { reviewHistory().recordServerStep(jobId, "codex.quota"); } catch { /* visible history health */ }
+      endCodexForQuota(jobId, result.quotaResetAt);
+      return;
+    }
+    try {
+      reviewHistory().recordServerStep(jobId, result.ok ? "codex.response_received" : "codex.failed");
+      const unparsed = result.ok ? result.unparsedText?.trim() : localReplies(result);
+      if (unparsed) reviewHistory().recordObservation(jobId, "codex", `codex:${jobId}`, unparsed, unparsed.length, unparsed.length > 128_000);
+    } catch { /* metadata storage failure is visible without starting another request */ }
+    const collect = (j: Job, raw: string, originalText?: string, evidence?: { unparsedText?: string; residualReplies?: string }): Job => ({
+      ...j,
+      storedLegs: [...(j.storedLegs ?? []).filter((l) => l.provider !== "codex"), { provider: "codex" as const, raw, originalText, ...evidence }],
+      generating: { ...j.generating, codex: false },
+      providerProgress: { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now() } },
+      updatedAt: Date.now(),
+    });
+    transitionJob(jobId, (j) => {
+      if (j.status !== "awaiting_chat") return j;
+      if (result.ok) return collect(j, result.raw, result.originalText, { unparsedText: result.unparsedText, residualReplies: result.residualReplies });
+      // A completed reply that is not review JSON (or was cut off) is evidence: posted verbatim, never clean.
+      const salvage = failedLocalSalvage(result);
+      if (salvage) return collect(j, salvage, localReplies(result));
+      return {
+        ...j, generating: { ...j.generating, codex: false },
+        providerErrors: { ...j.providerErrors, codex: { code: "error", message: result.error } },
+        providerProgress: { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now() } },
+        assumptions: [...(j.assumptions ?? []), `Skipped codex (${result.error})`].slice(0, 12), updatedAt: Date.now(),
+      };
+    });
+  } finally {
+    codexInFlight.delete(jobId);
+    codexControllers.delete(jobId);
+    codexPrompts.delete(jobId);
+    const job = state.jobs.find((j) => j.id === jobId);
+    const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());
+    if (job?.status === "awaiting_chat" && legs.length) await submitHarborChat(jobId, legs[0].raw, legs);
   }
 }
 
@@ -2135,6 +2272,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   }
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
+  if (postedJob.codexNote) notes.unshift(postedJob.codexNote);
   if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
   if (headCheckNote) notes.push(headCheckNote);
   if (postedJob.priorFindingsNote) notes.push(postedJob.priorFindingsNote);

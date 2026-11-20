@@ -170,7 +170,7 @@ export const Route = createFileRoute("/api/harbor")({
           }
           const legs = Array.isArray(body.results)
             ? body.results
-                .filter((r) => r.provider === "chatgpt" || r.provider === "grok" || r.provider === "local")
+                .filter((r) => r.provider === "chatgpt" || r.provider === "grok" || r.provider === "local" || r.provider === "codex")
                 .map((r) => ({ provider: r.provider as ReviewProvider, raw: String(r.raw ?? "") }))
             : undefined;
           const out = await submitHarborChat(body.jobId, String(body.raw ?? ""), legs);

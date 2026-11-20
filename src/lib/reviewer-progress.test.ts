@@ -290,4 +290,33 @@ describe("buildReviewerLanes", () => {
     assert.match(skip.ops[1], /^ChatGPT: logged out in the worker's Chrome profile/);
   });
 
+
+  it("shows the codex lane (in flight, queued for the Codex slot, answered, skipped) and a codex skip never touches chatgpt or local", () => {
+    const running = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local", "codex"], generating: { codex: true },
+      providerProgress: { codex: { runId: "codex:j1", stage: "codex_running", observedAt: 1, receivedAt: 1 } } }), { now: 2 });
+    assert.deepEqual(running.map((l) => l.provider), ["chatgpt", "local", "codex"]);
+    assert.equal(running[2].label, "Codex (ChatGPT account)");
+    assert.equal(running[2].state, "generating");
+    assert.equal(running[2].detail, "Codex request sent · waiting for output");
+    const queued = buildReviewerLanes(job({ reviewProviders: ["codex"], generating: { codex: true },
+      providerProgress: { codex: { runId: "codex:j1", stage: "codex_queued", observedAt: 1, receivedAt: 1 } } }));
+    assert.equal(queued[0].state, "waiting");
+    assert.match(queued[0].detail, /waiting for the Codex slot/);
+    const answered = buildReviewerLanes(job({ reviewProviders: ["codex"], storedLegs: [{ provider: "codex", raw: json }] }));
+    assert.equal(answered[0].state, "answered");
+    assert.equal(answered[0].findingCount, 1);
+    const note = "Skipped codex (Codex skipped (usage limit, resets at 14:05 UTC))";
+    const skipped = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local", "codex"], assumptions: [note],
+      generating: { chatgpt: true, local: true, codex: false }, providerErrors: { codex: { code: "quota", message: "Codex skipped (usage limit, resets at 14:05 UTC)" } } }),
+      { localInFlight: true });
+    assert.equal(skipped[2].state, "skipped");
+    assert.equal(skipped[2].detail, note);
+    assert.notEqual(skipped[0].state, "skipped", "chatgpt is not skipped by a codex note");
+    assert.doesNotMatch(skipped[0].detail, /usage limit|skipped/i);
+    assert.equal(skipped[1].state, "generating", "local is not skipped by a codex note");
+    // ChatGPT finished without JSON: its own detail, never the codex usage-limit note.
+    const chatEmpty = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "codex"], assumptions: [note], generating: { chatgpt: false },
+      providerErrors: { codex: { code: "quota", message: "Codex skipped (usage limit, resets at 14:05 UTC)" } } }));
+    assert.equal(emptyReviewSkip([chatEmpty[0]]).usageLimited, false);
+  });
 });

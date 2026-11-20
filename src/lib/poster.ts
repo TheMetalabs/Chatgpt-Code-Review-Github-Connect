@@ -496,7 +496,7 @@ export function partitionMany(rows: ProviderGate[]) {
 
 export function disputedFromUnique(unique: Partial<Record<ReviewProvider, Finding[]>>) {
   const out: { source: ReviewProvider; finding: Finding }[] = [];
-  for (const p of ["local", "chatgpt", "grok"] as ReviewProvider[]) {
+  for (const p of ["local", "chatgpt", "grok", "codex"] as ReviewProvider[]) {
     for (const finding of unique[p] ?? []) out.push({ source: p, finding });
   }
   return out;

@@ -26,7 +26,14 @@ export type JobStatus =
   | "dlq"
   | "cancelled";
 
-export type ReviewProvider = "chatgpt" | "grok" | "local";
+/** "codex": a ChatGPT model reached through a LOCAL OpenAI-compatible proxy that wraps a ChatGPT
+ * account's Codex login (codex-reviewer.server.ts). Never a chat provider: the Chrome bridge never
+ * sees it. The id is chosen so it cannot collide with "chatgpt" or "local" in any matcher. */
+export type ReviewProvider = "chatgpt" | "grok" | "local" | "codex";
+
+/** reasoning_effort a Codex request sends (BotSettings.codexReasoningEffort). */
+export type CodexReasoningEffort = "low" | "medium" | "high";
+export const CODEX_REASONING_EFFORTS: CodexReasoningEffort[] = ["low", "medium", "high"];
 
 /** How the local reviewer leg runs. "single" is the one-shot prompt (browser-parity, rollback);
  * "multiturn" runs the SDK tool loop that reads files and iterates; "auto" picks single for a PR
@@ -171,6 +178,13 @@ export interface Job {
   reviewProviders?: ReviewProvider[];
   /** Chat legs ended because their reviewer was turned off; removed from the pinned lists, kept only so the worker is told to stop them. */
   endedLegs?: ReviewProvider[];
+  /** Legs ended because their provider hit its usage limit before it ran (Codex quota) while another
+   * pinned reviewer remained: removed from reviewProviders like endedLegs, so the others' clean
+   * verdict still publishes clean. */
+  quotaEndedLegs?: ReviewProvider[];
+  /** Fixed note on why Codex did not run on this job (usage limit and its reset time), shown in the
+   * ops comment and the review body. Never backend text. */
+  codexNote?: string;
   /** settings.localReviewRole pinned at snapshot; a later settings/env change never alters this job. */
   localReviewRole?: LocalReviewRole;
   /** Monotonic ownership token for the validator phase. Bumped on each awaiting_chat → validator
@@ -403,8 +417,29 @@ export interface BotSettings {
    * out of the review (diff, context, local loop groups), and never post a finding on them (live
    * WalkieBoard #523: 16 rounds of findings on unmodified vendored WhisperKit sources). */
   skipVendoredPaths: boolean;
+  /** The Codex reviewer (codex-reviewer.server.ts): a ChatGPT model through a local proxy (ChatMock). */
+  reviewCodex: boolean;
+  /** OpenAI-compatible base URL of the local proxy, e.g. ChatMock http://127.0.0.1:8000/v1. */
+  codexBaseUrl: string;
+  /** The proxy's own access key (may be empty: a dummy bearer is sent). */
+  codexApiKey: string;
+  codexModel: string;
+  codexReasoningEffort: CodexReasoningEffort;
+  /** Send response_format json_schema (dropped once per process when the proxy rejects it). */
+  codexStructuredOutput: boolean;
+  /** The Codex prompt is the chat prompt fitted to this many chars (the diff is never shrunk). */
+  codexPromptMaxChars: number;
+  /** max_completion_tokens; 0 = not sent. */
+  codexMaxOutputTokens: number;
+  /** Hard ceiling of one Codex request (minutes), counted once the request holds the Codex slot. */
+  codexTimeoutMinutes: number;
+  /** Cooldown after a usage limit that names no reset time (minutes). */
+  codexQuotaCooldownMinutes: number;
   localLlmApiKeySet?: boolean;
   webhookSecretSet?: boolean;
+  codexApiKeySet?: boolean;
+  /** Read-only (publicSettings): the process-wide Codex usage-limit cooldown end, epoch ms. */
+  codexCooldownUntil?: number;
 }
 
 export interface SnapshotFile {
@@ -574,6 +609,16 @@ export const DEFAULT_SETTINGS: BotSettings = {
   findingDedupePrior: true,
   postLatestHeadOnly: true,
   skipVendoredPaths: true,
+  reviewCodex: false,
+  codexBaseUrl: "http://127.0.0.1:8000/v1",
+  codexApiKey: "",
+  codexModel: "gpt-6-luna",
+  codexReasoningEffort: "medium",
+  codexStructuredOutput: true,
+  codexPromptMaxChars: 600_000,
+  codexMaxOutputTokens: 0,
+  codexTimeoutMinutes: 20,
+  codexQuotaCooldownMinutes: 60,
 };
 
 export const DEFAULT_REVIEW_ORDER: ReviewProvider[] = ["local", "chatgpt", "grok"];
@@ -582,6 +627,7 @@ export const PROVIDER_LABEL: Record<ReviewProvider, string> = {
   local: "Local LLM",
   chatgpt: "ChatGPT",
   grok: "Grok",
+  codex: "Codex (ChatGPT account)",
 };
 
 export const SECRET_MASK = "••••••••••••";
@@ -613,14 +659,21 @@ export function localLlmReady(
   return Boolean(s.reviewLocal && s.localLlmBaseUrl?.trim() && s.localLlmModel?.trim());
 }
 
+export function codexReady(
+  s: Partial<Pick<BotSettings, "reviewCodex" | "codexBaseUrl" | "codexModel">>,
+): boolean {
+  return Boolean(s.reviewCodex && s.codexBaseUrl?.trim() && s.codexModel?.trim());
+}
+
 export function providersFromSettings(
   s: Pick<BotSettings, "reviewChatgpt" | "reviewGrok" | "reviewLocal"> &
-    Partial<Pick<BotSettings, "localLlmBaseUrl" | "localLlmModel">>,
+    Partial<Pick<BotSettings, "localLlmBaseUrl" | "localLlmModel" | "reviewCodex" | "codexBaseUrl" | "codexModel">>,
 ): ReviewProvider[] {
   const out: ReviewProvider[] = [];
   if (s.reviewChatgpt) out.push("chatgpt");
   if (s.reviewGrok) out.push("grok");
   if (localLlmReady(s)) out.push("local");
+  if (codexReady(s)) out.push("codex");
   return out;
 }
 
@@ -660,7 +713,8 @@ export function describeEnabledReviewers(providers: readonly ReviewProvider[], r
       : `${chat.join(" + ")} in parallel (Chrome)`;
   const localBit = !local ? "" : !chat.length ? "local only" : localFallback ? "local runs as the fallback"
     : role === "verify-clean" ? "local verifies a clean result" : "local racing";
-  return [chatBit, localBit].filter(Boolean).join("; ") || "none configured";
+  const codexBit = !providers.includes("codex") ? "" : !chat.length && !local ? "codex only" : "codex racing";
+  return [chatBit, localBit, codexBit].filter(Boolean).join("; ") || "none configured";
 }
 
 export function claimedReviewerNote(providers: readonly ReviewProvider[]): string {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
+import { canReleaseHeldLocal, chatStalled, skippedProvider, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -431,5 +431,30 @@ describe("validator generation ownership (held-local release race)", () => {
     assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 7 }), true);
     assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 6 }), false);
     assert.equal(canReleaseHeldLocal({ ...job, localVerifyStartedAt: 1 }, { validatorGeneration: 7 }), false);
+  });
+});
+
+describe("codex provider", () => {
+  it("\"Skipped codex\" marks only codex as skipped, never chatgpt or local; theirs never marks codex", () => {
+    const rows = ["Skipped codex (Codex skipped (usage limit, resets at 14:05 UTC))", "Skipped codex (HTTP 500 from the Codex proxy)"];
+    assert.equal(skippedProvider(rows, "codex"), true);
+    assert.equal(skippedProvider(rows, "chatgpt"), false);
+    assert.equal(skippedProvider(rows, "local"), false);
+    assert.equal(skippedProvider(rows, "grok"), false);
+    assert.equal(skippedProvider(["Skipped chatgpt: usage limit", "Skipped local (codex proxy down)", "notes: Skipped codex later"], "codex"), false);
+  });
+
+  it("stillRacing waits for an in-flight codex leg and stops once it is skipped or has a payload", () => {
+    const base = { providers: ["chatgpt", "codex"] as ReviewProvider[], payloads: ["chatgpt"] as ReviewProvider[], localInFlight: false };
+    assert.equal(stillRacing({ ...base, generating: { codex: true } }), true);
+    assert.equal(stillRacing({ ...base, assumptions: ["Skipped codex (the Codex proxy is unreachable)"] }), false);
+    assert.equal(stillRacing({ ...base, payloads: ["chatgpt", "codex"] }), false);
+    // A codex skip never ends the wait on chatgpt.
+    assert.equal(stillRacing({ ...base, payloads: ["codex"], assumptions: ["Skipped codex (cancelled)"] }), true);
+  });
+
+  it("codex is no chat leg: verify-clean races it with chat, never holds it back", () => {
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: ["chatgpt", "local", "codex"], localReleased: false }), ["chatgpt", "codex"]);
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: ["chatgpt", "local", "codex"], localReleased: true, localFallback: true }), ["local", "codex"]);
   });
 });

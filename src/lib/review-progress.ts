@@ -75,6 +75,9 @@ export const PROGRESS_LABELS = {
     local_lease_waiting: "Waiting for local model · another review or local call holds it (FIFO); nothing sent yet",
     local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",
     local_generating: "Local LLM generating output",
+    codex_queued: "Waiting for the Codex slot · another Codex review is running; nothing sent yet",
+    codex_running: "Codex request sent · waiting for output",
+    codex_generating: "Codex generating output",
     // Tab Lease (Phase 1+). Labelled ahead of the extension: a stage without a label is dropped.
     tab_lost: "Tab lost · it disappeared without Ashlar closing it (vanished, creation unknown or browser restart)",
     tab_rekeyed: "Browser replaced the tab's ID · the lease follows the new ID",

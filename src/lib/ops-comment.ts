@@ -60,7 +60,7 @@ export function buildOpsComment(input: OpsCommentInput): string {
     .filter((row): row is [ReviewProvider, AuxiliaryProviderFailure] => Object.hasOwn(PROVIDER_LABEL, row[0]))
     .map(([provider, reason]) => `${PROVIDER_LABEL[provider]} (${reason})`);
   const providerNote = auxiliary.length
-    ? `Canonical ${PROVIDER_LABEL[input.canonicalProvider ?? input.providers.find((p) => p !== "local") ?? input.providers[0] ?? "chatgpt"]} verdict retained; auxiliary reviewer failure: ${auxiliary.join(", ")}.`
+    ? `Canonical ${PROVIDER_LABEL[input.canonicalProvider ?? input.providers.find((p) => p !== "local" && p !== "codex") ?? input.providers[0] ?? "chatgpt"]} verdict retained; auxiliary reviewer failure: ${auxiliary.join(", ")}.`
     : "";
   const notes = [providerNote, ...input.notes].map((n) => n.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8);
   const noteLines = notes.length ? notes.map((n) => `- ${n}`).join("\n") : "- No blockers. Failures are skipped; remaining reviewers continue.";

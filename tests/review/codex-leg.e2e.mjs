@@ -1,0 +1,278 @@
+// The Codex reviewer leg through the production module graph (app-fixture): webhook → harbor snapshot →
+// Codex request to the fixture's proxy route (/codex/v1/chat/completions) → schema merge → GitHub post.
+// Only GitHub I/O and settings persistence are adapters. Synthetic PR content only.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { appFixture, eventually } from "./app-fixture.mjs";
+import { isConvergedFindings } from "../../src/lib/review-loop.ts";
+
+const finding = {
+  severity: "P1",
+  file: "a.ts",
+  line: 1,
+  side: "RIGHT",
+  title: "answer is off by one",
+  failure_scenario: "Callers expecting 41 get 42.",
+  root_cause: "The constant changed.",
+  evidence: "a.ts:1 `export const answer = 42;`",
+  recommended_fix: "Keep 41.",
+  recommended_test: "Assert 41.",
+};
+const clean = JSON.stringify({
+  merge_recommendation: "COMMENT",
+  highest_risk: "",
+  investigated_safe: ["a.ts: constant only"],
+  assumptions: [],
+  findings: [],
+});
+const dirty = JSON.stringify({
+  merge_recommendation: "REQUEST_CHANGES",
+  highest_risk: "wrong answer",
+  investigated_safe: [],
+  assumptions: [],
+  findings: [finding],
+});
+
+const job = (app, id) => app.harbor.getHarbor().jobs.find((j) => j.id === id);
+const ended = (app, id) =>
+  eventually(
+    () => ["posted", "skipped", "dlq", "cancelled"].includes(job(app, id)?.status),
+    `job ${id} did not finish`,
+  );
+const codexSent = (app, n = 1) =>
+  eventually(() => app.codexRequests.length >= n, `Codex request ${n} never arrived`);
+/** The bridge's chat result, as the extension delivers it (no force: the merge waits for the other racers). */
+const chatgpt = (app, id, raw) =>
+  app.harbor.submitHarborChat(id, raw, [{ provider: "chatgpt", raw }]);
+
+function sse(res, content, finish = "stop") {
+  const data = (o) => `data: ${JSON.stringify(o)}\n\n`;
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write(data({ choices: [{ delta: { content: content.slice(0, 9) } }] }));
+  res.end(
+    data({ choices: [{ delta: { content: content.slice(9) }, finish_reason: finish }] }) +
+      "data: [DONE]\n\n",
+  );
+}
+function quota(res, body) {
+  res.writeHead(429, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+const hhmm = (at) =>
+  `${String(new Date(at).getUTCHours()).padStart(2, "0")}:${String(new Date(at).getUTCMinutes()).padStart(2, "0")} UTC`;
+
+async function codexApp(t, settings = {}, github = {}) {
+  const app = await appFixture({ reviewLocal: false, reviewCodex: true, ...settings }, github);
+  t.after(() => app.close());
+  return app;
+}
+
+test("Codex races ChatGPT: its request carries no sampling fields, and its finding is merged and posted", async (t) => {
+  const app = await codexApp(t);
+  const out = await app.mention("codex-findings");
+  await codexSent(app);
+  const { body } = app.codexRequests[0];
+  assert.equal(body.model, "gpt-6-luna");
+  assert.equal(body.stream, true);
+  assert.equal(body.reasoning_effort, "medium");
+  for (const field of [
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "max_tokens",
+    "service_tier",
+  ])
+    assert.equal(field in body, false, field);
+  assert.equal(body.response_format?.type, "json_schema");
+  assert.match(
+    body.messages[1].content,
+    /<<<ATTACH:ashlar-diff\.patch>>>[\s\S]*export const answer = 42;/,
+    "the job's chat prompt, attachments inline",
+  );
+  assert.match(body.messages[1].content, /Return at most 8 findings/);
+  assert.equal(app.localRequests.length, 0, "never sent to the local model");
+  assert.deepEqual([...job(app, out.jobId).reviewProviders], ["chatgpt", "codex"]);
+  // The bridge never offers Codex to the extension.
+  const offer = app.bridge.takeNextBridgeJob("fixture-client");
+  assert.ok(offer, "the chat leg is offered");
+  assert.deepEqual([...offer.providers], ["chatgpt"]);
+  // ChatGPT answers first: the merge waits for Codex.
+  assert.equal((await chatgpt(app, out.jobId, clean)).ok, true);
+  assert.equal(job(app, out.jobId).status, "awaiting_chat", "still racing Codex");
+  const lane = app.harbor
+    .publicJobs([job(app, out.jobId)])[0]
+    .reviewerLanes.find((l) => l.provider === "codex");
+  assert.equal(lane.label, "Codex (ChatGPT account)");
+  assert.equal(lane.state, "generating");
+  sse(app.codexResponses[0], dirty);
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(app.reviews.length, 1);
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 p2=0/);
+  assert.equal(app.reviews[0].comments.length, 1);
+  assert.match(app.reviews[0].comments[0].body, /answer is off by one/);
+  assert.match(done.plan, /Schema-merged chatgpt \+ codex/);
+  assert.equal(app.codexRequests.length, 1, "one Codex request per review");
+});
+
+test("a Codex request goes out while the local model holds its lease and the slot lock", async (t) => {
+  const app = await codexApp(t, { reviewLocal: true });
+  app.env.ASHLAR_LOCAL_SLOT_LOCK = "true";
+  const out = await app.mention("codex-beside-local");
+  await eventually(() => app.localRequests.length === 1, "the local leg is running");
+  await codexSent(app);
+  assert.equal(
+    app.localResponses[0].writableEnded,
+    false,
+    "local still holds the lease and the slot",
+  );
+  sse(app.codexResponses[0], clean);
+  await eventually(
+    () => (job(app, out.jobId)?.storedLegs ?? []).some((l) => l.provider === "codex"),
+    "the Codex leg is stored",
+  );
+});
+
+test("a superseded job aborts its Codex request", async (t) => {
+  const app = await codexApp(t);
+  const first = await app.mention("codex-supersede-1");
+  await codexSent(app);
+  const second = await app.mention("codex-supersede-2");
+  await eventually(
+    () => job(app, first.jobId).status === "cancelled",
+    "the first job is superseded",
+  );
+  await eventually(
+    () => app.codexResponses[0].req.destroyed || app.codexResponses[0].destroyed,
+    "the old Codex request was aborted",
+  );
+  await codexSent(app, 2);
+  assert.equal(app.harbor.orphanedLocalState().length, 0);
+  sse(app.codexResponses[1], clean);
+  await chatgpt(app, second.jobId, clean);
+  await ended(app, second.jobId);
+  assert.equal(job(app, second.jobId).status, "posted");
+});
+
+test("usage limit mid-job beside a clean ChatGPT: Codex leaves the pinned list, the review posts clean and converges; the next job sends no Codex request", async (t) => {
+  const app = await codexApp(t);
+  const out = await app.mention("codex-quota");
+  await codexSent(app);
+  await chatgpt(app, out.jobId, clean);
+  const resetAt = app.clock.now + 3_600_000;
+  const note = `Codex skipped (usage limit, resets at ${hhmm(resetAt)})`;
+  // The backend's own words never reach the job: they name ChatGPT and "disconnected".
+  quota(app.codexResponses[0], {
+    error: {
+      type: "usage_limit_reached",
+      message: "ChatGPT account disconnected: usage limit",
+      resets_in_seconds: 3600,
+    },
+  });
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.deepEqual([...done.reviewProviders], ["chatgpt"]);
+  assert.deepEqual([...done.quotaEndedLegs], ["codex"]);
+  assert.deepEqual([...(done.skippedProviders ?? [])], []);
+  assert.deepEqual([...(done.incompleteProviders ?? [])], []);
+  assert.equal(done.codexNote, note);
+  const body = app.reviews[0].body;
+  assert.ok(body.startsWith("Didn't find any major issues."), body.slice(0, 200));
+  assert.ok(isConvergedFindings(body), "clean converges");
+  assert.ok(body.includes(note), "the review body carries the fixed note");
+  assert.doesNotMatch(JSON.stringify(done), /disconnected/i, "no backend text on the job");
+  await eventually(
+    () => app.ops.some((b) => b.includes(out.jobId) && b.includes(note)),
+    "the ops comment carries the fixed note",
+  );
+
+  // The next job, during the cooldown: Codex is not pinned and no request is spent.
+  const next = await app.mention("codex-quota-next");
+  await eventually(() => job(app, next.jobId)?.status === "awaiting_chat", "snapshot ready");
+  assert.deepEqual([...job(app, next.jobId).reviewProviders], ["chatgpt"]);
+  assert.equal(job(app, next.jobId).codexNote, note);
+  await eventually(
+    () => app.ops.some((b) => b.includes(next.jobId) && b.includes(`- ${note}`)),
+    "the next job's ops comment says why, in fixed text",
+  );
+  await chatgpt(app, next.jobId, clean);
+  await ended(app, next.jobId);
+  assert.equal(job(app, next.jobId).status, "posted");
+  assert.equal(app.codexRequests.length, 1, "no Codex request during the cooldown");
+  assert.equal(
+    app.harbor.publicSettings(app.harbor.getHarbor().settings).codexCooldownUntil,
+    resetAt,
+  );
+});
+
+test("Codex alone hitting its usage limit is never a clean review; during the cooldown a Codex-only job is a failed attempt", async (t) => {
+  const app = await codexApp(t, { reviewChatgpt: false });
+  const out = await app.mention("codex-only-quota");
+  await codexSent(app);
+  assert.deepEqual([...job(app, out.jobId).reviewProviders], ["codex"]);
+  quota(app.codexResponses[0], {
+    error: { type: "usage_limit_reached", resets_at: Math.floor(app.clock.now / 1000) + 1800 },
+  });
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "skipped");
+  assert.match(done.skipReason, /usage limit/);
+  assert.equal(app.reviews.length, 0, "nothing posted");
+  assert.equal(done.providerErrors.codex.code, "quota");
+
+  const next = await app.mention("codex-only-cooling");
+  await ended(app, next.jobId);
+  const cooling = job(app, next.jobId);
+  assert.equal(cooling.status, "skipped");
+  assert.equal(cooling.noReviewAttempt, true);
+  assert.match(cooling.skipReason, /^Codex skipped \(usage limit, resets at \d\d:\d\d UTC\)$/);
+  assert.equal(app.codexRequests.length, 1);
+  await eventually(
+    () =>
+      app.ops.some(
+        (b) =>
+          b.includes(next.jobId) &&
+          /\*\*Status:\*\* failed/.test(b) &&
+          /ashlar-attempt failed/.test(b),
+      ),
+    "a failed attempt, not a review",
+  );
+});
+
+test("a Codex reply cut off before it finished stays incomplete beside a clean ChatGPT (never clean)", async (t) => {
+  const app = await codexApp(t);
+  const out = await app.mention("codex-truncated");
+  await codexSent(app);
+  await chatgpt(app, out.jobId, clean);
+  sse(
+    app.codexResponses[0],
+    '{"merge_recommendation":"REQUEST_CHANGES","findings":[{"severity":"P1","file":"a.ts","line":1,"title":"answer',
+    "length",
+  );
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.ok(done.incompleteProviders.includes("codex"));
+  const body = app.reviews[0].body;
+  assert.ok(!isConvergedFindings(body), "not a clean pass");
+  assert.doesNotMatch(body, /^Didn't find any major issues/);
+  assert.match(body, /No complete review from codex/);
+});
+
+test("publicSettings masks the Codex proxy key", async (t) => {
+  const app = await codexApp(t);
+  const pub = app.harbor.publicSettings({
+    ...app.harbor.getHarbor().settings,
+    codexApiKey: "proxy-secret",
+  });
+  assert.equal(pub.codexApiKey, "");
+  assert.equal(pub.codexApiKeySet, true);
+  assert.equal(
+    app.harbor.publicSettings({ ...app.harbor.getHarbor().settings, codexApiKey: "" })
+      .codexApiKeySet,
+    false,
+  );
+});

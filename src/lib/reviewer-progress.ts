@@ -35,7 +35,7 @@ function providerErrorNote(
   const own = rows.find(row => new RegExp(`\\b${provider}\\b`, "i").test(row));
   if (own) return own.trim();
   // Common bridge notes may be shared, but never another provider's diagnostic.
-  return rows.find(row => !/\b(chatgpt|grok|local)\b/i.test(row) && /bridge|disconnected/i.test(row))?.trim();
+  return rows.find(row => !/\b(chatgpt|grok|local|codex)\b/i.test(row) && /bridge|disconnected/i.test(row))?.trim();
 }
 
 /** A leg the worker failed because the provider's Chrome session is logged out (#455). */
@@ -119,6 +119,13 @@ export function localLegNote(progress: ProviderProgress | undefined, now: number
   return view === "lease-waiting" ? `local reviewer: ${leaseWaiting(progress)} — another review holds it until all its turns finish` : LOCAL_LEG_NOTE[view];
 }
 
+/** Lane text for an in-flight Codex leg, from its progress stage (codex-reviewer.server.ts). */
+export function codexLegDetail(progress: ProviderProgress | undefined): string {
+  if (progress?.stage === "codex_queued") return "waiting for the Codex slot (one Codex review at a time)";
+  if (progress?.stage === "codex_running") return "Codex request sent · waiting for output";
+  return "calling Codex";
+}
+
 export function buildReviewerLanes(
   job: Pick<
     Job,
@@ -145,12 +152,16 @@ export function buildReviewerLanes(
     const raw = job.storedLegs?.find((l) => l.provider === provider)?.raw?.trim() ?? "";
     const skip = skippedProvider(job.assumptions, provider);
     const skipNote = (job.assumptions ?? []).find((a) =>
-      provider === "local" ? /^Skipped local/i.test(a) : new RegExp(`Skipped ${provider}`, "i").test(a),
+      provider === "local" ? /^Skipped local/i.test(a) : provider === "codex" ? /^Skipped codex\b/i.test(a) : new RegExp(`Skipped ${provider}`, "i").test(a),
     );
 
     const pendingLocal = provider === "local" && Boolean(opts?.localInFlight || job.generating?.local === true);
     if (pendingLocal) {
       return { provider, state: "generating", label, detail: localLegDetail(job.providerProgress?.local, now, staleMs), answered: false };
+    }
+    if (provider === "codex" && job.generating?.codex === true) {
+      const progress = job.providerProgress?.codex;
+      return { provider, state: progress?.stage === "codex_queued" ? "waiting" : "generating", label, detail: codexLegDetail(progress), answered: false };
     }
     if (raw) {
       const stats = replyStats(raw);
@@ -235,6 +246,13 @@ export function buildReviewerLanes(
         };
       }
       return { provider, state: "waiting", label, detail: "local in the race", answered: false };
+    }
+    if (provider === "codex") {
+      if (g === false) return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };
+      if (job.status === "validator" || job.status === "posting" || job.status === "posted") {
+        return { provider, state: "empty", label, detail: "no JSON from this reviewer", answered: false };
+      }
+      return { provider, state: "waiting", label, detail: "codex in the race", answered: false };
     }
 
     if (job.providerErrors?.[provider]?.code === "disconnected" || (g === true && job.bridgeClaimedAt && !claimed(job, now))) {

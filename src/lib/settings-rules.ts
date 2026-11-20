@@ -24,7 +24,9 @@
  * fail-closed); I/O; per-request provider behaviour beyond the capability table below.
  */
 import {
+  CODEX_REASONING_EFFORTS,
   DEFAULT_REVIEW_ORDER,
+  DEFAULT_SETTINGS,
   FIX_AGENT_KNOBS,
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
@@ -274,8 +276,8 @@ export function fixAgentProblem(raw: unknown): string | null {
 
 export const NO_REVIEWER_PROBLEM = "enable ChatGPT, Grok, or a local URL+model";
 
-/** Every BotSettings field a save may write (the derived *Set flags are read-only). */
-export type SettingsField = Exclude<keyof BotSettings, "localLlmApiKeySet" | "webhookSecretSet">;
+/** Every BotSettings field a save may write (the derived *Set flags and the Codex cooldown are read-only). */
+export type SettingsField = Exclude<keyof BotSettings, "localLlmApiKeySet" | "webhookSecretSet" | "codexApiKeySet" | "codexCooldownUntil">;
 
 /** The object shape nested in a settings value: the value itself when it is an object, the element
  * type of an array of objects; never for a primitive or an array of primitives. */
@@ -336,6 +338,10 @@ export const SETTINGS_INT_FIELDS = {
   promptContextMaxChars: { label: "prompt.context_max_chars", min: 0, max: MAX_INT, unit: "chars" },
   promptPolicyMaxChars: { label: "prompt.policy_max_chars", min: 0, max: MAX_INT, unit: "chars" },
   contextPadLines: { label: "prompt.context_pad_lines", min: 0, max: MAX_INT, unit: "count" },
+  codexPromptMaxChars: { label: "codex.prompt_max_chars", min: 200_000, max: 1_000_000, unit: "chars" },
+  codexMaxOutputTokens: { label: "codex.max_output_tokens", min: 0, max: 1_000_000, unit: "count" },
+  codexTimeoutMinutes: { label: "codex.timeout_minutes", min: 1, max: 240, unit: "count" },
+  codexQuotaCooldownMinutes: { label: "codex.quota_cooldown_minutes", min: 1, max: 10_080, unit: "count" },
 } as const satisfies Partial<Record<SettingsField, IntDomain & { label: string }>>;
 
 export type SettingsIntField = keyof typeof SETTINGS_INT_FIELDS;
@@ -408,6 +414,16 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   findingDedupePrior: bool("finding_precision.dedupe_prior"),
   postLatestHeadOnly: bool("finding_precision.post_latest_head_only"),
   skipVendoredPaths: bool("finding_precision.skip_vendored"),
+  reviewCodex: bool("review_codex"),
+  codexBaseUrl: text("codex.base_url"),
+  codexApiKey: text("codex.api_key"),
+  codexModel: text("codex.model"),
+  codexReasoningEffort: oneOf("codex.reasoning_effort", CODEX_REASONING_EFFORTS),
+  codexStructuredOutput: bool("codex.structured_output"),
+  codexPromptMaxChars: int("codexPromptMaxChars"),
+  codexMaxOutputTokens: int("codexMaxOutputTokens"),
+  codexTimeoutMinutes: int("codexTimeoutMinutes"),
+  codexQuotaCooldownMinutes: int("codexQuotaCooldownMinutes"),
 };
 
 export const SETTINGS_FIELDS = Object.keys(SETTINGS_FIELD_RULES) as SettingsField[];
@@ -415,7 +431,20 @@ export const SETTINGS_FIELDS = Object.keys(SETTINGS_FIELD_RULES) as SettingsFiel
 /** Secret fields: a blank or masked value in a patch means "keep the stored secret" (the screen
  * shows a mask and "Blank keeps the stored key"); any other string replaces it (trimmed). A
  * non-string is invalid like any other field. */
-export const SECRET_FIELDS: readonly SettingsField[] = ["webhookSecret", "localLlmApiKey"];
+export const SECRET_FIELDS: readonly SettingsField[] = ["webhookSecret", "localLlmApiKey", "codexApiKey"];
+
+/** The room the Codex prompt keeps beside the diff (codex-reviewer CODEX_PROMPT_DIFF_HEADROOM): the
+ * prompt fit cuts the code context, never the diff, so the diff budget must leave this much. */
+export const CODEX_DIFF_HEADROOM = 150_000;
+
+/** Why the diff budget does not fit the Codex prompt budget (null = fits, or Codex is off). */
+export function codexDiffBudgetProblem(raw: Record<string, unknown>): string | null {
+  if (raw.reviewCodex !== true) return null;
+  const diff = typeof raw.promptDiffMaxChars === "number" ? raw.promptDiffMaxChars : DEFAULT_SETTINGS.promptDiffMaxChars;
+  const max = typeof raw.codexPromptMaxChars === "number" ? raw.codexPromptMaxChars : DEFAULT_SETTINGS.codexPromptMaxChars;
+  if (diff <= max - CODEX_DIFF_HEADROOM) return null;
+  return `prompt.diff_max_chars (${diff}) must be at most codex.prompt_max_chars − ${CODEX_DIFF_HEADROOM} (${max - CODEX_DIFF_HEADROOM}) while review_codex is on: the Codex prompt never shrinks the diff`;
+}
 
 /** Why these settings cannot be saved (null = valid). `raw` is the full document about to be
  * saved (the live settings with the operator's patch merged over them), before normalization.
@@ -431,6 +460,8 @@ export function settingsProblem(raw: Partial<BotSettings> | Record<string, unkno
     if (problem) return problem;
   }
   if (!providersFromSettings(r as unknown as BotSettings).length) return NO_REVIEWER_PROBLEM;
+  const codexBudget = codexDiffBudgetProblem(r);
+  if (codexBudget) return codexBudget;
   return null;
 }
 

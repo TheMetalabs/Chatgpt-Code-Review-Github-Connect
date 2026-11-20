@@ -3,6 +3,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useAshlar } from "@/lib/store";
 import {
+  CODEX_REASONING_EFFORTS,
   DEFAULT_SETTINGS,
   FIX_AGENT_KNOBS,
   FIX_MODES,
@@ -29,6 +30,7 @@ import {
 } from "@/lib/settings-rules";
 import type {
   BotSettings,
+  CodexReasoningEffort,
   FixAgentKnob,
   FixAgentProvider,
   FixAgentSettings,
@@ -62,6 +64,15 @@ const PIPELINE_THINKING_LABEL: Record<LocalPipelineThinking, string> = {
   off: "off — no turn thinks",
 };
 
+/** The Codex fields the section edits (types.ts BotSettings, validated by settings-rules). */
+type CodexFields = Pick<BotSettings, "reviewCodex" | "codexBaseUrl" | "codexApiKey" | "codexApiKeySet" | "codexModel" | "codexReasoningEffort" |
+  "codexStructuredOutput" | "codexPromptMaxChars" | "codexMaxOutputTokens" | "codexTimeoutMinutes" | "codexQuotaCooldownMinutes" | "codexCooldownUntil">;
+
+const CODEX_PROMPT_ATTRS = formAttrs(SETTINGS_INT_FIELDS.codexPromptMaxChars);
+const CODEX_OUTPUT_ATTRS = formAttrs(SETTINGS_INT_FIELDS.codexMaxOutputTokens);
+const CODEX_TIMEOUT_ATTRS = formAttrs(SETTINGS_INT_FIELDS.codexTimeoutMinutes);
+const CODEX_COOLDOWN_ATTRS = formAttrs(SETTINGS_INT_FIELDS.codexQuotaCooldownMinutes);
+
 /** The finding-precision fields the section edits (types.ts BotSettings, validated by settings-rules). */
 type FindingPrecision = Pick<BotSettings, "findingGate" | "findingP1ClosedPath" | "findingNotes" | "findingDedupePrior" | "postLatestHeadOnly" | "skipVendoredPaths">;
 
@@ -73,6 +84,7 @@ function hydrateDraft(saved: BotSettings): BotSettings {
     localLeaseCapacity: saved.localLeaseCapacity ?? DEFAULT_SETTINGS.localLeaseCapacity,
     localLlmApiKey: saved.localLlmApiKeySet ? SECRET_MASK : "",
     webhookSecret: saved.webhookSecretSet ? SECRET_MASK : saved.webhookSecret,
+    codexApiKey: saved.codexApiKeySet ? SECRET_MASK : "",
   };
 }
 
@@ -129,12 +141,15 @@ export function Settings() {
 
   const secretDirty =
     (!isMaskedSecret(draft.localLlmApiKey) && Boolean(draft.localLlmApiKey.trim())) ||
-    (!isMaskedSecret(draft.webhookSecret) && Boolean(draft.webhookSecret.trim()));
+    (!isMaskedSecret(draft.webhookSecret) && Boolean(draft.webhookSecret.trim())) ||
+    (!isMaskedSecret(draft.codexApiKey) && Boolean(draft.codexApiKey.trim()));
 
+  // Secrets, their *Set flags and the read-only Codex cooldown never make the form dirty.
+  const comparable = (s: BotSettings) => JSON.stringify({ ...s, localLlmApiKey: "", webhookSecret: "", localLlmApiKeySet: false, webhookSecretSet: false,
+    codexApiKey: "", codexApiKeySet: false, codexCooldownUntil: 0 });
   const dirty =
     touched &&
-    (JSON.stringify({ ...saved, localLlmApiKey: "", webhookSecret: "", localLlmApiKeySet: false, webhookSecretSet: false }) !==
-      JSON.stringify({ ...draft, localLlmApiKey: "", webhookSecret: "", localLlmApiKeySet: false, webhookSecretSet: false }) ||
+    (comparable(saved) !== comparable(draft) ||
       mentionText !== saved.mention.join(", ") ||
       secretDirty);
 
@@ -180,6 +195,16 @@ export function Settings() {
     saved.findingDedupePrior,
     saved.postLatestHeadOnly,
     saved.skipVendoredPaths,
+    saved.reviewCodex,
+    saved.codexBaseUrl,
+    saved.codexApiKeySet,
+    saved.codexModel,
+    saved.codexReasoningEffort,
+    saved.codexStructuredOutput,
+    saved.codexPromptMaxChars,
+    saved.codexMaxOutputTokens,
+    saved.codexTimeoutMinutes,
+    saved.codexQuotaCooldownMinutes,
     savedFixKey,
   ]);
 
@@ -195,7 +220,7 @@ export function Settings() {
     setDraft((d) => ({ ...d, fixAgent: { ...d.fixAgent, ...p } }));
   }
 
-  function toggle(key: "reviewChatgpt" | "reviewGrok" | "reviewLocal", on: boolean) {
+  function toggle(key: "reviewChatgpt" | "reviewGrok" | "reviewLocal" | "reviewCodex", on: boolean) {
     const next = { ...draft, [key]: on };
     if (!on && providersFromSettings(next).length === 0) return;
     patch({ [key]: on });
@@ -231,6 +256,7 @@ export function Settings() {
         reviewOrder: order,
         localLlmApiKey: isMaskedSecret(draft.localLlmApiKey) ? "" : draft.localLlmApiKey,
         webhookSecret: isMaskedSecret(draft.webhookSecret) ? "" : draft.webhookSecret,
+        codexApiKey: isMaskedSecret(draft.codexApiKey) ? "" : draft.codexApiKey,
       });
       setTouched(false);
       setMentionText(mention.join(", "));
@@ -603,6 +629,11 @@ export function Settings() {
             Signs Inbox ping only. Live GitHub HMAC uses the GitHub App webhook secret below. Masked if already saved.
           </p>
         </Field>
+        <CodexSection
+          value={{ ...draft, codexCooldownUntil: saved.codexCooldownUntil }}
+          onChange={patch}
+          onToggle={(on) => toggle("reviewCodex", on)}
+        />
         <FindingPrecisionSection value={draft} onChange={patch} />
         <FixAgentSection fix={draft.fixAgent} onChange={patchFix} />
         <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-bg/95 p-3 backdrop-blur">
@@ -669,6 +700,16 @@ local_llm:
   model_rate_limits: ${draft.localLlmModelRateLimits || "—"}
   lease_capacity: ${draft.localLeaseCapacity}
   json_repair_enabled: ${draft.localJsonRepairEnabled}
+codex:
+  enabled: ${draft.reviewCodex}
+  base_url: ${draft.codexBaseUrl || "—"}
+  model: ${draft.codexModel || "—"}
+  reasoning_effort: ${draft.codexReasoningEffort}
+  structured_output: ${draft.codexStructuredOutput}
+  prompt_max_chars: ${draft.codexPromptMaxChars}
+  max_output_tokens: ${draft.codexMaxOutputTokens}
+  timeout_minutes: ${draft.codexTimeoutMinutes}
+  quota_cooldown_minutes: ${draft.codexQuotaCooldownMinutes}
 fix_agent:  # review loop (experimental)
   enabled: ${draft.fixAgent.enabled}
   provider: ${draft.fixAgent.provider ?? "—"}
@@ -1036,6 +1077,144 @@ function GitHubApp({ github }: { github: GithubReady }) {
 
 /** Finding precision (finding-gate.ts). Every switch here is read from the live settings when a
  * reviewer reply is gated, so a saved change applies to the next review — no restart. */
+function CodexSection({
+  value,
+  onChange,
+  onToggle,
+}: {
+  value: CodexFields;
+  onChange: (p: Partial<CodexFields>) => void;
+  onToggle: (on: boolean) => void;
+}) {
+  const until = value.codexCooldownUntil ?? 0;
+  const cooling = until > Date.now();
+  return (
+    <section aria-label="Codex reviewer" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">
+      <div>
+        <h2 className="text-sm font-medium">{PROVIDER_LABEL.codex}</h2>
+        <p className="mt-2 text-[12px] leading-relaxed text-fg-muted">
+          A ChatGPT model through a local OpenAI-compatible proxy that holds this machine&apos;s ChatGPT Codex login
+          (ChatMock, see README). One request per review, streamed, never through the Chrome bridge or the local model
+          queue; one Codex review at a time. A usage limit skips Codex until it resets. Off by default.
+        </p>
+        <p className="mt-2 font-mono text-[12px]" aria-label="codex.cooldown">
+          {cooling ? `Cooling down until ${new Date(until).toLocaleString()} (usage limit)` : "No usage-limit cooldown"}
+        </p>
+      </div>
+      <Field label="review_codex">
+        <Toggle label="review with Codex (ChatGPT account)" checked={value.reviewCodex} onChange={onToggle} />
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="codex.base_url">
+          <input
+            value={value.codexBaseUrl}
+            onChange={(e) => onChange({ codexBaseUrl: e.target.value })}
+            placeholder="http://127.0.0.1:8000/v1"
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
+          />
+        </Field>
+        <Field label="codex.model">
+          <input
+            value={value.codexModel}
+            onChange={(e) => onChange({ codexModel: e.target.value })}
+            placeholder="gpt-6-luna"
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
+          />
+        </Field>
+        <Field label="codex.reasoning_effort">
+          <select
+            value={value.codexReasoningEffort}
+            onChange={(e) => onChange({ codexReasoningEffort: e.target.value as CodexReasoningEffort })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          >
+            {CODEX_REASONING_EFFORTS.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="codex.structured_output">
+          <Toggle
+            label="send response_format json_schema"
+            checked={value.codexStructuredOutput}
+            onChange={(v) => onChange({ codexStructuredOutput: v })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            A proxy that rejects it gets the request once more without it, and no more for the rest of the process.
+          </p>
+        </Field>
+        <Field label="codex.prompt_max_chars">
+          <input
+            type="number"
+            min={CODEX_PROMPT_ATTRS.min}
+            max={CODEX_PROMPT_ATTRS.max}
+            step={CODEX_PROMPT_ATTRS.step}
+            value={formValue(value.codexPromptMaxChars)}
+            onChange={(e) => onChange({ codexPromptMaxChars: fromForm(CODEX_PROMPT_ATTRS.unit, e.target.valueAsNumber) })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            The code context shrinks to fit; the diff never does, so prompt.diff_max_chars must stay at least 150000 below this.
+          </p>
+        </Field>
+        <Field label="codex.max_output_tokens">
+          <input
+            type="number"
+            min={CODEX_OUTPUT_ATTRS.min}
+            max={CODEX_OUTPUT_ATTRS.max}
+            step={CODEX_OUTPUT_ATTRS.step}
+            value={formValue(value.codexMaxOutputTokens)}
+            onChange={(e) => onChange({ codexMaxOutputTokens: fromForm(CODEX_OUTPUT_ATTRS.unit, e.target.valueAsNumber) })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">0 = not sent (max_completion_tokens).</p>
+        </Field>
+        <Field label="codex.timeout_minutes">
+          <input
+            type="number"
+            min={CODEX_TIMEOUT_ATTRS.min}
+            max={CODEX_TIMEOUT_ATTRS.max}
+            step={CODEX_TIMEOUT_ATTRS.step}
+            value={formValue(value.codexTimeoutMinutes)}
+            onChange={(e) => onChange({ codexTimeoutMinutes: fromForm(CODEX_TIMEOUT_ATTRS.unit, e.target.valueAsNumber) })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">Hard ceiling of one request, from when it holds the Codex slot. 5 min of stream silence also ends it.</p>
+        </Field>
+        <Field label="codex.quota_cooldown_minutes">
+          <input
+            type="number"
+            min={CODEX_COOLDOWN_ATTRS.min}
+            max={CODEX_COOLDOWN_ATTRS.max}
+            step={CODEX_COOLDOWN_ATTRS.step}
+            value={formValue(value.codexQuotaCooldownMinutes)}
+            onChange={(e) => onChange({ codexQuotaCooldownMinutes: fromForm(CODEX_COOLDOWN_ATTRS.unit, e.target.valueAsNumber) })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">Used when a usage limit names no reset time.</p>
+        </Field>
+      </div>
+      <Field label="codex.api_key">
+        <input
+          type="password"
+          autoComplete="off"
+          value={value.codexApiKey}
+          onFocus={() => {
+            if (isMaskedSecret(value.codexApiKey)) onChange({ codexApiKey: "" });
+          }}
+          onChange={(e) => onChange({ codexApiKey: replaceMasked(value.codexApiKey, e.target.value) })}
+          placeholder={value.codexApiKeySet ? SECRET_MASK : "not set"}
+          className="h-11 w-full rounded-md border border-line bg-bg px-3 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
+        />
+        <p className="mt-2 text-[12px] text-fg-subtle">
+          The proxy&apos;s own access key, not a ChatGPT credential. Empty is fine for ChatMock. Masked if already saved; blank keeps the stored key.
+        </p>
+      </Field>
+    </section>
+  );
+}
+
 function FindingPrecisionSection({ value, onChange }: { value: FindingPrecision; onChange: (p: Partial<FindingPrecision>) => void }) {
   return (
     <section aria-label="Finding precision" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">

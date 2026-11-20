@@ -606,3 +606,106 @@ describe("fixAgent: one validator, durable only via the settings JSON (every fie
     });
   }
 });
+
+describe("codex reviewer settings", () => {
+  const CODEX_ENV = {
+    ASHLAR_REVIEW_CODEX: "true",
+    ASHLAR_CODEX_BASE_URL: "http://127.0.0.1:8317/v1",
+    ASHLAR_CODEX_API_KEY: "proxy-env-key",
+    ASHLAR_CODEX_MODEL: "gpt-6-luna-mini",
+    ASHLAR_CODEX_REASONING_EFFORT: "high",
+    ASHLAR_CODEX_STRUCTURED_OUTPUT: "false",
+    ASHLAR_CODEX_PROMPT_MAX_CHARS: "500000",
+    ASHLAR_CODEX_MAX_OUTPUT_TOKENS: "16000",
+    ASHLAR_CODEX_TIMEOUT_MINUTES: "30",
+    ASHLAR_CODEX_QUOTA_COOLDOWN_MINUTES: "90",
+  };
+
+  it("defaults off, with ChatMock's address, gpt-6-luna, medium effort, structured output and the documented budgets", () => {
+    const s = sanitizeBotSettings({});
+    assert.equal(s.reviewCodex, false);
+    assert.equal(s.codexBaseUrl, "http://127.0.0.1:8000/v1");
+    assert.equal(s.codexApiKey, "");
+    assert.equal(s.codexModel, "gpt-6-luna");
+    assert.equal(s.codexReasoningEffort, "medium");
+    assert.equal(s.codexStructuredOutput, true);
+    assert.equal(s.codexPromptMaxChars, 600_000);
+    assert.equal(s.codexMaxOutputTokens, 0);
+    assert.equal(s.codexTimeoutMinutes, 20);
+    assert.equal(s.codexQuotaCooldownMinutes, 60);
+    assert.deepEqual(providersFromSettings(s).includes("codex"), false);
+  });
+
+  it("round-trips every codex field (sanitize → .env mirror → env seed → sanitize) and normalizes bad values", () => {
+    const saved = sanitizeBotSettings({ reviewCodex: true, codexBaseUrl: " http://127.0.0.1:8317/v1 ", codexApiKey: "proxy-key", codexModel: "gpt-6-luna-mini",
+      codexReasoningEffort: "low", codexStructuredOutput: false, codexPromptMaxChars: 450_000, codexMaxOutputTokens: 8000, codexTimeoutMinutes: 45, codexQuotaCooldownMinutes: 120 });
+    assert.equal(saved.codexBaseUrl, "http://127.0.0.1:8317/v1");
+    assert.deepEqual(providersFromSettings({ ...saved, reviewChatgpt: false, reviewGrok: false }), ["codex"], "codex alone is a reviewer");
+    const env = botSettingsToEnv(saved);
+    assert.equal(env.ASHLAR_REVIEW_CODEX, "true");
+    assert.equal(env.ASHLAR_CODEX_BASE_URL, "http://127.0.0.1:8317/v1");
+    assert.equal(env.ASHLAR_CODEX_API_KEY, "proxy-key");
+    assert.equal(env.ASHLAR_CODEX_MODEL, "gpt-6-luna-mini");
+    assert.equal(env.ASHLAR_CODEX_REASONING_EFFORT, "low");
+    assert.equal(env.ASHLAR_CODEX_STRUCTURED_OUTPUT, "false");
+    assert.equal(env.ASHLAR_CODEX_PROMPT_MAX_CHARS, "450000");
+    assert.equal(env.ASHLAR_CODEX_MAX_OUTPUT_TOKENS, "8000");
+    assert.equal(env.ASHLAR_CODEX_TIMEOUT_MINUTES, "45");
+    assert.equal(env.ASHLAR_CODEX_QUOTA_COOLDOWN_MINUTES, "120");
+    const codexKeys = Object.keys(env).filter((k) => k.includes("CODEX"));
+    const prev = Object.fromEntries(codexKeys.map((k) => [k, process.env[k]]));
+    try {
+      for (const k of codexKeys) process.env[k] = env[k];
+      const reloaded = sanitizeBotSettings(overlayEnv({}));
+      for (const key of Object.keys(saved).filter((k) => k.startsWith("codex") || k === "reviewCodex")) {
+        assert.deepEqual(reloaded[key as keyof BotSettings], saved[key as keyof BotSettings], key);
+      }
+    } finally {
+      for (const k of codexKeys) if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+    const bad = sanitizeBotSettings({ codexReasoningEffort: "max", codexPromptMaxChars: 5, codexTimeoutMinutes: 9999, codexStructuredOutput: "yes", codexBaseUrl: 42 });
+    assert.equal(bad.codexReasoningEffort, "medium");
+    assert.equal(bad.codexPromptMaxChars, 200_000, "clamped into its domain");
+    assert.equal(bad.codexTimeoutMinutes, 240);
+    assert.equal(bad.codexStructuredOutput, true);
+    assert.equal(bad.codexBaseUrl, "http://127.0.0.1:8000/v1");
+  });
+
+  it("env seeds every codex field before the first save; a saved review_codex wins", () => {
+    const prev = Object.fromEntries(Object.keys(CODEX_ENV).map((k) => [k, process.env[k]]));
+    try {
+      Object.assign(process.env, CODEX_ENV);
+      const s = sanitizeBotSettings(overlayEnv({}));
+      assert.equal(s.reviewCodex, true);
+      assert.equal(s.codexBaseUrl, "http://127.0.0.1:8317/v1");
+      assert.equal(s.codexApiKey, "proxy-env-key");
+      assert.equal(s.codexModel, "gpt-6-luna-mini");
+      assert.equal(s.codexReasoningEffort, "high");
+      assert.equal(s.codexStructuredOutput, false);
+      assert.equal(s.codexPromptMaxChars, 500_000);
+      assert.equal(s.codexMaxOutputTokens, 16_000);
+      assert.equal(s.codexTimeoutMinutes, 30);
+      assert.equal(s.codexQuotaCooldownMinutes, 90);
+      const merged = diskReviewerFlagsWin({ reviewCodex: false }, overlayEnv({ reviewCodex: false }));
+      assert.equal(merged.reviewCodex, false, "the Settings screen's saved toggle wins over the env seed");
+    } finally {
+      for (const k of Object.keys(CODEX_ENV)) if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+  });
+
+  it("does not copy an env-only Codex proxy key onto disk", () => {
+    const runtime = sanitizeBotSettings({ ...DEFAULT_SETTINGS, codexApiKey: "env-proxy" });
+    assert.equal(persistableSettings(runtime, { ASHLAR_CODEX_API_KEY: "env-proxy" }, {}).codexApiKey, "");
+    assert.equal(persistableSettings(runtime, { ASHLAR_CODEX_API_KEY: "env-proxy" }, { codexApiKey: "typed" }).codexApiKey, "typed");
+    assert.equal(persistableSettings({ ...runtime, codexApiKey: "typed-in-ui" }, { ASHLAR_CODEX_API_KEY: "env-proxy" }, {}).codexApiKey, "typed-in-ui");
+  });
+
+  it("with codex on, prompt.diff_max_chars must leave 150000 chars of the Codex prompt budget (the diff is never shrunk)", () => {
+    const on = { ...DEFAULT_SETTINGS, reviewCodex: true };
+    assert.equal(settingsProblem(on), null, "the defaults fit (300000 ≤ 600000 − 150000)");
+    assert.equal(settingsProblem({ ...on, promptDiffMaxChars: 450_000 }), null);
+    assert.match(settingsProblem({ ...on, promptDiffMaxChars: 450_001 }) ?? "", /prompt\.diff_max_chars \(450001\) must be at most codex\.prompt_max_chars − 150000 \(450000\)/);
+    assert.match(settingsProblem({ ...on, codexPromptMaxChars: 400_000 }) ?? "", /must be at most codex\.prompt_max_chars − 150000 \(250000\)/);
+    assert.equal(settingsProblem({ ...DEFAULT_SETTINGS, reviewCodex: false, promptDiffMaxChars: 900_000 }), null, "no rule while codex is off");
+  });
+});

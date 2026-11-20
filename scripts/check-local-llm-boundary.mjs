@@ -98,6 +98,13 @@ const ALLOW = new Set([
   "tests/review/long-wait.test.mjs",
   "tests/review/local-model-routing.test.mjs",
   "tests/review/settings-fix-agent.test.mjs",
+  // Codex reviewer leg (scope extension, BOUNDARY.md): a non-chat racer over the shared local transport.
+  "src/lib/codex-reviewer.server.ts", // codex reviewer leg
+  "tests/review/codex-reviewer.test.mjs", // codex reviewer leg
+  "tests/review/codex-leg.e2e.mjs", // codex reviewer leg
+  "tests/review/settings-codex.test.mjs", // codex reviewer leg (settings)
+  "src/lib/local-fallback.test.ts", // codex reviewer leg: skip/race predicate cases only
+  "src/routes/jobs.$id.tsx", // provider enumeration only: codex key in the manual-paste record
   "BOUNDARY.md",
   "scripts/check-local-llm-boundary.mjs",
   "package.json",
@@ -119,6 +126,10 @@ const SCOPED = {
   "src/lib/fix-request-watch.test.ts": { additionsOnly: true },
   // The fix transport's control type gains the optional waitForModel hook; the fix agent stays frozen.
   "src/lib/fix-agent.ts": { declarations: ["RequestFix"] },
+  // Provider enumeration only: codex label/loop. Merge and posting semantics are unchanged.
+  "src/lib/poster.ts": { declarations: ["disputedFromUnique"] },
+  "src/lib/review-format.ts": { declarations: ["SummaryJob", "reviewSummaryBody", "reviewersLine"] },
+  "src/lib/ops-comment.ts": { declarations: ["buildOpsComment"] },
 };
 
 function checkScope(scope, oldText, newText, file) {

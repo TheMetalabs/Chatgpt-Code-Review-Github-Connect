@@ -194,10 +194,10 @@ export class ReviewHistoryStore {
         }
         this.write(key, old);
     }
-    recordServerStep(id: string, stage: "local.requested" | "local.lease_acquired" | "local.accepted" | "local.generating" | "local.response_received" | "local.failed") {
+    recordServerStep(id: string, stage: "local.requested" | "local.lease_acquired" | "local.accepted" | "local.generating" | "local.response_received" | "local.failed" | "codex.requested" | "codex.response_received" | "codex.failed" | "codex.quota") {
         if (!this.read<Summary>(this.jobKey(id)))
             return;
-        this.append(id, { id: `server:${stage}`, source: "server", stage, provider: "local", at: Date.now() });
+        this.append(id, { id: `server:${stage}`, source: "server", stage, provider: stage.startsWith("codex.") ? "codex" : "local", at: Date.now() });
     }
     recordProgress(id: string, provider: ReviewProvider, runId: string, values: unknown) {
         if (!this.read<Summary>(this.jobKey(id)))
@@ -333,14 +333,14 @@ export class ReviewHistoryStore {
         }>(this.jobKey(id, "steps"));
         const responses: Partial<Record<ReviewProvider, StoredResponse>> = {};
         if (includeResponses)
-            for (const p of ["chatgpt", "grok", "local"] as const) {
+            for (const p of ["chatgpt", "grok", "local", "codex"] as const) {
                 const r = this.read<StoredResponse>(this.jobKey(id, `response-${p}`));
                 if (r)
                     responses[p] = r;
             }
         const observations: Partial<Record<ReviewProvider, unknown>> = {};
         if (includeResponses)
-            for (const p of ["chatgpt", "grok", "local"] as const) {
+            for (const p of ["chatgpt", "grok", "local", "codex"] as const) {
                 const observed = this.read(this.jobKey(id, `observation-${p}`));
                 if (observed)
                     observations[p] = observed;

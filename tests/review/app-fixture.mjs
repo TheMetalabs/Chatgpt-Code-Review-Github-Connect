@@ -9,13 +9,18 @@ import {root,types} from './load-source.mjs';
 export async function appFixture(options={}, githubOptions={}) {
  if(!process.execArgv.includes('--experimental-vm-modules'))
    throw new Error('appFixture requires --experimental-vm-modules (prevents leaked server handles on module-link failure)');
- const ops=[],reviews=[],localResponses=[],localRequests=[];
+ const ops=[],reviews=[],localResponses=[],localRequests=[],codexResponses=[],codexRequests=[];
  const githubCalls={head:0,snapshot:0,reactions:[],timeline:[]};
  let route,webhookRoute,historyRoute;
  const server=createServer(async(req,res)=>{
    if(req.url==='/v1/chat/completions'){
      let text='';for await(const chunk of req)text+=chunk;
      localRequests.push(JSON.parse(text));localResponses.push(res);return;
+   }
+   // The Codex proxy (settings codexBaseUrl): its own route, so a test tells the two servers apart.
+   if(req.url==='/codex/v1/chat/completions'){
+     let text='';for await(const chunk of req)text+=chunk;
+     codexRequests.push({body:JSON.parse(text),headers:req.headers});codexResponses.push(res);return;
    }
    const selectedRoute=req.url.split('?')[0]==='/api/webhook'?webhookRoute:req.url.split('?')[0]==='/api/bridge'?route:req.url.split('?')[0]==='/api/history'?historyRoute:null;
    if(selectedRoute){
@@ -36,7 +41,7 @@ export async function appFixture(options={}, githubOptions={}) {
  // raw evidence) with placeholder findings whose evidence quotes no fixture code, which the precision
  // gate (finding-gate.ts, default 'rules') would rightly drop. A test of the gate itself passes
  // {findingGate:'rules'} (finding-gate-wiring.test.mjs).
- const settings={...types.DEFAULT_SETTINGS,findingGate:'off',localReviewPipeline:false,reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',...options};
+ const settings={...types.DEFAULT_SETTINGS,findingGate:'off',localReviewPipeline:false,reviewChatgpt:true,reviewGrok:false,reviewLocal:true,localLlmBaseUrl:origin+'/v1',localLlmModel:'fixture',codexBaseUrl:origin+'/codex/v1',...options};
  // The diff is in the shape fetchPullSnapshot builds: compact `--- path` + patch blocks, no git headers.
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
   changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],
@@ -110,7 +115,7 @@ export async function appFixture(options={}, githubOptions={}) {
   return harbor.ingestGitHubWebhook({hmacOk:true,deliveryId,event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:1,pull_request:{},title:'fixture'},comment:{id:42,body:'@ashlar-bot review'}}});
  }
  // env: the app realm's process.env (per fixture), so a test can set server env the code reads live.
- return {harbor,bridge,history,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,env:context.process.env,
+ return {harbor,bridge,history,origin,clock,ops,reviews,localResponses,localRequests,codexResponses,codexRequests,mention,githubCalls,env:context.process.env,
    async close(){harbor.resetHarbor();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));},
  };
 }

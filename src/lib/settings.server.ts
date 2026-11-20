@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
+  CODEX_REASONING_EFFORTS,
   DEFAULT_SETTINGS,
   FIX_AGENT_KNOBS,
   FIX_AGENT_PROVIDERS,
@@ -14,6 +15,7 @@ import {
   normalizeReviewOrder,
   providersFromSettings,
   type BotSettings,
+  type CodexReasoningEffort,
   type FixAgentKnob,
   type FixAgentProvider,
   type FixDelivery,
@@ -24,7 +26,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
-import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
+import { CODEX_DIFF_HEADROOM, SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 import { normalizeGateMode } from "./finding-gate.ts";
 
@@ -163,8 +165,33 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
     const v = envFlag(env);
     if (v !== undefined) o[key] = v;
   }
+  // Codex reviewer (codex-reviewer.server.ts): env seeds, a saved reviewCodex wins (diskReviewerFlagsWin).
+  const codex = envFlag("ASHLAR_REVIEW_CODEX");
+  if (codex !== undefined) o.reviewCodex = codex;
+  const codexBase = envStr("ASHLAR_CODEX_BASE_URL");
+  if (codexBase) o.codexBaseUrl = codexBase;
+  const codexKey = process.env.ASHLAR_CODEX_API_KEY;
+  if (codexKey !== undefined && codexKey !== "") o.codexApiKey = codexKey;
+  const codexModel = envStr("ASHLAR_CODEX_MODEL");
+  if (codexModel) o.codexModel = codexModel;
+  const codexEffort = envStr("ASHLAR_CODEX_REASONING_EFFORT");
+  if (codexEffort) o.codexReasoningEffort = codexEffort;
+  const codexStructured = envFlag("ASHLAR_CODEX_STRUCTURED_OUTPUT");
+  if (codexStructured !== undefined) o.codexStructuredOutput = codexStructured;
+  for (const [key, env] of CODEX_INT_ENV) {
+    const n = envNum(env);
+    if (n !== undefined) o[key] = n;
+  }
   return o;
 }
+
+/** Codex whole-number settings and the env var that seeds and mirrors each. */
+const CODEX_INT_ENV = [
+  ["codexPromptMaxChars", "ASHLAR_CODEX_PROMPT_MAX_CHARS"],
+  ["codexMaxOutputTokens", "ASHLAR_CODEX_MAX_OUTPUT_TOKENS"],
+  ["codexTimeoutMinutes", "ASHLAR_CODEX_TIMEOUT_MINUTES"],
+  ["codexQuotaCooldownMinutes", "ASHLAR_CODEX_QUOTA_COOLDOWN_MINUTES"],
+] as const satisfies readonly (readonly [SettingsIntField, string])[];
 
 /** Finding-precision booleans and the env var that seeds each (before the first save) and mirrors it. */
 const FINDING_PRECISION_FLAGS = [
@@ -225,6 +252,13 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_FINDING_DEDUPE_PRIOR: String(s.findingDedupePrior),
     ASHLAR_POST_LATEST_HEAD_ONLY: String(s.postLatestHeadOnly),
     ASHLAR_SKIP_VENDORED_PATHS: String(s.skipVendoredPaths),
+    ASHLAR_REVIEW_CODEX: String(s.reviewCodex),
+    ASHLAR_CODEX_BASE_URL: s.codexBaseUrl,
+    ASHLAR_CODEX_API_KEY: s.codexApiKey,
+    ASHLAR_CODEX_MODEL: s.codexModel,
+    ASHLAR_CODEX_REASONING_EFFORT: s.codexReasoningEffort,
+    ASHLAR_CODEX_STRUCTURED_OUTPUT: String(s.codexStructuredOutput),
+    ...Object.fromEntries(CODEX_INT_ENV.map(([key, env]) => [env, String(s[key])])),
     // fixAgent is deliberately NOT mirrored (no field of it): the settings JSON is its only
     // durable store, and a saved fixAgent wins over env at load (diskFixAgentWins). An env
     // ASHLAR_FIX_* var only seeds a field that was never saved; no env var can switch the loop on.
@@ -342,9 +376,38 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     findingDedupePrior: bool(p.findingDedupePrior, DEFAULT_SETTINGS.findingDedupePrior),
     postLatestHeadOnly: bool(p.postLatestHeadOnly, DEFAULT_SETTINGS.postLatestHeadOnly),
     skipVendoredPaths: bool(p.skipVendoredPaths, DEFAULT_SETTINGS.skipVendoredPaths),
+    reviewCodex: bool(p.reviewCodex, DEFAULT_SETTINGS.reviewCodex),
+    codexBaseUrl: str(p.codexBaseUrl, DEFAULT_SETTINGS.codexBaseUrl).trim(),
+    codexApiKey: str(p.codexApiKey, DEFAULT_SETTINGS.codexApiKey),
+    codexModel: str(p.codexModel, DEFAULT_SETTINGS.codexModel).trim(),
+    codexReasoningEffort: CODEX_REASONING_EFFORTS.includes(p.codexReasoningEffort as CodexReasoningEffort)
+      ? (p.codexReasoningEffort as CodexReasoningEffort)
+      : DEFAULT_SETTINGS.codexReasoningEffort,
+    codexStructuredOutput: bool(p.codexStructuredOutput, DEFAULT_SETTINGS.codexStructuredOutput),
+    codexPromptMaxChars: intField(p, "codexPromptMaxChars"),
+    codexMaxOutputTokens: intField(p, "codexMaxOutputTokens"),
+    codexTimeoutMinutes: intField(p, "codexTimeoutMinutes"),
+    codexQuotaCooldownMinutes: intField(p, "codexQuotaCooldownMinutes"),
   };
+  fitCodexPromptBudget(next);
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;
+}
+
+/** Load normalizes INTO the save domain (settings-rules codexDiffBudgetProblem): with Codex on, a diff
+ * budget the Codex prompt budget cannot hold (an env seed such as ASHLAR_PROMPT_DIFF_MAX_CHARS=500000)
+ * raises the Codex prompt budget to diff + headroom when its domain allows, else turns Codex off. A
+ * save is validated before it gets here, so this only ever changes a stored or env-seeded document. */
+function fitCodexPromptBudget(next: BotSettings): void {
+  if (!next.reviewCodex || next.promptDiffMaxChars <= next.codexPromptMaxChars - CODEX_DIFF_HEADROOM) return;
+  const needed = next.promptDiffMaxChars + CODEX_DIFF_HEADROOM;
+  if (needed <= SETTINGS_INT_FIELDS.codexPromptMaxChars.max) {
+    console.warn(`[settings] codex.prompt_max_chars ${next.codexPromptMaxChars} cannot hold prompt.diff_max_chars ${next.promptDiffMaxChars} + ${CODEX_DIFF_HEADROOM}; raised to ${needed}`);
+    next.codexPromptMaxChars = needed;
+    return;
+  }
+  console.warn(`[settings] prompt.diff_max_chars ${next.promptDiffMaxChars} leaves no room in the Codex prompt (max ${SETTINGS_INT_FIELDS.codexPromptMaxChars.max}); review_codex turned off`);
+  next.reviewCodex = false;
 }
 
 function settingsPath() {
@@ -394,6 +457,10 @@ export function persistableSettings(next: BotSettings, env: NodeJS.Dict<string> 
   if (envKey && out.localLlmApiKey === envKey && disk.localLlmApiKey !== envKey) {
     out.localLlmApiKey = typeof disk.localLlmApiKey === "string" ? disk.localLlmApiKey : "";
   }
+  const envCodexKey = env.ASHLAR_CODEX_API_KEY;
+  if (envCodexKey && out.codexApiKey === envCodexKey && disk.codexApiKey !== envCodexKey) {
+    out.codexApiKey = typeof disk.codexApiKey === "string" ? disk.codexApiKey : "";
+  }
   const envSecret = env.ASHLAR_WEBHOOK_SECRET;
   if (envSecret && out.webhookSecret === envSecret && disk.webhookSecret !== envSecret) {
     out.webhookSecret = typeof disk.webhookSecret === "string" ? disk.webhookSecret : DEFAULT_SETTINGS.webhookSecret;
@@ -403,7 +470,7 @@ export function persistableSettings(next: BotSettings, env: NodeJS.Dict<string> 
 
 export function diskReviewerFlagsWin(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
   const out = { ...merged };
-  for (const key of ["reviewChatgpt", "reviewGrok", "reviewLocal", "localJsonRepairEnabled"] as const) {
+  for (const key of ["reviewChatgpt", "reviewGrok", "reviewLocal", "reviewCodex", "localJsonRepairEnabled"] as const) {
     if (typeof disk[key] === "boolean") out[key] = disk[key];
   }
   return out;
@@ -462,6 +529,9 @@ export function saveBotSettings(settings: BotSettings) {
     const envPatch: Record<string, string | undefined> = botSettingsToEnv(disk);
     if (runtime.localLlmApiKey && runtime.localLlmApiKey === process.env.ASHLAR_LOCAL_LLM_API_KEY) {
       envPatch.ASHLAR_LOCAL_LLM_API_KEY = undefined;
+    }
+    if (runtime.codexApiKey && runtime.codexApiKey === process.env.ASHLAR_CODEX_API_KEY) {
+      envPatch.ASHLAR_CODEX_API_KEY = undefined;
     }
     if (runtime.webhookSecret && runtime.webhookSecret === process.env.ASHLAR_WEBHOOK_SECRET) {
       envPatch.ASHLAR_WEBHOOK_SECRET = undefined;

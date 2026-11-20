@@ -242,6 +242,11 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
     } else {
       next.webhookSecretSet = true;
     }
+    if (!patch.codexApiKey || isMaskedSecret(patch.codexApiKey)) {
+      next.codexApiKey = prev.codexApiKey;
+    } else {
+      next.codexApiKeySet = true;
+    }
     const body: Record<string, unknown> = {
       action: "settings",
       username: next.username,
@@ -281,12 +286,24 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       findingDedupePrior: next.findingDedupePrior,
       postLatestHeadOnly: next.postLatestHeadOnly,
       skipVendoredPaths: next.skipVendoredPaths,
+      reviewCodex: next.reviewCodex,
+      codexBaseUrl: next.codexBaseUrl,
+      codexModel: next.codexModel,
+      codexReasoningEffort: next.codexReasoningEffort,
+      codexStructuredOutput: next.codexStructuredOutput,
+      codexPromptMaxChars: next.codexPromptMaxChars,
+      codexMaxOutputTokens: next.codexMaxOutputTokens,
+      codexTimeoutMinutes: next.codexTimeoutMinutes,
+      codexQuotaCooldownMinutes: next.codexQuotaCooldownMinutes,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;
     }
     if (next.webhookSecret.trim() && !isMaskedSecret(next.webhookSecret) && patch.webhookSecret && !isMaskedSecret(patch.webhookSecret)) {
       body.webhookSecret = next.webhookSecret;
+    }
+    if ((next.codexApiKey ?? "").trim() && !isMaskedSecret(next.codexApiKey) && patch.codexApiKey && !isMaskedSecret(patch.codexApiKey)) {
+      body.codexApiKey = next.codexApiKey;
     }
     const res = await fetch("/api/harbor", {
       method: "POST",
@@ -332,9 +349,11 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
             ...remote.settings,
             webhookSecret: s.settings.webhookSecret,
             localLlmApiKey: s.settings.localLlmApiKey,
+            codexApiKey: s.settings.codexApiKey,
             reviewOrder: remote.settings.reviewOrder ?? s.settings.reviewOrder,
             localLlmApiKeySet: Boolean(remote.settings.localLlmApiKeySet),
             webhookSecretSet: Boolean(remote.settings.webhookSecretSet),
+            codexApiKeySet: Boolean(remote.settings.codexApiKeySet),
           }
         : s.settings,
     })),

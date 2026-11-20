@@ -77,7 +77,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures" | "coverageCutProviders" | "coverageCutReview" | "notes">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "codexNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures" | "coverageCutProviders" | "coverageCutReview" | "notes">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {
@@ -122,7 +122,8 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
   const parts: SummaryParts = {
     outcome,
     sha: job.headSha.slice(0, 7),
-    noteLine: job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "",
+    // A Codex usage-limit note (fixed text) follows the verification note.
+    noteLine: [job.localVerifyNote, job.codexNote].filter(Boolean).map((n) => `\n${neutralizeMarkers(n as string)}\n`).join(""),
     skipped: skippedNotes(job).slice(0, 4).map(neutralizeMarkers),
     incomplete: Boolean(job.incompleteProviders?.length) || auxiliaryFailed(job).length > 0,
     // The clean-pass sentinel reworded and markers neutralized (rawBodyText): the length the merge
@@ -301,7 +302,8 @@ function reviewersLine(job: SummaryJob): string {
     : job.localReviewRole === "verify-clean" && chat.length
       ? " Local LLM verifies a clean chat result."
       : " Local LLM is fallback if Chrome does not return.";
-  return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}`;
+  const codex = providers.includes("codex") ? " Codex reviewed the same snapshot." : "";
+  return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}${codex}`;
 }
 
 /** A fallback release exists only because chat did not return, so the line names what actually ran:

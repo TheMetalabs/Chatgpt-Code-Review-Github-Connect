@@ -291,7 +291,7 @@ function ChatHandoff({
   fpRound: boolean;
 }) {
   const mergeRemote = useAshlar((s) => s.mergeRemote);
-  const [raws, setRaws] = useState<Record<ReviewProvider, string>>({ chatgpt: "", grok: "", local: "" });
+  const [raws, setRaws] = useState<Record<ReviewProvider, string>>({ chatgpt: "", grok: "", local: "", codex: "" });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [promptText, setPromptText] = useState(prompt);

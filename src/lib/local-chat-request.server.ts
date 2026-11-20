@@ -30,16 +30,45 @@ export class LocalChatCutOff extends Error {
   }
 }
 
-/** The server refused the request with a non-2xx status before any reply existed. */
+/** Most of an error body kept on LocalChatHttpError / LocalChatStreamError (a quota reply's reset time
+ * can sit past the message's 160 chars). */
+const MAX_ERROR_BODY = 16 * 1024;
+
+/** The server refused the request with a non-2xx status before any reply existed. `body` and
+ * `headers` keep what a caller needs to read a usage-limit reply (its reset time); the message stays short. */
 export class LocalChatHttpError extends Error {
   readonly status: number;
   readonly retryAfterMs?: number;
-  constructor(status: number, body: string, retryAfterMs?: number) {
+  readonly body: string;
+  readonly headers: Record<string, string>;
+  constructor(status: number, body: string, retryAfterMs?: number, headers: Record<string, string> = {}) {
     super(`local LLM HTTP ${status}: ${body.slice(0, 160)}`);
     this.name = "LocalChatHttpError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.body = body.slice(0, MAX_ERROR_BODY);
+    this.headers = headers;
   }
+}
+
+/** A stream that ended before completion after the server sent an `error` chunk instead of a reply
+ * (a proxy that reports a usage limit inside a 200 stream). Same message as any incomplete stream;
+ * `body` is the error chunk as JSON ({"error": ...}). */
+export class LocalChatStreamError extends Error {
+  readonly body: string;
+  constructor(body: string) {
+    super("local LLM stream ended before completion");
+    this.name = "LocalChatStreamError";
+    this.body = body.slice(0, MAX_ERROR_BODY);
+  }
+}
+
+function headerRecord(headers: http.IncomingHttpHeaders): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value !== undefined) out[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value);
+  }
+  return out;
 }
 
 function retryAfterMs(value: string | string[] | undefined): number | undefined {
@@ -67,6 +96,12 @@ export type LocalRequestOptions = {
   onActivity?: (activity: LocalRequestActivity) => void;
   /** Wire-level streaming for chat/completions. Default: ASHLAR_LOCAL_LLM_STREAM, on unless "false". */
   stream?: boolean;
+  /** Never take the ASHLAR_LOCAL_SLOT_LOCK slot: a request to another server than the local model
+   * (the Codex proxy) must not queue behind, or block, the local model's slot. */
+  bypassSlotLock?: boolean;
+  /** Called on every chunk of response bytes, whatever it holds (an SSE comment heartbeat included,
+   * which onActivity never reports): a caller's own silence watchdog. */
+  onBytes?: () => void;
 };
 
 /** The env-configured streaming default (on unless ASHLAR_LOCAL_LLM_STREAM="false"). Exported so the
@@ -170,6 +205,7 @@ type StreamChunk = {
   model?: string;
   created?: number;
   usage?: unknown;
+  error?: unknown;
   choices?: { delta?: { role?: string; content?: unknown; reasoning_content?: unknown; tool_calls?: ToolCallDelta[] }; finish_reason?: string | null }[];
 };
 
@@ -184,11 +220,14 @@ class StreamAssembler {
   private content = "";
   private reasoning = "";
   private finish: string | null = null;
+  /** An `error` chunk the server sent instead of a reply (kept for LocalChatStreamError). */
+  error: unknown;
   private readonly tools = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
 
   /** Returns what this chunk was: real output, or a heartbeat with nothing in it. */
   apply(chunk: StreamChunk): LocalRequestActivity["kind"] {
     if (chunk.usage !== undefined && chunk.usage !== null) this.usage = chunk.usage;
+    if (chunk.error !== undefined && chunk.error !== null) this.error ??= chunk.error;
     if (chunk.model !== "keepalive") {
       if (chunk.id) this.id = chunk.id;
       if (chunk.model) this.model = chunk.model;
@@ -262,7 +301,7 @@ export function requestLocalJson(
   const dispatch = () => dispatchLocalJson(url, apiKey, chat, body, signal, opts);
   // Optional HTTP slot: chat/completions only. Released when THIS request settles so the next
   // lease-holder cannot send while a cancelled request is still occupying the server.
-  if (chat && localSlotLockEnabled()) {
+  if (chat && !opts?.bypassSlotLock && localSlotLockEnabled()) {
     return localHttpSlot().acquire(signal).then(async (release) => {
       try { return await dispatch(); }
       finally { release(); }
@@ -324,6 +363,7 @@ function dispatchLocalJson(
         activity(assembler.apply(chunk));
       };
       res.on("data", (chunk: Buffer) => {
+        opts?.onBytes?.();
         bytes += chunk.length;
         // Bound memory, never queue/generation duration; don't store partial reviews.
         if (bytes > MAX_RESPONSE_BYTES) { res.destroy(new Error("local LLM response too large")); return; }
@@ -346,13 +386,16 @@ function dispatchLocalJson(
           // A complete chat response always carries a finish_reason. Treat its absence as incomplete
           // whether or not a [DONE] arrived: a stream that reaches [DONE] with no finish_reason (a
           // truncating proxy, an interrupted server) must not resolve a partial reply as if finished.
-          if (!assembler.finished) { reject(new Error("local LLM stream ended before completion")); return; }
+          if (!assembler.finished) {
+            reject(assembler.error !== undefined ? new LocalChatStreamError(JSON.stringify({ error: assembler.error })) : new Error("local LLM stream ended before completion"));
+            return;
+          }
           resolve(assembler.result());
           return;
         }
         const text = Buffer.concat(chunks).toString("utf8");
         if (!ok) {
-          reject(new LocalChatHttpError(res.statusCode ?? 0, text, retryAfterMs(res.headers["retry-after"])));
+          reject(new LocalChatHttpError(res.statusCode ?? 0, text, retryAfterMs(res.headers["retry-after"]), headerRecord(res.headers)));
           return;
         }
         let parsed: unknown;

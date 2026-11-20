@@ -16,6 +16,8 @@ export function shouldStartLocalRace(input: {
 export function skippedProvider(assumptions: readonly string[] | undefined, provider: ReviewProvider): boolean {
   const rows = assumptions ?? [];
   if (provider === "local") return rows.some((a) => /^Skipped local/i.test(a));
+  // Anchored: a Codex note never reads as another provider's skip, nor theirs as Codex's.
+  if (provider === "codex") return rows.some((a) => /^Skipped codex\b/i.test(a));
   return rows.some((a) => new RegExp(`Skipped ${provider}`, "i").test(a));
 }
 

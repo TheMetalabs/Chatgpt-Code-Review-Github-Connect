@@ -114,3 +114,18 @@ test("every Codex setting is on the Settings screen and in its save request", ()
   }
   assert.match(screen, /Cooling down until/, "the cooldown status is shown read-only");
 });
+
+test("review_codex sits with the other reviewer toggles, so Codex can be turned on as the only reviewer from the top list", () => {
+  const screen = source("src/routes/settings.tsx");
+  const list = screen.match(
+    /<Toggle label="review_chatgpt"[\s\S]*?<\/div>/,
+  )?.[0];
+  assert.ok(list, "the reviewer toggle list is on the screen");
+  for (const p of ["review_chatgpt", "review_grok", "review_local", "review_codex"])
+    assert.ok(list.includes(`label="${p}"`), `${p} is in the reviewer toggle list`);
+  assert.match(
+    list,
+    /label="review_codex" checked=\{draft\.reviewCodex\} onChange=\{\(v\) => toggle\("reviewCodex", v\)\}/,
+    "the top toggle edits reviewCodex through the same last-reviewer guard as the others",
+  );
+});

@@ -208,6 +208,36 @@ test("usage limit mid-job beside a clean ChatGPT: Codex leaves the pinned list, 
   );
 });
 
+test("Codex as the only reviewer: nothing is offered to the bridge, and its finding is posted on its own", async (t) => {
+  const app = await codexApp(t, { reviewChatgpt: false });
+  const out = await app.mention("codex-only-review");
+  await codexSent(app);
+  assert.deepEqual([...job(app, out.jobId).reviewProviders], ["codex"]);
+  assert.equal(app.bridge.takeNextBridgeJob("fixture-client"), null, "no chat leg to offer");
+  sse(app.codexResponses[0], dirty);
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(app.reviews.length, 1);
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 p2=0/);
+  assert.match(app.reviews[0].comments[0].body, /answer is off by one/);
+  assert.equal(app.localRequests.length, 0);
+  assert.equal(app.codexRequests.length, 1);
+});
+
+test("Codex as the only reviewer: a clean reply posts a clean, converged review", async (t) => {
+  const app = await codexApp(t, { reviewChatgpt: false });
+  const out = await app.mention("codex-only-clean");
+  await codexSent(app);
+  sse(app.codexResponses[0], clean);
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(app.reviews.length, 1);
+  assert.ok(isConvergedFindings(app.reviews[0].body), "a clean Codex-only review converges");
+  assert.equal(done.noReviewAttempt ?? false, false);
+});
+
 test("Codex alone hitting its usage limit is never a clean review; during the cooldown a Codex-only job is a failed attempt", async (t) => {
   const app = await codexApp(t, { reviewChatgpt: false });
   const out = await app.mention("codex-only-quota");

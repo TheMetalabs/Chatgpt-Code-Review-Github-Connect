@@ -313,10 +313,11 @@ export function Settings() {
             onChange={(v) => patch({ precisionOverRecall: v })}
           />
         </div>
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2">
           <Toggle label="review_chatgpt" checked={draft.reviewChatgpt} onChange={(v) => toggle("reviewChatgpt", v)} />
           <Toggle label="review_grok" checked={draft.reviewGrok} onChange={(v) => toggle("reviewGrok", v)} />
           <Toggle label="review_local" checked={draft.reviewLocal} onChange={(v) => toggle("reviewLocal", v)} />
+          <Toggle label="review_codex" checked={draft.reviewCodex} onChange={(v) => toggle("reviewCodex", v)} />
         </div>
         <Field label="local_review_role">
           <Toggle

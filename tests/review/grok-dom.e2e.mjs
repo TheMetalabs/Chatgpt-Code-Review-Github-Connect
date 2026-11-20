@@ -1086,7 +1086,7 @@ test('grok: leading UI labels ("Grok", "×15 JSON", "×5") are not part of the a
   const prose = await openGrok(t, `<main><div data-testid="assistant-message" id="response-answer-B" role="article"><p>JSON parsing looks fine here.</p></div></main>${COMPOSER}`);
   assert.deepEqual(await prose.evaluate(() => assistantCorpus()), ['JSON parsing looks fine here.']);
 });
-test('grok: the review JSON is read from the code block literally, including the tail a folded block hides', async t => {
+test('both providers read review JSON from the code block literally, including a folded tail', async t => {
   const full = JSON.stringify({findings: [{severity: 'P1', file: 'a.ts', line: 1, title: 'say \\"hi\\"', evidence: 'x'}], merge_recommendation: 'REQUEST_CHANGES'}, null, 2);
   const lines = full.split('\n'), head = lines.slice(0, 4).join('\n'), tail = lines.slice(4).join('\n');
   const esc = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -1100,7 +1100,8 @@ test('grok: the review JSON is read from the code block literally, including the
     return {grok, chatgpt: harvestJson({allowThin: true})};
   });
   assert.equal(JSON.parse(read.grok).merge_recommendation, 'REQUEST_CHANGES', 'Grok reads the whole block');
-  assert.equal(read.chatgpt, null, 'ChatGPT keeps reading the rendered corpus, which shows only the head');
+  assert.equal(JSON.parse(read.chatgpt).merge_recommendation, 'REQUEST_CHANGES', 'ChatGPT reads the whole block');
+  assert.deepEqual(JSON.parse(read.chatgpt).findings, JSON.parse(read.grok).findings);
 });
 
 test('grok: the incomplete-answer settle clock belongs to one run and one response, not to the text alone', async t => {

@@ -107,3 +107,24 @@ test('review on the 2026-09 unit DOM: the sent turn is confirmed, the fenced JSO
  await tab.page.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),unitTurn({turn:1,id:'user-B',text:'my own question'}));
  assert.deepEqual(verdict(await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL})),{canClose:false,reason:'repurposed',cause:'user_turn'});
 });
+
+test('ChatGPT harvests a folded clean review code block, including investigated_safe in its hidden tail',async t=>{
+ const tab=await unitTab(t);
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(3000);
+ const full=JSON.stringify({findings:[],merge_recommendation:'APPROVE',investigated_safe:['a.ts: reviewed and safe'],coverage:[{file:'a.ts',status:'cleared',reason:'constant change'}]},null,2);
+ await renderUnitAnswer(tab.page,unitAnswer({code:full.slice(0,18)}),{done:false});await tab.page.clock.runFor(1600);
+ await tab.page.evaluate(({full,actions})=>{
+  document.querySelector('[data-testid="stop-button"]').remove();
+  const code=document.querySelector('#code');code.innerHTML='';
+  const shown=document.createElement('span');shown.textContent=full.slice(0,full.indexOf('"investigated_safe"'));
+  const tail=document.createElement('span');tail.hidden=true;tail.dataset.tail='';tail.textContent=full.slice(full.indexOf('"investigated_safe"'));
+  code.append(shown,tail);
+  const expand=document.createElement('button');expand.type='button';expand.setAttribute('aria-expanded','false');expand.textContent='더 보기';
+  code.closest('[data-markdown-copy="code-block"]').append(expand);
+  document.querySelector('[data-fixture-blocks]').insertAdjacentHTML('afterend',actions);
+ },{full,actions:unitAnswer({code:full}).actions});
+ await tab.page.clock.runFor(3200);
+ const raw=await tab.page.evaluate(()=>harvestJson({allowThin:true}));
+ assert.ok(raw,'ChatGPT code-block harvest returned no review JSON');
+ assert.deepEqual(JSON.parse(raw),JSON.parse(full));
+});

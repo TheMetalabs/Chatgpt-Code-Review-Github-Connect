@@ -378,3 +378,17 @@ test('a ChatGPT reply cut off after its findings, no finding, is never a clean p
   assert.equal(isZeroFindings(body, {authoredByBot: true}), false);
   assert.ok(job.incompleteProviders?.includes('chatgpt') || job.rawCauses?.chatgpt, 'the cut-off leg is flagged, not credited');
 });
+
+test('ChatGPT fenced raw JSON with a recovered empty verdict earns clean credit only when coverage is the cut', async t => {
+  const text = `ChatGPT\n\`\`\`json\n{"merge_recommendation":"APPROVE","findings":[],"investigated_safe":["a.ts: reviewed and safe"],"coverage":[{"file":"a.ts","status":"cleared","reason":"constant change"},{"file":"b.ts","status":"cleared","reason":"cut`;
+  for (const read of [classifyReviewText, ext.classifyReviewText]) {
+    const out = read(text);
+    assert.equal(out.status, 'recovered-truncated');
+    assert.equal(JSON.parse(out.json).truncated, true);
+  }
+  assert.equal(JSON.parse(extractChatJsonRecovering(text)).findings.length, 0);
+  const {body, job} = await bridgeRound(t, 'raw-chatgpt-recovered-clean', [{provider: 'chatgpt', raw: text, originalText: text}], {grok: false});
+  assert.equal(body.split('\n')[0], CLEAN_REVIEW_BODY);
+  assert.equal(isZeroFindings(body, {authoredByBot: true}), true);
+  assert.deepEqual([...job.coverageCutProviders], ['chatgpt']);
+});

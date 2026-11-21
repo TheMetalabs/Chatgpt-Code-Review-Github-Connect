@@ -1,5 +1,5 @@
 import type { Job, LocalReviewRole, ReviewProvider, ProviderError } from "./types.ts";
-import { isChatProvider } from "./types.ts";
+import { isChatProvider, isPrimaryProvider } from "./types.ts";
 import { salvageReviewJson } from "./extract-chat-json.ts";
 
 export function shouldStartLocalRace(input: {
@@ -47,12 +47,14 @@ export function stillRacing(input: {
 }
 
 // settings.localReviewRole = "verify-clean" (pinned on the job at snapshot as Job.localReviewRole):
-// the chat reviewers run first, local is held back and is "released" either as a verification round
-// (merged chat result parsed clean) or as today's fallback (chat produced no usable result).
+// the primary reviewers (chat and Codex: isPrimaryProvider) run first, local is held back and is
+// "released" either as a verification round (merged primary result parsed clean) or as today's
+// fallback (no primary produced a usable result).
 
-/** Local is a verifier only when the job's role says so AND both a chat reviewer and local are enabled. */
+/** Local is a verifier only when the job's role says so AND both a primary reviewer (chat or Codex)
+ * and local are enabled. */
 export function localVerifies(input: { role?: LocalReviewRole; providers: readonly ReviewProvider[] }): boolean {
-  return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
+  return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isPrimaryProvider);
 }
 
 /** A stored local leg is a usable complete verdict for fallback delivery only when its raw is review
@@ -191,8 +193,11 @@ export function shouldStartLocalLeg(input: {
   return shouldStartLocalRace(input);
 }
 
-/** Chat finished without a usable result (quota / disconnected / no JSON), or it is stalled with no
- * progress because the Chrome bridge is offline / never claimed the job: release local as the fallback. */
+/** No primary reviewer can still produce a usable verdict: chat finished without a usable result
+ * (quota / disconnected / no JSON) or is stalled with no progress because the Chrome bridge is
+ * offline / never claimed the job, and Codex (when pinned) has ended without one too: release local
+ * as the fallback. A Codex leg still running holds the release back whatever chat does (no bridge
+ * stall applies to it): it may still return the verdict local verifies. */
 export function releaseLocalAsFallback(input: {
   role?: LocalReviewRole;
   providers: readonly ReviewProvider[];
@@ -201,8 +206,30 @@ export function releaseLocalAsFallback(input: {
   usableChat: boolean;
   /** chatStalled(): chat is nominally racing but cannot progress (bridge offline / job unclaimed). */
   chatStalled?: boolean;
+  /** A non-chat primary (Codex) is still racing. */
+  codexRacing?: boolean;
+  /** A non-chat primary (Codex) has a payload to judge. */
+  usableCodex?: boolean;
 }): boolean {
-  return localVerifies(input) && !input.localReleased && !input.usableChat && (!input.chatRacing || Boolean(input.chatStalled));
+  if (!localVerifies(input) || input.localReleased || input.usableChat || input.usableCodex || input.codexRacing) return false;
+  return !input.chatRacing || Boolean(input.chatStalled);
+}
+
+/** verify-clean: the chat legs are stalled (chatStalled: the bridge offline past its grace, no chat
+ * progress) while Codex has finished with a payload to judge. The fallback must not replace that
+ * payload (releaseLocalAsFallback), and stillRacing still counts a stalled chat leg as running, so
+ * without this the job would wait on chat forever: the stalled chat legs are settled as an explicit
+ * skip instead, and Codex's payload is judged (findings post; a clean result starts the verification
+ * round, Codex standing in for the canonical chat leg). */
+export function settleStalledChat(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  chatStalled?: boolean;
+  codexRacing?: boolean;
+  usableCodex?: boolean;
+}): boolean {
+  return localVerifies(input) && !input.localReleased && Boolean(input.chatStalled) && !input.codexRacing && Boolean(input.usableCodex);
 }
 
 /** A held verify-clean chat leg that has made no progress (no payload, not generating) while the

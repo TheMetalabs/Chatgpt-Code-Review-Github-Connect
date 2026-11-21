@@ -145,7 +145,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     case "unverified-clean":
       return capReviewBody(cleanBody(job, parts));
     case "incomplete":
-      return capReviewBody(incompleteBody(parts));
+      return capReviewBody(incompleteBody(parts, job));
     default: {
       const unhandled: never = outcome;
       return unhandled;
@@ -253,9 +253,18 @@ function coverageCutBlock(p: SummaryParts): string {
   return `\n**Coverage incomplete** — ${who}'s reply was cut off after its verdict: its findings list arrived complete and empty, but its coverage list did not finish, so the files it had not reached are not cleared.${reply}`;
 }
 
-function incompleteBody(p: SummaryParts): string {
+/** The first line names who did not finish. It reads "ChatGPT/Grok" (the fixed chat wording) unless
+ * Codex is among the reviewers that were skipped or returned no complete review; then it names those
+ * reviewers (e.g. "Codex", "ChatGPT and Codex"). */
+function incompleteBody(p: SummaryParts, job: SummaryJob): string {
+  const unfinished = [...new Set([...(job.skippedProviders ?? []), ...(job.incompleteProviders ?? []), ...auxiliaryFailed(job)])];
+  const NAME: Record<ReviewProvider, string> = { chatgpt: "ChatGPT", grok: "Grok", local: "Local LLM", codex: "Codex" };
+  const names = unfinished.filter((p) => Object.hasOwn(NAME, p)).map((p) => NAME[p]);
+  const who = unfinished.includes("codex")
+    ? names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0]
+    : "ChatGPT/Grok";
   return `${REVIEW_SUMMARY_MARK}
-ChatGPT/Grok did not finish a full review.
+${who} did not finish a full review.
 ${p.noteLine}
 ${p.skipped.map((s) => `- ${s}`).join("\n")}
 
@@ -297,13 +306,18 @@ function reviewersLine(job: SummaryJob): string {
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   if (job.localFallbackAt) return fallbackReviewersLine(job, chat, providers.includes("local"));
+  const hasCodex = providers.includes("codex");
+  // verify-clean: Codex is a primary reviewer like chat, so local verifies its clean result too (beside
+  // chat: the merged chat + Codex result, which is clean only when both are).
+  const verified = chat.length && hasCodex ? "merged chat + Codex" : chat.length ? "chat" : hasCodex ? "Codex" : "";
   const local = !providers.includes("local")
     ? ""
-    : job.localReviewRole === "verify-clean" && chat.length
-      ? " Local LLM verifies a clean chat result."
+    : job.localReviewRole === "verify-clean" && verified
+      ? ` Local LLM verifies a clean ${verified} result.`
       : " Local LLM is fallback if Chrome does not return.";
-  const codex = providers.includes("codex") ? " Codex reviewed the same snapshot." : "";
-  return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}${codex}`;
+  const codex = hasCodex ? " Codex reviewed the same snapshot." : "";
+  // No chat reviewer: the line starts with local's (or Codex's) sentence, without its leading space.
+  return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}${codex}`.trimStart();
 }
 
 /** A fallback release exists only because chat did not return, so the line names what actually ran:

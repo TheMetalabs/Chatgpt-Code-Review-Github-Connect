@@ -25,6 +25,13 @@ changed file is outside the allowlist below.
 > `SummaryJob` / `reviewSummaryBody` / `reviewersLine`, `ops-comment.ts` `buildOpsComment`, scoped by
 > declaration; `jobs.$id.tsx` provider record) and a fixed usage-limit note. The bridge and the
 > extension never see the provider (`isChatProvider` is unchanged).
+>
+> **Codex as a verify-clean primary.** Under `localReviewRole=verify-clean` Codex is a primary
+> reviewer like chat (`isPrimaryProvider`): local verifies a clean Codex result and is the fallback
+> once no primary can deliver. The change sits in `local-fallback.ts` / `harbor.server.ts` and the
+> reviewer-line text (`types.ts`, `review-format.ts` `reviewersLine`, Settings help); the bridge, the
+> extension and race mode are untouched. `docs/local-verify-clean.md` is allowlisted for it and the
+> reviewer-line tests (`ops-comment.test.ts`, `review-format.test.ts`) are scoped to added cases.
 
 ## Why
 

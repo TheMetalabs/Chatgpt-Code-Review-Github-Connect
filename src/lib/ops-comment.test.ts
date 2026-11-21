@@ -25,6 +25,17 @@ describe("buildOpsComment", () => {
     assert.equal(header(), "Reviewers: chatgpt (Chrome); local verifies a clean result.");
   });
 
+  it("verify-clean with Codex pinned: Codex reviews first beside chat and local verifies; race is unchanged", () => {
+    const header = (providers: ("chatgpt" | "local" | "codex")[], role: "race" | "verify-clean", localFallback?: boolean) =>
+      buildOpsComment({ phase: "running", providers, role, localFallback, notes: [] })
+        .split("\n").find((l) => l.startsWith("Reviewers:"));
+    assert.equal(header(["local", "codex"], "verify-clean"), "Reviewers: codex; local verifies a clean result.");
+    assert.equal(header(["chatgpt", "local", "codex"], "verify-clean"), "Reviewers: chatgpt (Chrome); codex; local verifies a clean result.");
+    assert.equal(header(["local", "codex"], "verify-clean", true), "Reviewers: codex; local runs as the fallback.");
+    assert.equal(header(["local", "codex"], "race"), "Reviewers: local only; codex racing.");
+    assert.equal(header(["chatgpt", "local", "codex"], "race"), "Reviewers: chatgpt (Chrome); local racing; codex racing.");
+  });
+
   it("does not mention Grok when the setting is off", () => {
     const body = buildOpsComment({
       phase: "running",

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { canReleaseHeldLocal, chatStalled, skippedProvider, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
+import { canReleaseHeldLocal, chatStalled, skippedProvider, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, settleStalledChat, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
 import { isPrimaryProvider, type ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -496,5 +496,17 @@ describe("verify-clean: Codex is a primary reviewer", () => {
     assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true, chatStalled: true, codexRacing: true }), false, "a bridge stall never ends the wait on Codex");
     assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true, chatStalled: true }), true, "stalled chat, Codex ended: fallback");
     assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true }), false, "chat still running");
+  });
+
+  it("settleStalledChat: stalled chat beside a finished Codex payload is settled so that payload is judged", () => {
+    const v = { role: "verify-clean" as const, providers: all, localReleased: false };
+    assert.equal(settleStalledChat({ ...v, chatStalled: true, usableCodex: true }), true);
+    assert.equal(settleStalledChat({ ...v, chatStalled: true, usableCodex: true, codexRacing: true }), false, "Codex still running");
+    assert.equal(settleStalledChat({ ...v, chatStalled: false, usableCodex: true }), false, "chat may still deliver");
+    assert.equal(settleStalledChat({ ...v, chatStalled: true, usableCodex: false }), false, "no payload: releaseLocalAsFallback decides");
+    assert.equal(settleStalledChat({ ...v, localReleased: true, chatStalled: true, usableCodex: true }), false);
+    assert.equal(settleStalledChat({ ...v, role: "race", chatStalled: true, usableCodex: true }), false, "race is unchanged");
+    // The fallback stays held in that case: the payload is judged, never replaced.
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: false, chatStalled: true, usableCodex: true }), false);
   });
 });

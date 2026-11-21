@@ -17,9 +17,17 @@ racing, Codex included: a chat leg at its usage limit never releases local while
 still running (a bridge stall ends the wait on chat only). With chat + Codex the two merge as today
 (the browser chat provider stays canonical); with the canonical chat leg unavailable, a complete
 Codex verdict stands in for it exactly as another chat leg's would. A Codex usage limit or Codex
-turned off still takes Codex off the job's pinned reviewers; when it was the last primary, local is
-released as the fallback in the same transaction (`codexLeftFallback`), never left held and never a
-Codex-only failed attempt. Race is unchanged: Codex races local and chat.
+turned off still takes Codex off the job's pinned reviewers while another primary remains (so it never
+blocks their clean convergence); when it was the last primary, Codex stays pinned as a skipped
+reviewer and local is released as the fallback in the same transaction (`codexLastPrimary`): never
+left held, never a Codex-only failed attempt, and, as after a chat usage limit, a clean local result
+posts `incomplete`. A chat leg stalled past the bridge grace beside a finished Codex payload is
+settled as an explicit skip (`settleStalledChat`) so that payload is judged instead of waiting on the
+bridge. A Codex reply that is not review JSON beside the canonical chat reviewer is an auxiliary
+failure, exactly like a broken Grok leg: the chat verdict still goes to local verification, never
+clean. Codex requests run one at a time process-wide and a request's timeout starts only once it
+holds that slot, so a queued Codex request delays the verification round or the fallback until it
+has run. Race is unchanged: Codex races local and chat.
 
 ## §1 Review outcome — one closed enum
 
@@ -194,6 +202,7 @@ It is called only on an **explicit terminal signal** of the chat round:
 | Chat's only result is a findings=0 pre-gate salvage (`rawCauses` = `unparseable`, including `salvaged_no_repair` after a failed JSON repair): not a complete structured verdict, never CONVERGED | fallback | `submitHarborChat` |
 | Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload, and no Codex leg is still running or holds a payload | fallback | watcher |
 | Codex, the last primary, left the job (usage limit, turned off) | fallback | `endCodexForQuota` / `endDisabledCodexLegs` |
+| Chat stalled past the bridge grace beside a finished Codex payload: chat is settled as skipped, then the payload is judged (`verify` or post) | verification round or none | watcher (`settleStalledChat`) |
 | The job's Chrome bridge link reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
 
 The link is `chatBridgeLink` in `bridge.server.ts`. A job no Chrome profile has claimed uses the

@@ -130,7 +130,8 @@ const SCOPED = {
   "src/lib/fix-agent.ts": { declarations: ["RequestFix"] },
   // Provider enumeration only: codex label/loop. Merge and posting semantics are unchanged.
   "src/lib/poster.ts": { declarations: ["disputedFromUnique"] },
-  "src/lib/review-format.ts": { declarations: ["SummaryJob", "reviewSummaryBody", "reviewersLine"] },
+  // incompleteBody: its first line names Codex when Codex did not finish (chat-only wording unchanged).
+  "src/lib/review-format.ts": { declarations: ["SummaryJob", "reviewSummaryBody", "reviewersLine", "incompleteBody"] },
   "src/lib/ops-comment.ts": { declarations: ["buildOpsComment"] },
   // verify-clean with Codex as a primary reviewer: new reviewer-line cases only; no existing line may change.
   "src/lib/ops-comment.test.ts": { additionsOnly: true },

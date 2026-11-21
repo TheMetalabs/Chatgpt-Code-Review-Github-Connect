@@ -215,6 +215,23 @@ export function releaseLocalAsFallback(input: {
   return !input.chatRacing || Boolean(input.chatStalled);
 }
 
+/** verify-clean: the chat legs are stalled (chatStalled: the bridge offline past its grace, no chat
+ * progress) while Codex has finished with a payload to judge. The fallback must not replace that
+ * payload (releaseLocalAsFallback), and stillRacing still counts a stalled chat leg as running, so
+ * without this the job would wait on chat forever: the stalled chat legs are settled as an explicit
+ * skip instead, and Codex's payload is judged (findings post; a clean result starts the verification
+ * round, Codex standing in for the canonical chat leg). */
+export function settleStalledChat(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  chatStalled?: boolean;
+  codexRacing?: boolean;
+  usableCodex?: boolean;
+}): boolean {
+  return localVerifies(input) && !input.localReleased && Boolean(input.chatStalled) && !input.codexRacing && Boolean(input.usableCodex);
+}
+
 /** A held verify-clean chat leg that has made no progress (no payload, not generating) while the
  * bridge has been disconnected for at least `graceMs`, measured from the moment it disconnected
  * (never from job age). A connected bridge never releases local by time: BRIDGE_CLAIM_MS is an

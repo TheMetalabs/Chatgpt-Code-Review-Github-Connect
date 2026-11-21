@@ -29,8 +29,22 @@ describe("review-format", () => {
         [{ ...FINDING_412, id: "f1" }],
         "ashlar-bot",
       );
-    assert.match(body(["local", "codex"]), /\n ?Local LLM verifies a clean Codex result\. Codex reviewed the same snapshot\.\n/);
-    assert.match(body(["chatgpt", "local", "codex"]), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat or Codex result\. Codex reviewed the same snapshot\.\n/);
+    assert.match(body(["local", "codex"]), /\nLocal LLM verifies a clean Codex result\. Codex reviewed the same snapshot\.\n/);
+    assert.match(body(["chatgpt", "local", "codex"]), /\nchatgpt ran in parallel\. Local LLM verifies a clean merged chat \+ Codex result\. Codex reviewed the same snapshot\.\n/);
+  });
+
+  it("an incomplete body names Codex when it did not finish; the chat-only wording is unchanged", () => {
+    const first = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local", "codex"], localReviewRole: "verify-clean", localFallbackAt: 1, assumptions: [], coverage: [], ...patch },
+        [],
+        "ashlar-bot",
+      ).split("\n")[1];
+    assert.equal(first({ skippedProviders: ["codex"] }), "Codex did not finish a full review.");
+    assert.equal(first({ skippedProviders: ["chatgpt", "codex"] }), "ChatGPT and Codex did not finish a full review.");
+    assert.equal(first({ incompleteProviders: ["codex"], skippedProviders: ["chatgpt"] }), "ChatGPT and Codex did not finish a full review.");
+    assert.equal(first({ skippedProviders: ["chatgpt"] }), "ChatGPT/Grok did not finish a full review.");
+    assert.equal(first({ reviewProviders: ["chatgpt", "grok", "local"], skippedProviders: ["grok"] }), "ChatGPT/Grok did not finish a full review.");
   });
 
   it("a fallback release names only the chat reviewers that ran, never a skipped one as running in parallel", () => {

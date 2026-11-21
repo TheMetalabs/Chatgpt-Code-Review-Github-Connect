@@ -341,7 +341,9 @@ function chatgptQuota(app, jobId) {
   );
 }
 
-test("verify-clean: ChatGPT at its usage limit and a clean Codex reply still release local as the fallback", async (t) => {
+// verify-clean: Codex is a primary reviewer like chat. It runs first with chat; local verifies a clean
+// merged primary result, or runs as the fallback once no primary can still produce a usable verdict.
+test("verify-clean: ChatGPT at its usage limit and a clean Codex reply: local verifies Codex's clean result before anything posts", async (t) => {
   const app = await verifyCleanApp(t);
   const out = await app.mention("verify-codex-clean");
   await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
@@ -349,40 +351,253 @@ test("verify-clean: ChatGPT at its usage limit and a clean Codex reply still rel
   assert.equal(app.localRequests.length, 0, "local is held back in verify-clean");
   chatgptQuota(app, out.jobId);
   sse(app.codexResponses[0], clean);
-  await eventually(() => app.localRequests.length === 1, "local runs as the fallback");
-  assert.ok(job(app, out.jobId).localFallbackAt, "released as the fallback");
+  await eventually(() => app.localRequests.length === 1, "local runs as the verifier");
+  assert.ok(job(app, out.jobId).localVerifyStartedAt, "released as the verification round");
+  assert.equal(job(app, out.jobId).localFallbackAt, undefined, "not as the fallback: Codex returned a usable verdict");
   assert.equal(app.reviews.length, 0, "nothing posted before local");
   localReply(app.localResponses[0], clean);
   await ended(app, out.jobId);
   const done = job(app, out.jobId);
   assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.localVerified, true);
+  assert.equal(done.canonicalProvider, "codex", "Codex stands in for the ChatGPT leg at its usage limit");
   assert.match(done.plan, /Schema-merged .*codex/);
   assert.match(done.plan, /Schema-merged .*local/);
+  assert.match(app.reviews[0].body, /codex found nothing; local verification agreed\./);
+  assert.ok(isConvergedFindings(app.reviews[0].body), "verified clean");
 });
 
-test("verify-clean: ChatGPT at its usage limit while Codex is still running releases local at once", async (t) => {
+test("verify-clean: ChatGPT at its usage limit while Codex is still running: local waits for Codex, and Codex's finding posts without local", async (t) => {
   const app = await verifyCleanApp(t);
   const out = await app.mention("verify-codex-running");
   await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
   await codexSent(app);
   chatgptQuota(app, out.jobId);
-  await eventually(
-    () => app.localRequests.length === 1,
-    "local runs as the fallback while Codex runs",
-  );
-  assert.equal(app.codexResponses[0].writableEnded, false, "Codex is still in flight");
-  localReply(app.localResponses[0], clean);
   await new Promise((r) => setTimeout(r, 150));
-  assert.equal(job(app, out.jobId).status, "awaiting_chat", "the merge waits for Codex");
+  assert.equal(app.localRequests.length, 0, "no local request while Codex, a primary reviewer, still runs");
+  assert.equal(job(app, out.jobId).localFallbackAt, undefined);
+  assert.equal(job(app, out.jobId).status, "awaiting_chat");
   sse(app.codexResponses[0], dirty);
   await ended(app, out.jobId);
   const done = job(app, out.jobId);
   assert.equal(done.status, "posted", done.githubError || done.plan);
-  assert.match(
-    app.reviews[0].body,
-    /ashlar-findings total=1 /,
-    "Codex's finding is merged with local's verdict",
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 /, "Codex's finding is posted");
+  assert.equal(app.localRequests.length, 0, "findings: no verification round");
+  assert.equal(done.localVerifyStartedAt, undefined);
+  assert.equal(done.localFallbackAt, undefined);
+});
+
+test("verify-clean: a clean Codex reply that lands before ChatGPT hits its usage limit is verified by local, never replaced by the fallback", async (t) => {
+  const app = await verifyCleanApp(t);
+  const out = await app.mention("verify-codex-first");
+  await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
+  await codexSent(app);
+  sse(app.codexResponses[0], clean);
+  await eventually(
+    () => (job(app, out.jobId)?.storedLegs ?? []).some((l) => l.provider === "codex"),
+    "the Codex leg is stored while ChatGPT still runs",
   );
+  assert.equal(app.localRequests.length, 0);
+  chatgptQuota(app, out.jobId);
+  await eventually(() => app.localRequests.length === 1, "local runs");
+  assert.ok(job(app, out.jobId).localVerifyStartedAt, "as the verifier of Codex's clean result");
+  assert.equal(job(app, out.jobId).localFallbackAt, undefined, "never as the fallback");
+  localReply(app.localResponses[0], clean);
+  await ended(app, out.jobId);
+  assert.equal(job(app, out.jobId).status, "posted");
+  assert.equal(job(app, out.jobId).localVerified, true);
+});
+
+/** verify-clean with local + Codex only (no chat reviewer). */
+async function localCodexApp(t) {
+  const app = await codexApp(t, {
+    reviewChatgpt: false,
+    reviewLocal: true,
+    localReviewRole: "verify-clean",
+    localJsonRepairEnabled: false,
+  });
+  app.env.ASHLAR_LOCAL_LLM_STREAM = "false";
+  return app;
+}
+async function localCodexJob(app, name) {
+  const out = await app.mention(name);
+  await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
+  await codexSent(app);
+  assert.deepEqual([...job(app, out.jobId).reviewProviders], ["local", "codex"]);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(app.localRequests.length, 0, "local is held back while Codex reviews first");
+  return out.jobId;
+}
+
+test("verify-clean, local + Codex: Codex's finding posts without running local, and local is not counted skipped or incomplete", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-findings");
+  assert.match(job(app, id).plan, /codex review first; local verifies a clean result/);
+  await eventually(
+    () => app.ops.some((b) => b.includes(id) && b.includes("Reviewers: codex; local verifies a clean result.")),
+    "the ops comment names local as the verifier",
+  );
+  sse(app.codexResponses[0], dirty);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(app.reviews.length, 1);
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 p2=0/);
+  assert.match(app.reviews[0].comments[0].body, /answer is off by one/);
+  assert.equal(app.localRequests.length, 0, "zero local requests");
+  assert.deepEqual([...(done.skippedProviders ?? [])], [], "local is not a skipped reviewer");
+  assert.deepEqual([...(done.incompleteProviders ?? [])], [], "nor an incomplete one");
+  assert.doesNotMatch(app.reviews[0].body, /ashlar-outcome incomplete/);
+  assert.equal(done.noReviewAttempt ?? false, false);
+});
+
+test("verify-clean, local + Codex: a clean Codex reply is held while local verifies, then posts verified clean", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-clean");
+  sse(app.codexResponses[0], clean);
+  await eventually(() => app.localRequests.length === 1, "local verification starts");
+  assert.ok(job(app, id).localVerifyStartedAt, "a verification round");
+  assert.deepEqual([...job(app, id).localVerifyChat], ["codex"]);
+  await eventually(
+    () => app.ops.some((b) => b.includes(id) && b.includes("The review found nothing; the local LLM is verifying before the review posts.")),
+    "the ops comment says local is verifying the clean result",
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(app.reviews.length, 0, "the clean Codex result is held");
+  assert.equal(job(app, id).status, "awaiting_chat");
+  localReply(app.localResponses[0], clean);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.localVerified, true);
+  const body = app.reviews[0].body;
+  assert.ok(body.startsWith("Didn't find any major issues."), body.slice(0, 200));
+  assert.match(body, /codex found nothing; local verification agreed\./);
+  assert.ok(isConvergedFindings(body), "verified clean converges");
+  assert.equal(app.codexRequests.length, 1);
+});
+
+test("verify-clean, local + Codex: Codex at its usage limit releases local as the fallback; the job posts from local", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-quota");
+  quota(app.codexResponses[0], { error: { type: "usage_limit_reached", resets_in_seconds: 3600 } });
+  await eventually(() => app.localRequests.length === 1, "local runs as the fallback");
+  const released = job(app, id);
+  assert.ok(released.localFallbackAt, "released as the fallback");
+  assert.equal(released.localVerifyStartedAt, undefined);
+  assert.deepEqual([...released.reviewProviders], ["local"]);
+  assert.deepEqual([...released.quotaEndedLegs], ["codex"]);
+  localReply(app.localResponses[0], dirty);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.noReviewAttempt ?? false, false, "not a failed attempt: local is pinned");
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 /, "local's finding is posted");
+  assert.match(app.reviews[0].body, /Codex skipped \(usage limit/);
+  assert.match(done.plan, /Schema-merged local/);
+});
+
+test("verify-clean, local + Codex: a Codex HTTP 500 releases local as the fallback, as a chat failure does", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-500");
+  app.codexResponses[0].writeHead(500, { "content-type": "text/plain" });
+  app.codexResponses[0].end("upstream exploded");
+  await eventually(() => app.localRequests.length === 1, "local runs as the fallback");
+  assert.ok(job(app, id).localFallbackAt, "released as the fallback");
+  assert.match(job(app, id).plan, /^Codex returned nothing usable; local runs as the fallback\./);
+  localReply(app.localResponses[0], clean);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.noReviewAttempt ?? false, false);
+  // As the chat-down fallback: the primary that returned nothing is a skipped reviewer, so not a clean pass.
+  assert.deepEqual([...done.skippedProviders], ["codex"]);
+  assert.ok(!isConvergedFindings(app.reviews[0].body), "a skipped primary is no clean pass");
+  assert.match(app.reviews[0].body, /ashlar-outcome incomplete/);
+});
+
+test("verify-clean, local + Codex: a Codex reply that is not review JSON releases local as the fallback; the reply posts as evidence", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-prose");
+  sse(app.codexResponses[0], "PROSE-MARK: I looked at a.ts and think the constant is wrong.");
+  await eventually(() => app.localRequests.length === 1, "local runs as the fallback");
+  assert.ok(job(app, id).localFallbackAt, "released as the fallback, not as a verifier");
+  assert.equal(job(app, id).localVerifyStartedAt, undefined);
+  assert.equal(app.reviews.length, 0, "nothing posted before local");
+  localReply(app.localResponses[0], clean);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  const body = app.reviews[0].body;
+  assert.match(body, /PROSE-MARK/, "Codex's reply posts verbatim");
+  assert.ok(!isConvergedFindings(body), "never a clean pass");
+  assert.match(done.plan, /Schema-merged .*codex/);
+  assert.match(done.plan, /Schema-merged .*local/);
+});
+
+test("verify-clean, ChatGPT + Codex + local: a clean ChatGPT beside Codex's finding posts without local", async (t) => {
+  const app = await verifyCleanApp(t);
+  const out = await app.mention("mixed-findings");
+  await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
+  await codexSent(app);
+  assert.equal((await chatgpt(app, out.jobId, clean)).ok, true);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(job(app, out.jobId).status, "awaiting_chat", "the merge waits for Codex");
+  assert.equal(app.localRequests.length, 0);
+  sse(app.codexResponses[0], dirty);
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 /);
+  assert.equal(app.localRequests.length, 0, "findings: no verification round");
+  assert.equal(done.canonicalProvider, "chatgpt", "the browser chat provider stays canonical");
+  assert.deepEqual([...(done.skippedProviders ?? [])], []);
+});
+
+test("verify-clean, ChatGPT + Codex + local: clean ChatGPT and clean Codex are verified by local", async (t) => {
+  const app = await verifyCleanApp(t);
+  const out = await app.mention("mixed-clean");
+  await eventually(() => job(app, out.jobId)?.status === "awaiting_chat", "snapshot ready");
+  await codexSent(app);
+  sse(app.codexResponses[0], clean);
+  await eventually(
+    () => (job(app, out.jobId)?.storedLegs ?? []).some((l) => l.provider === "codex"),
+    "the Codex leg is stored",
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(app.localRequests.length, 0, "ChatGPT is still a racing primary");
+  assert.equal((await chatgpt(app, out.jobId, clean)).ok, true);
+  await eventually(() => app.localRequests.length === 1, "local verification starts");
+  assert.deepEqual([...job(app, out.jobId).localVerifyChat], ["chatgpt", "codex"]);
+  assert.equal(app.reviews.length, 0, "held while local verifies");
+  localReply(app.localResponses[0], clean);
+  await ended(app, out.jobId);
+  const done = job(app, out.jobId);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.localVerified, true);
+  assert.equal(done.canonicalProvider, "chatgpt");
+  assert.match(app.reviews[0].body, /chatgpt \+ codex found nothing; local verification agreed\./);
+  assert.ok(isConvergedFindings(app.reviews[0].body));
+});
+
+test("verify-clean, local + Codex: turning Codex off mid-flight releases local as the fallback", async (t) => {
+  const app = await localCodexApp(t);
+  const id = await localCodexJob(app, "lc-off");
+  app.harbor.patchHarborSettings({ reviewCodex: false });
+  await eventually(
+    () => app.codexResponses[0].req.destroyed || app.codexResponses[0].destroyed,
+    "the Codex request was aborted",
+  );
+  await eventually(() => app.localRequests.length === 1, "local runs as the fallback");
+  assert.ok(job(app, id).localFallbackAt, "released as the fallback");
+  assert.deepEqual([...job(app, id).reviewProviders], ["local"]);
+  localReply(app.localResponses[0], dirty);
+  await ended(app, id);
+  const done = job(app, id);
+  assert.equal(done.status, "posted", done.githubError || done.plan);
+  assert.equal(done.noReviewAttempt ?? false, false);
+  assert.match(app.reviews[0].body, /ashlar-findings total=1 /);
+  assert.equal(app.codexRequests.length, 1);
 });
 
 test("turning Codex off in Settings aborts its running leg; the job finishes with the others (clean stays clean)", async (t) => {

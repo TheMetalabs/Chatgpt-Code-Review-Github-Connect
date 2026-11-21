@@ -321,13 +321,13 @@ export function Settings() {
         </div>
         <Field label="local_review_role">
           <Toggle
-            label="local verifies a clean chat result"
+            label="local verifies a clean chat / Codex result"
             checked={draft.localReviewRole === "verify-clean"}
             onChange={(v) => patch({ localReviewRole: v ? "verify-clean" : "race" })}
           />
           <p className="mt-2 text-[12px] text-fg-subtle">
-            Run chat reviewers first; when they find nothing, the local LLM runs a final verification round.
-            Off (default): local races the chat reviewers. If chat fails, local still runs as the fallback.
+            Run the chat reviewers and Codex first; when they find nothing, the local LLM runs a final verification round.
+            Off (default): local races them. If they all fail, local still runs as the fallback.
           </p>
         </Field>
         <Field label="local_review.pipeline">

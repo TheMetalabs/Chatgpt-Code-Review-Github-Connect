@@ -70,6 +70,7 @@ import {
   BRIDGE_CONNECTED_MS,
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
+  isPrimaryProvider,
   normalizeReviewOrder,
   providersFromSettings,
 } from "./types";
@@ -225,10 +226,15 @@ function endDisabledCodexLegs() {
     if (job.status !== "awaiting_chat" || !(job.reviewProviders ?? []).includes("codex")) continue;
     if ((job.storedLegs ?? []).some((l) => l.provider === "codex" && l.raw.trim())) continue;
     const now = Date.now();
+    let fallbackPrompt: string | undefined;
     transitionJob(job.id, (j) => {
       if (j.status !== "awaiting_chat") return j;
       const others = (j.reviewProviders ?? []).filter((p) => p !== "codex");
-      if (others.length) return { ...j, reviewProviders: others, generating: { ...j.generating, codex: false }, updatedAt: now };
+      if (others.length) {
+        const fallback = codexLeftFallback(j, others, "Codex was turned off");
+        fallbackPrompt = fallback.prompt;
+        return { ...j, ...fallback.patch, reviewProviders: others, generating: { ...j.generating, codex: false }, updatedAt: now };
+      }
       const message = "codex was turned off in settings";
       return { ...j, generating: { ...j.generating, codex: false },
         providerErrors: { ...j.providerErrors, codex: { code: "cancelled", message } },
@@ -236,7 +242,31 @@ function endDisabledCodexLegs() {
     });
     codexControllers.get(job.id)?.abort();
     codexPrompts.delete(job.id);
+    if (fallbackPrompt !== undefined) void kickLocalRace(job.id, fallbackPrompt);
   }
+}
+
+/** verify-clean: Codex leaves a job's pinned reviewers (usage limit, or turned off) while local is the
+ * pinned verifier. When Codex was the last primary reviewer, nothing is left for local to verify, so
+ * local is released as the fallback in the same transaction (the stamp releaseHeldLocal sets; the
+ * caller starts the leg with `prompt`): never held with nothing to wait on, and never a Codex-only
+ * failed attempt, because local is pinned. Otherwise (another primary remains, race, already
+ * released) nothing changes. */
+function codexLeftFallback(j: Job, others: readonly ReviewProvider[], why: string): { patch: Partial<Job>; prompt?: string } {
+  if (!localVerifies({ role: j.localReviewRole, providers: j.reviewProviders ?? [] })) return { patch: {} };
+  if (!others.includes("local") || others.some(isPrimaryProvider) || !canReleaseHeldLocal(j)) return { patch: {} };
+  const prompt = releaseLocalPrompt(j);
+  return {
+    patch: { localFallbackAt: Date.now(), localReleasePrompt: prompt, plan: `${why} before it returned a review; local runs as the fallback.` },
+    prompt,
+  };
+}
+
+/** How a release plan names a job's primary reviewers (verify-clean): chat, Codex, or both. */
+function primaryNames(providers: readonly ReviewProvider[]): string {
+  const chat = providers.some(isChatProvider);
+  const codex = providers.includes("codex");
+  return chat && codex ? "Chat reviewers and Codex" : codex ? "Codex" : "Chat reviewers";
 }
 
 /** The job's only pinned reviewer was Codex and it ended without running (usage limit, or turned off). */
@@ -751,10 +781,11 @@ async function watchReviewersLoop(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
-    // The fallback is decided on chat alone: a non-chat racer still running (Codex) must not hold back
-    // the local fallback once every chat reviewer is down.
-    const chatRacing = stillRacing({
-      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: fallbackWaivesChat(job) }).filter(isChatProvider),
+    // The fallback waits while any primary reviewer is still racing (verify-clean: chat and Codex alike).
+    // Chat and Codex are judged apart only because a bridge stall (`stalled`) ends the wait on chat,
+    // never on a Codex request that is still running.
+    const primaryRacing = (pick: (p: ReviewProvider) => boolean) => stillRacing({
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: fallbackWaivesChat(job) }).filter(pick),
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -763,21 +794,24 @@ async function watchReviewersLoop(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
+    const nonChatPrimary = (p: ReviewProvider) => isPrimaryProvider(p) && !isChatProvider(p);
     if (
       job.status === "awaiting_chat" &&
       releaseLocalAsFallback({
         role,
         providers: job.reviewProviders ?? [],
         localReleased,
-        chatRacing,
+        chatRacing: primaryRacing(isChatProvider),
         usableChat: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()),
         chatStalled: stalled,
+        codexRacing: primaryRacing(nonChatPrimary),
+        usableCodex: stored.some((l) => nonChatPrimary(l.provider) && l.raw.trim()),
       })
     ) {
-      // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
-      // as today's fallback, not as a verifier. Re-check at once only after a real release, so a
-      // release that did not apply can never spin this loop without its tick.
-      if (releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned nothing usable; local runs as the fallback.")) continue;
+      // No primary can still deliver (chat quota / disconnected / nothing returned, Codex failed):
+      // never lose the review — local runs as today's fallback, not as a verifier. Re-check at once
+      // only after a real release, so a release that did not apply can never spin this loop without its tick.
+      if (releaseHeldLocal(jobId, token, { kind: "fallback" }, `${primaryNames(job.reviewProviders ?? [])} returned nothing usable; local runs as the fallback.`)) continue;
     }
     if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
@@ -816,7 +850,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
       const note = localLegNote(job.providerProgress?.local, Date.now(), localStaleNoteMs());
       if (note) notes.push(note);
     }
-    if (job.localVerifyStartedAt) notes.push("Chat review found nothing; the local LLM is verifying before the review posts.");
+    if (job.localVerifyStartedAt) notes.push(`${(job.localVerifyChat ?? []).includes("codex") ? "The review" : "Chat review"} found nothing; the local LLM is verifying before the review posts.`);
     if (job.codexNote) notes.push(job.codexNote);
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
@@ -992,6 +1026,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
   recordReviewCoverage(jobId, prompt, sample, chatParts.sections);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
+  const primaryProviders = providers.filter(isPrimaryProvider);
   // Pinned once here like reviewProviders: a later settings change never alters a review in flight.
   const localReviewRole = state.settings.localReviewRole ?? "race";
   const verifier = localVerifies({ role: localReviewRole, providers });
@@ -1001,7 +1036,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     ...j,
     status: "awaiting_chat",
     plan: verifier
-      ? `Snapshot loaded. ${chatProviders.join(" + ")} review first; local verifies a clean result.`
+      ? `Snapshot loaded. ${primaryProviders.join(" + ")} review first; local verifies a clean result.`
       : providers.includes("codex")
       ? `Snapshot loaded. ${providers.join(" + ")} race in parallel. Schema-merge when each finishes.`
       : providers.includes("local")
@@ -1088,18 +1123,23 @@ function noteCodexStage(jobId: string, stage: CodexStage) {
 function endCodexForQuota(jobId: string, resetAt: number) {
   const note = codexQuotaNote(resetAt);
   const now = Date.now();
+  let fallbackPrompt: string | undefined;
   transitionJob(jobId, (j) => {
     if (j.status !== "awaiting_chat" || !(j.reviewProviders ?? []).includes("codex") || j.providerErrors?.codex) return j;
     const others = (j.reviewProviders ?? []).filter((p) => p !== "codex");
     const progress = { ...j.providerProgress, codex: { runId: `codex:${jobId}`, stage: "quota" as const, observedAt: now, receivedAt: now } };
     if (others.length) {
-      return { ...j, reviewProviders: others, generating: { ...j.generating, codex: false }, providerProgress: progress,
+      // verify-clean with Codex the last primary: local is released as the fallback in this transaction.
+      const fallback = codexLeftFallback(j, others, "Codex hit its usage limit");
+      fallbackPrompt = fallback.prompt;
+      return { ...j, ...fallback.patch, reviewProviders: others, generating: { ...j.generating, codex: false }, providerProgress: progress,
         quotaEndedLegs: [...new Set([...(j.quotaEndedLegs ?? []), "codex" as const])], codexNote: note, updatedAt: now };
     }
     return { ...j, generating: { ...j.generating, codex: false }, providerProgress: progress,
       providerErrors: { ...j.providerErrors, codex: { code: "quota", message: note } },
       assumptions: [...(j.assumptions ?? []), `Skipped codex (${note})`].slice(0, 12), codexNote: note, updatedAt: now };
   });
+  if (fallbackPrompt !== undefined) void kickLocalRace(jobId, fallbackPrompt);
 }
 
 /** Run the job's Codex request, store its leg (or its failure) and submit like the local leg. */
@@ -1734,7 +1774,11 @@ export async function submitHarborChat(
   // leg has not finished, withhold the incomplete stamp so a complete fallback chat verdict can
   // start Cloud Verify. After a non-clean or failed local result, stamp the configured canonical
   // provider incomplete and never promote.
-  const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
+  // verify-clean: Codex is a primary reviewer, so with the canonical chat leg unavailable a complete Codex
+  // verdict stands in for it exactly as another chat leg's would (chat first in the pinned order). Race
+  // keeps the chat-only rule.
+  const verifierRole = localVerifies({ role, providers });
+  const completeChatProvider = providers.find((provider) => (verifierRole ? isPrimaryProvider(provider) : isChatProvider(provider)) && complete.has(provider));
   const canonicalErrorCode = configuredCanonicalProvider
     ? job.providerErrors?.[configuredCanonicalProvider]?.code
     : undefined;
@@ -1828,18 +1872,18 @@ export async function submitHarborChat(
   ) as Partial<Record<ReviewProvider, RawCause>>;
   const auxiliaryFailures = Object.keys(auxiliaryProviderFailures).length ? auxiliaryProviderFailures : undefined;
 
-  // The verify-clean fallback is decided on chat output only: a Codex gate beside no usable chat gate
-  // still releases local as the fallback (its leg stays stored and merges with local's).
-  const usableChatGate = [...canonicalByProvider.keys()].some(isChatProvider);
-  if (!usableChatGate && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
-    // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
+  // The verify-clean fallback is decided on the primary reviewers' output (chat and Codex): a usable
+  // Codex gate is a primary result to judge, exactly as a chat gate is.
+  const usablePrimaryGate = [...canonicalByProvider.keys()].some(isPrimaryProvider);
+  if (!usablePrimaryGate && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
+    // verify-clean, no primary returned valid JSON: local runs as today's fallback instead of a skip.
     if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
     if (auxiliaryFailures) {
       transitionJob(jobId, (j) => ownsValidatorGeneration(j, validatorGeneration)
         ? { ...j, auxiliaryProviderFailures: auxiliaryFailures, updatedAt: Date.now() }
         : j);
     }
-    releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming, { validatorGeneration });
+    releaseHeldLocal(jobId, token, { kind: "fallback" }, `${primaryNames(providers)} returned no valid JSON; local runs as the fallback.`, incoming, { validatorGeneration });
     return { ok: true };
   }
   if (!canonicalGates.length) {
@@ -1914,9 +1958,9 @@ export async function submitHarborChat(
     incompleteProviders,
     auxiliaryProviderFailures: auxiliaryFailures,
   }, merged.findings.length);
-  // Credit only the chat reviewers that produced the clean structured result (pinned when the
-  // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
-  const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
+  // Credit only the primary reviewers (verify-clean: chat and Codex) that produced the clean structured
+  // result (pinned when the verification round starts): a skipped or failed one found nothing only by absence.
+  const cleanChat = job.localVerifyChat ?? structured.filter(verifierRole ? isPrimaryProvider : isChatProvider);
   if (outcome === "verify") {
     // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
     const plan = `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`;
@@ -1929,12 +1973,14 @@ export async function submitHarborChat(
   // JSON as raw with no Coverage(model) and tripped loop-error (aicc #598). Release local as the
   // chat-down fallback so it still runs. Salvage is never CONVERGED / verified-clean (outcome stays
   // raw / incomplete after the merge). Overflow/malformed (other raw causes) still post as today.
+  // The primary reviewers count alike (verify-clean: a Codex reply that is not review JSON is that salvage too).
+  const isPrimary = (p: string) => isPrimaryProvider(p as ReviewProvider);
   const chatSalvageOnly =
     merged.findings.length === 0 &&
     Boolean(rawReview) &&
-    !structured.some(isChatProvider) &&
-    Object.entries(rawCausesForBody).some(([p]) => isChatProvider(p as ReviewProvider)) &&
-    Object.entries(rawCausesForBody).filter(([p]) => isChatProvider(p as ReviewProvider)).every(([, c]) => c === "unparseable");
+    !structured.some(isPrimaryProvider) &&
+    Object.entries(rawCausesForBody).some(([p]) => isPrimary(p)) &&
+    Object.entries(rawCausesForBody).filter(([p]) => isPrimary(p)).every(([, c]) => c === "unparseable");
   if (
     chatSalvageOnly &&
     releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })
@@ -1944,7 +1990,7 @@ export async function submitHarborChat(
       jobId,
       token,
       { kind: "fallback" },
-      "Chat reviewers returned no usable structured JSON; local runs as the fallback.",
+      `${primaryNames(providers)} returned no usable structured JSON; local runs as the fallback.`,
       incoming,
       { validatorGeneration },
     );

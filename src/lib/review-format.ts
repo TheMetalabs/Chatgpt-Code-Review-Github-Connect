@@ -297,12 +297,15 @@ function reviewersLine(job: SummaryJob): string {
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   if (job.localFallbackAt) return fallbackReviewersLine(job, chat, providers.includes("local"));
+  const hasCodex = providers.includes("codex");
+  // verify-clean: Codex is a primary reviewer like chat, so local verifies its clean result too.
+  const verified = [chat.length ? "chat" : "", hasCodex ? "Codex" : ""].filter(Boolean).join(" or ");
   const local = !providers.includes("local")
     ? ""
-    : job.localReviewRole === "verify-clean" && chat.length
-      ? " Local LLM verifies a clean chat result."
+    : job.localReviewRole === "verify-clean" && verified
+      ? ` Local LLM verifies a clean ${verified} result.`
       : " Local LLM is fallback if Chrome does not return.";
-  const codex = providers.includes("codex") ? " Codex reviewed the same snapshot." : "";
+  const codex = hasCodex ? " Codex reviewed the same snapshot." : "";
   return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}${codex}`;
 }
 

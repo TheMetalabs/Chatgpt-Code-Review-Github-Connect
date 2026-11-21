@@ -22,6 +22,17 @@ describe("review-format", () => {
     assert.match(findingJob({ localVerifyStartedAt: 1 }), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
   });
 
+  it("verify-clean with Codex pinned: the reviewers line says local verifies a clean Codex result", () => {
+    const body = (reviewProviders: ReviewProvider[]) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders, localReviewRole: "verify-clean", assumptions: [], coverage: [] },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      );
+    assert.match(body(["local", "codex"]), /\n ?Local LLM verifies a clean Codex result\. Codex reviewed the same snapshot\.\n/);
+    assert.match(body(["chatgpt", "local", "codex"]), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat or Codex result\. Codex reviewed the same snapshot\.\n/);
+  });
+
   it("a fallback release names only the chat reviewers that ran, never a skipped one as running in parallel", () => {
     const line = (patch: Record<string, unknown>) =>
       reviewSummaryBody(

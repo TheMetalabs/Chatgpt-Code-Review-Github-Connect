@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canReleaseHeldLocal, chatStalled, skippedProvider, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
-import type { ReviewProvider } from "./types.ts";
+import { isPrimaryProvider, type ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -456,5 +456,45 @@ describe("codex provider", () => {
   it("codex is no chat leg: verify-clean races it with chat, never holds it back", () => {
     assert.deepEqual(racingProviders({ role: "verify-clean", providers: ["chatgpt", "local", "codex"], localReleased: false }), ["chatgpt", "codex"]);
     assert.deepEqual(racingProviders({ role: "verify-clean", providers: ["chatgpt", "local", "codex"], localReleased: true, localFallback: true }), ["local", "codex"]);
+  });
+});
+
+describe("verify-clean: Codex is a primary reviewer", () => {
+  const lc: ReviewProvider[] = ["local", "codex"];
+  const all: ReviewProvider[] = ["chatgpt", "local", "codex"];
+
+  it("isPrimaryProvider: every reviewer but local", () => {
+    assert.deepEqual((["chatgpt", "grok", "local", "codex"] as ReviewProvider[]).filter(isPrimaryProvider), ["chatgpt", "grok", "codex"]);
+  });
+
+  it("localVerifies with local + Codex (no chat reviewer); race and local-only stay as they were", () => {
+    assert.equal(localVerifies({ role: "verify-clean", providers: lc }), true);
+    assert.equal(localVerifies({ role: "verify-clean", providers: all }), true);
+    assert.equal(localVerifies({ role: "race", providers: lc }), false, "race is unchanged");
+    assert.equal(localVerifies({ role: "verify-clean", providers: ["codex"] }), false, "no local: nothing to verify");
+    assert.equal(localVerifies({ role: "verify-clean", providers: ["local"] }), false, "local only behaves as today");
+  });
+
+  it("racingProviders / shouldStartLocalLeg hold local back until Codex's result releases it", () => {
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: lc, localReleased: false }), ["codex"]);
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: lc, localReleased: true }), ["local", "codex"]);
+    assert.deepEqual(racingProviders({ role: "race", providers: lc, localReleased: false }), ["local", "codex"], "race: Codex and local race");
+    const base = { status: "awaiting_chat" as const, localDone: false, localStarted: false };
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: lc, localReleased: false, ...base }), false);
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: lc, localReleased: true, ...base }), true);
+    assert.equal(shouldStartLocalLeg({ role: "race", providers: lc, localReleased: false, ...base }), true);
+  });
+
+  it("releaseLocalAsFallback waits while Codex races and while it has a payload to judge; releases once no primary can deliver", () => {
+    const v = { role: "verify-clean" as const, providers: lc, localReleased: false, chatRacing: false, usableChat: false };
+    assert.equal(releaseLocalAsFallback({ ...v, codexRacing: true }), false, "Codex still running");
+    assert.equal(releaseLocalAsFallback({ ...v, usableCodex: true }), false, "Codex's result is judged (verify or post)");
+    assert.equal(releaseLocalAsFallback({ ...v, codexRacing: false, usableCodex: false }), true, "Codex failed: local is the fallback");
+    assert.equal(releaseLocalAsFallback({ ...v, role: "race" }), false, "race is unchanged");
+    const mixed = { ...v, providers: all };
+    assert.equal(releaseLocalAsFallback({ ...mixed, codexRacing: true }), false, "chat down, Codex running: wait for Codex");
+    assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true, chatStalled: true, codexRacing: true }), false, "a bridge stall never ends the wait on Codex");
+    assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true, chatStalled: true }), true, "stalled chat, Codex ended: fallback");
+    assert.equal(releaseLocalAsFallback({ ...mixed, chatRacing: true }), false, "chat still running");
   });
 });

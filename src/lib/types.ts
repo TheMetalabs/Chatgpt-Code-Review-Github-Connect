@@ -57,6 +57,13 @@ export function isChatProvider(p: ReviewProvider): p is "chatgpt" | "grok" {
   return p === "chatgpt" || p === "grok";
 }
 
+/** A primary reviewer under localReviewRole "verify-clean": every reviewer but local (the chat
+ * reviewers and Codex). They run first; local verifies their clean merged result, or runs as the
+ * fallback when none of them can still produce a usable verdict. */
+export function isPrimaryProvider(p: ReviewProvider): p is Exclude<ReviewProvider, "local"> {
+  return p !== "local";
+}
+
 export type Trigger =
   | "pull_request.opened"
   | "pull_request.reopened"
@@ -369,7 +376,7 @@ export interface BotSettings {
   localReviewMaxTokens: number;
   /** "single" = one-shot prompt; "multiturn" = SDK tool loop; "auto" = pick by PR size. */
   localReviewMode: LocalReviewMode;
-  /** "race" = local runs alongside chat; "verify-clean" = local verifies a clean chat result. */
+  /** "race" = local runs alongside chat; "verify-clean" = local verifies a clean chat / Codex result. */
   localReviewRole: LocalReviewRole;
   /** auto-mode cutoff: a single-turn prompt estimated at or below this many tokens stays single-turn. */
   localReviewSingleTurnMaxTokens: number;
@@ -683,7 +690,8 @@ export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"ch
 
 /**
  * `race` (default): local runs in parallel with the chat reviewers. `verify-clean`: local runs only
- * after the merged chat result is clean, as a verification round (settings.localReviewRole, env ASHLAR_LOCAL_REVIEW_ROLE).
+ * after the merged result of the primary reviewers (chat and Codex) is clean, as a verification round
+ * (settings.localReviewRole, env ASHLAR_LOCAL_REVIEW_ROLE).
  */
 export type LocalReviewRole = "race" | "verify-clean";
 
@@ -711,9 +719,15 @@ export function describeEnabledReviewers(providers: readonly ReviewProvider[], r
     : chat.length === 1
       ? `${chat[0]} (Chrome)`
       : `${chat.join(" + ")} in parallel (Chrome)`;
+  const codex = providers.includes("codex");
+  // verify-clean with Codex pinned: Codex is a primary reviewer like chat, so local verifies (or is the
+  // fallback for) its result too, and it reads before local.
+  if (role === "verify-clean" && local && codex) {
+    return [chatBit, "codex", localFallback ? "local runs as the fallback" : "local verifies a clean result"].filter(Boolean).join("; ");
+  }
   const localBit = !local ? "" : !chat.length ? "local only" : localFallback ? "local runs as the fallback"
     : role === "verify-clean" ? "local verifies a clean result" : "local racing";
-  const codexBit = !providers.includes("codex") ? "" : !chat.length && !local ? "codex only" : "codex racing";
+  const codexBit = !codex ? "" : !chat.length && !local ? "codex only" : "codex racing";
   return [chatBit, localBit, codexBit].filter(Boolean).join("; ") || "none configured";
 }
 

@@ -7,6 +7,20 @@ back. It is released either as a **verification round** (the merged chat result 
 **fallback** (chat produced nothing usable). The role is pinned on the job at snapshot
 (`Job.localReviewRole`), so a later settings change never alters a review in flight.
 
+**Codex is a primary reviewer here.** Under `verify-clean` the *primary* reviewers are every pinned
+reviewer but local (`isPrimaryProvider`: ChatGPT, Grok and Codex), and wherever this document says
+"chat" for the round local verifies or replaces, read "the primary reviewers". So local + Codex
+alone is a verifier job: Codex runs first, its findings post without local, a clean Codex result is
+held while local verifies it, and local is the fallback once Codex ends with nothing usable (an
+error, a timeout, a reply that is not review JSON). The fallback waits while any primary is still
+racing, Codex included: a chat leg at its usage limit never releases local while a Codex request is
+still running (a bridge stall ends the wait on chat only). With chat + Codex the two merge as today
+(the browser chat provider stays canonical); with the canonical chat leg unavailable, a complete
+Codex verdict stands in for it exactly as another chat leg's would. A Codex usage limit or Codex
+turned off still takes Codex off the job's pinned reviewers; when it was the last primary, local is
+released as the fallback in the same transaction (`codexLeftFallback`), never left held and never a
+Codex-only failed attempt. Race is unchanged: Codex races local and chat.
+
 ## §1 Review outcome — one closed enum
 
 `reviewOutcome(job, findings)` in `src/lib/review-outcome.ts` is the only place a merged, gated
@@ -23,7 +37,7 @@ a handoff lost to a crash or a failed post is recovered by the next loop step
 to decide any of these.
 
 `findings` is the publish-gated count. A job is a *verifier* when its role is `verify-clean`, both a
-chat reviewer and local are enabled, and local did not run as the fallback. An FP round merges as
+primary reviewer (chat or Codex) and local are enabled, and local did not run as the fallback. An FP round merges as
 race.
 
 | Kind | When | First line | Marker | CONVERGED |
@@ -178,7 +192,8 @@ It is called only on an **explicit terminal signal** of the chat round:
 | The merged chat result is `verify` (§1: 0 findings, no raw, every chat payload a complete verdict) | verification round (`localVerifyChat` = the chat reviewers whose complete verdict was clean) | `submitHarborChat` |
 | Every chat leg finished without a usable payload (no valid JSON) | fallback | `submitHarborChat` |
 | Chat's only result is a findings=0 pre-gate salvage (`rawCauses` = `unparseable`, including `salvaged_no_repair` after a failed JSON repair): not a complete structured verdict, never CONVERGED | fallback | `submitHarborChat` |
-| Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload | fallback | watcher |
+| Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload, and no Codex leg is still running or holds a payload | fallback | watcher |
+| Codex, the last primary, left the job (usage limit, turned off) | fallback | `endCodexForQuota` / `endDisabledCodexLegs` |
 | The job's Chrome bridge link reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
 
 The link is `chatBridgeLink` in `bridge.server.ts`. A job no Chrome profile has claimed uses the
